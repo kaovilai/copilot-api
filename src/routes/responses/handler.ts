@@ -32,7 +32,7 @@ import type {
 import { createResponses as createCopilotResponses } from "~/services/copilot/create-responses"
 
 import { handleResponsesViaMessages } from "./messages-handler"
-import { createStreamIdTracker, fixStreamIds } from "./stream-id-sync"
+import { applyStreamIdFix, createStreamIdTracker } from "./stream-id-sync"
 import {
   applyResponsesApiContextManagement,
   compactInputByLatestCompaction,
@@ -211,11 +211,18 @@ export const handleResponses = async (c: Context) => {
             }
           }
 
-          const processedData = fixStreamIds(
-            (chunk as { data?: string }).data ?? "",
-            (chunk as { event?: string }).event,
-            idTracker,
-          )
+          const rawData = (chunk as { data?: string }).data ?? ""
+          const processedData =
+            (
+              parsedEvent
+              && applyStreamIdFix(
+                parsedEvent,
+                (chunk as { event?: string }).event,
+                idTracker,
+              )
+            ) ?
+              JSON.stringify(parsedEvent)
+            : rawData
 
           await stream.writeSSE({
             id: (chunk as { id?: string }).id,

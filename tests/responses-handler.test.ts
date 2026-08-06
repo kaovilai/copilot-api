@@ -1442,4 +1442,93 @@ describe("responses handler token usage", () => {
     expect(page.items[0]?.total_nano_aiu).toBe(1234)
     expect(page.items[0]?.total_tokens).toBe(7)
   })
+
+  test("rewrites output item ids consistently across added/delta/done and passes through a raw [DONE] sentinel without throwing", async () => {
+    createResponses.mockImplementation(() =>
+      Promise.resolve(
+        streamChunks([
+          {
+            data: JSON.stringify({
+              item: {
+                id: "",
+                role: "assistant",
+                status: "in_progress",
+                type: "message",
+              },
+              output_index: 0,
+              sequence_number: 1,
+              type: "response.output_item.added",
+            }),
+            event: "response.output_item.added",
+            id: "event_1",
+          },
+          {
+            data: JSON.stringify({
+              content_index: 0,
+              delta: "hi",
+              item_id: "upstream-mismatched-id",
+              output_index: 0,
+              sequence_number: 2,
+              type: "response.output_text.delta",
+            }),
+            event: "response.output_text.delta",
+            id: "event_2",
+          },
+          {
+            data: JSON.stringify({
+              item: {
+                id: "upstream-mismatched-id",
+                role: "assistant",
+                status: "completed",
+                type: "message",
+              },
+              output_index: 0,
+              sequence_number: 3,
+              type: "response.output_item.done",
+            }),
+            event: "response.output_item.done",
+            id: "event_3",
+          },
+          {
+            data: "[DONE]",
+          },
+        ]),
+      ),
+    )
+
+    const app = createApp()
+    const response = await app.request("/v1/responses", {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+      },
+      body: JSON.stringify({
+        input: "hello",
+        model: "gpt-test",
+        stream: true,
+      }),
+    })
+
+    expect(response.status).toBe(200)
+    const body = await response.text()
+
+    const dataLines = body
+      .split("\n")
+      .filter((line) => line.startsWith("data:"))
+      .map((line) => line.slice("data:".length).trim())
+
+    expect(dataLines).toContain("[DONE]")
+
+    const addedEvent = JSON.parse(dataLines[0]) as {
+      item: { id: string }
+    }
+    const generatedId = addedEvent.item.id
+    expect(generatedId).toMatch(/^oi_0_/)
+
+    const deltaEvent = JSON.parse(dataLines[1]) as { item_id: string }
+    expect(deltaEvent.item_id).toBe(generatedId)
+
+    const doneEvent = JSON.parse(dataLines[2]) as { item: { id: string } }
+    expect(doneEvent.item.id).toBe(generatedId)
+  })
 })

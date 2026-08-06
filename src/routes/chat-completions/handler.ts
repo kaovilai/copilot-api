@@ -20,9 +20,13 @@ import type {
   ChatCompletionResponse,
   ChatCompletionsPayload,
 } from "~/lib/types/chat-completions"
-import { createChatCompletions } from "~/services/copilot/create-chat-completions"
+import { createChatCompletions as createCopilotChatCompletions } from "~/services/copilot/create-chat-completions"
 
 const logger = createHandlerLogger("chat-completions-handler")
+
+export const chatCompletionsHandlerDependencies = {
+  createChatCompletions: createCopilotChatCompletions,
+}
 
 export async function handleCompletion(c: Context) {
   let payload = await c.req.json<ChatCompletionsPayload>()
@@ -78,10 +82,11 @@ export async function handleCompletion(c: Context) {
     model: payload.model,
   })
 
-  const response = await createChatCompletions(payload, {
-    requestId,
-    sessionId,
-  })
+  const response =
+    await chatCompletionsHandlerDependencies.createChatCompletions(payload, {
+      requestId,
+      sessionId,
+    })
 
   if (isNonStreaming(response)) {
     debugJson(logger, "Non-streaming response:", response)
@@ -117,14 +122,16 @@ export async function handleCompletion(c: Context) {
 }
 
 const isNonStreaming = (
-  response: Awaited<ReturnType<typeof createChatCompletions>>,
+  response: Awaited<ReturnType<typeof createCopilotChatCompletions>>,
 ): response is ChatCompletionResponse => Object.hasOwn(response, "choices")
 
 const parseChatCompletionChunk = (
   chunk: unknown,
 ): ChatCompletionChunk | null => {
   const data = (chunk as { data?: string }).data
-  if (!data || data === "[DONE]") {
+  // Only the final chunk of a stream carries usage/copilot_usage, which is
+  // all this parses for -- skip the JSON.parse on every other token.
+  if (!data || data === "[DONE]" || !data.includes("usage")) {
     return null
   }
 

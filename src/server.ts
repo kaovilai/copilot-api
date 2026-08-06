@@ -28,6 +28,11 @@ import { usageRoute } from "./routes/usage/route"
 
 export const server = new Hono()
 
+const usageViewerHtml = readFileSync(
+  new URL("../pages/index.html", import.meta.url),
+  "utf8",
+)
+
 server.use(traceIdMiddleware)
 server.use(logger())
 server.use(cors())
@@ -49,10 +54,7 @@ server.use(
 server.use(zstdDecompressionMiddleware)
 
 server.get("/", (c) => c.text("Server running"))
-server.get("/usage-viewer", (c) => {
-  const usageViewerFileUrl = new URL("../pages/index.html", import.meta.url)
-  return c.html(readFileSync(usageViewerFileUrl, "utf8"))
-})
+server.get("/usage-viewer", (c) => c.html(usageViewerHtml))
 server.get("/usage-viewer/", (c) => c.redirect("/usage-viewer", 301))
 
 server.route("/chat/completions", completionRoutes)
