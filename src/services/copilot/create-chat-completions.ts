@@ -16,6 +16,7 @@ import {
 } from "~/lib/api-config"
 import { logCopilotRateLimits } from "~/lib/copilot-rate-limit"
 import { HTTPError } from "~/lib/error"
+import { fetchWithConnectTimeout } from "~/lib/fetch-timeout"
 import { state } from "~/lib/state"
 
 export const createChatCompletions = async (
@@ -62,11 +63,14 @@ export const createChatCompletions = async (
 
   consola.log(`<-- model: ${payload.model}`)
 
-  const response = await fetch(`${copilotBaseUrl(state)}/chat/completions`, {
-    method: "POST",
-    headers,
-    body: JSON.stringify(payload),
-  })
+  const response = await fetchWithConnectTimeout(
+    `${copilotBaseUrl(state)}/chat/completions`,
+    {
+      method: "POST",
+      headers,
+      body: JSON.stringify(payload),
+    },
+  )
 
   logCopilotRateLimits(response.headers)
 
