@@ -5,7 +5,7 @@ import type {
   ResponseOutputItemDoneEvent,
   ResponseStreamEvent,
   ResponseTextDeltaEvent,
-} from "../src/services/copilot/create-responses"
+} from "../src/lib/types/responses"
 
 import {
   applyStreamIdFix,

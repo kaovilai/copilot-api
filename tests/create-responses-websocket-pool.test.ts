@@ -636,6 +636,71 @@ test("Responses websocket emits an error event when the websocket closes without
   )
 })
 
+test("Responses websocket emits a stall error when a fresh connection never responds", async () => {
+  useAcceleratedStallTimer()
+  MockWebSocket.autoComplete = false
+
+  const response = await createResponses(
+    {
+      input: "hello",
+      model: "gpt-test",
+      stream: true,
+    },
+    {
+      initiator: "user",
+      requestId: "request-1",
+      transport: "websocket",
+      vision: false,
+    },
+  )
+  const chunks = await collectStreamChunks(response as AsyncIterable<unknown>)
+
+  // A brand-new connection failing immediately is a real error, not a zombie
+  // reused from the pool -- it must not be silently retried.
+  expect(MockWebSocket.instances).toHaveLength(1)
+  expect(chunks).toHaveLength(1)
+  expect(chunks[0]?.event).toBe("error")
+  expect(chunks[0]?.data).toContain(
+    '"message":"Websocket stream stalled: no data received before timeout"',
+  )
+})
+
+test("Responses websocket transparently retries once when a reused connection stalls with no data", async () => {
+  useAcceleratedStallTimer()
+
+  await collectResponsesStream("request-1")
+  expect(MockWebSocket.instances).toHaveLength(1)
+
+  // Simulate the pooled connection going silently dead: sends still "succeed"
+  // but no reply, close, or error ever arrives on it.
+  const zombie = MockWebSocket.instances[0]
+  if (zombie) {
+    zombie.completeLatestResponse = () => {}
+  }
+
+  const response = await createResponses(
+    {
+      input: "hello",
+      model: "gpt-test",
+      stream: true,
+    },
+    {
+      initiator: "user",
+      requestId: "request-1",
+      transport: "websocket",
+      vision: false,
+    },
+  )
+  const chunks = await collectStreamChunks(response as AsyncIterable<unknown>)
+
+  expect(MockWebSocket.instances).toHaveLength(2)
+  expect(MockWebSocket.instances[1]?.sent).toHaveLength(1)
+  expect(chunks.some((chunk) => chunk.event === "error")).toBe(false)
+  expect(
+    chunks.some((chunk) => chunk.data?.includes('"type":"response.completed"')),
+  ).toBe(true)
+})
+
 test("Responses websocket passes HTTPS proxy env to Bun websocket init", async () => {
   const proxyEnv = clearProxyEnv()
   process.env.HTTPS_PROXY = "http://127.0.0.1:8080"
@@ -944,6 +1009,23 @@ const waitFor = async (predicate: () => boolean): Promise<void> => {
   }
 
   throw new Error("Timed out waiting for condition")
+}
+
+// Fires the websocket stall timers (20s/180s defaults in responses-websocket.ts)
+// almost immediately, without disturbing any other setTimeout call (e.g. the
+// pool's 60s idle-close timer, or the mock's own 0ms scheduling).
+const useAcceleratedStallTimer = (): void => {
+  ;(globalThis as unknown as { setTimeout: typeof setTimeout }).setTimeout = ((
+    handler: (...args: Array<unknown>) => void,
+    timeout?: number,
+    ...args: Array<unknown>
+  ) => {
+    if (timeout === 20_000 || timeout === 180_000) {
+      return originalSetTimeout(handler, 0, ...args)
+    }
+
+    return originalSetTimeout(handler, timeout, ...args)
+  }) as typeof setTimeout
 }
 
 const clearProxyEnv = (): Map<ProxyEnvKey, string | undefined> => {

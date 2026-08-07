@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, describe, expect, mock, test } from "bun:test"
+import { afterAll, afterEach, beforeEach, describe, expect, mock, test } from "bun:test"
 import { Hono } from "hono"
 
 import type { ResolvedProviderConfig } from "~/lib/config"
@@ -19,6 +19,11 @@ let messageApiWebSearchModel: string | undefined
 
 const noopTokenUsageRecorder = () => {}
 const findEndpointModel = mock((model: string) => ({
+  // mock.module replaces the shared ~/lib/models module for the whole test
+  // run (see the afterAll restore below), so keep this shape realistic --
+  // consumers that pick it up before the restore takes effect still expect
+  // a Model-shaped object (e.g. chat-completions handler reads capabilities.limits).
+  capabilities: { limits: {} },
   id: model,
   supported_endpoints: ["/v1/messages"],
 }))
@@ -375,6 +380,18 @@ afterEach(() => {
   messageApiWebSearchModel = undefined
   responsesResultOverride = undefined
   responsesStreamFactory = undefined
+})
+
+// mock.module replaces these modules in Bun's shared module registry for the
+// whole test run, not just this file -- restore the real implementations so
+// later-running test files that import ~/lib/models et al. don't silently
+// receive this file's fakes (e.g. a findEndpointModel with no capabilities).
+afterAll(async () => {
+  await mock.module("~/lib/config", () => actualConfigModule)
+  await mock.module("~/lib/models", () => actualModelsModule)
+  await mock.module("~/lib/state", () => actualStateModule)
+  await mock.module("~/lib/token", () => actualTokenModule)
+  await mock.module("~/lib/token-usage", () => actualTokenUsageModule)
 })
 
 describe("provider messages web_search", () => {
