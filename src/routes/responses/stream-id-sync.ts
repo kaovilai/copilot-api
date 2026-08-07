@@ -13,6 +13,8 @@
  * via @ai-sdk/openai provider requires the Responses API endpoint.
  */
 
+import { randomUUID } from "node:crypto"
+
 import type {
   ResponseOutputItemAddedEvent,
   ResponseOutputItemDoneEvent,
@@ -70,11 +72,8 @@ const handleOutputItemAdded = (
 ): boolean => {
   let changed = false
   if (!parsed.item.id) {
-    let randomSuffix = ""
-    while (randomSuffix.length < 16) {
-      randomSuffix += Math.random().toString(36).slice(2)
-    }
-    parsed.item.id = `oi_${parsed.output_index}_${randomSuffix.slice(0, 16)}`
+    const randomSuffix = randomUUID().replaceAll("-", "").slice(0, 16)
+    parsed.item.id = `oi_${parsed.output_index}_${randomSuffix}`
     changed = true
   }
 
