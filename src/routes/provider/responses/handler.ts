@@ -258,15 +258,19 @@ const streamProviderResponses = async (
       let event: ResponseStreamEvent | null = null
 
       if (chunk.data && chunk.data !== "[DONE]") {
-        event = parseProviderResponsesStreamEvent(chunk.data, {
-          normalizeCodex: options.normalizeCodex,
-          provider: options.provider,
-        })
-        if (event && options.normalizeCodex) {
-          responseChunk = {
-            ...chunk,
-            data: JSON.stringify(event),
-            event: event.type,
+        // Non-codex chunks are only parsed to extract usage, which is limited
+        // to the terminal event -- skip JSON.parse on every other token.
+        if (options.normalizeCodex || chunk.data.includes("usage")) {
+          event = parseProviderResponsesStreamEvent(chunk.data, {
+            normalizeCodex: options.normalizeCodex,
+            provider: options.provider,
+          })
+          if (event && options.normalizeCodex) {
+            responseChunk = {
+              ...chunk,
+              data: JSON.stringify(event),
+              event: event.type,
+            }
           }
         }
       }
