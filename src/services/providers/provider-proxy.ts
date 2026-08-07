@@ -5,11 +5,12 @@ import {
 } from "undici"
 
 import type { ResolvedProviderConfig } from "~/lib/config"
+import { getResponsesTransportConfig } from "~/lib/config"
+import { fetchWithConnectTimeout } from "~/lib/fetch-timeout"
 import { createTimeoutDispatcher } from "~/lib/timeout-dispatcher"
 import type { AnthropicMessagesPayload } from "~/lib/types/anthropic"
 import type { ChatCompletionsPayload } from "~/lib/types/chat-completions"
 import type { ResponsesPayload } from "~/lib/types/responses"
-import { getResponsesTransportConfig } from "~/lib/config"
 import { fetchResponsesWithLifecycle } from "~/services/responses-http"
 
 const SHARED_FORWARDABLE_HEADERS = ["accept", "user-agent"] as const
@@ -93,11 +94,14 @@ export async function forwardProviderMessages(
   requestHeaders: Headers,
 ): Promise<Response> {
   consola.log(`<-- model: ${payload.model}`)
-  return await fetch(`${providerConfig.baseUrl}/v1/messages`, {
-    method: "POST",
-    headers: buildProviderUpstreamHeaders(providerConfig, requestHeaders),
-    body: JSON.stringify(payload),
-  })
+  return await fetchWithConnectTimeout(
+    `${providerConfig.baseUrl}/v1/messages`,
+    {
+      method: "POST",
+      headers: buildProviderUpstreamHeaders(providerConfig, requestHeaders),
+      body: JSON.stringify(payload),
+    },
+  )
 }
 
 export async function forwardProviderChatCompletions(
@@ -106,11 +110,14 @@ export async function forwardProviderChatCompletions(
   requestHeaders: Headers,
 ): Promise<Response> {
   consola.log(`<-- model: ${payload.model}`)
-  return await fetch(`${providerConfig.baseUrl}/v1/chat/completions`, {
-    method: "POST",
-    headers: buildProviderUpstreamHeaders(providerConfig, requestHeaders),
-    body: JSON.stringify(payload),
-  })
+  return await fetchWithConnectTimeout(
+    `${providerConfig.baseUrl}/v1/chat/completions`,
+    {
+      method: "POST",
+      headers: buildProviderUpstreamHeaders(providerConfig, requestHeaders),
+      body: JSON.stringify(payload),
+    },
+  )
 }
 
 export async function forwardProviderResponses(
@@ -137,6 +144,8 @@ export async function forwardProviderResponses(
 }
 
 const PROVIDER_MODELS_TIMEOUT_MS = 15_000
+/** Small, unambiguously non-streaming JSON responses -- a plain total-duration cap is safe. */
+const PROVIDER_JSON_REQUEST_TIMEOUT_MS = 30_000
 
 export async function forwardProviderModels(
   providerConfig: ResolvedProviderConfig,
@@ -179,6 +188,7 @@ export async function forwardProviderAlphaSearch(
       method: "POST",
       headers,
       body,
+      signal: AbortSignal.timeout(PROVIDER_JSON_REQUEST_TIMEOUT_MS),
     },
   )
 }
