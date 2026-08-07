@@ -278,16 +278,20 @@ const createResponsesWebSocketStreamChunk = (
     if (parsed.type === "response.completed") {
       logCopilotQuotaSnapshots(parsed.copilot_quota_snapshots)
     }
+
+    const event = typeof parsed.type === "string" ? parsed.type : undefined
+    const id = typeof parsed.id === "string" ? parsed.id : undefined
+
     if (parsed.type === "error" && parsed.error) {
       consola.warn("Copilot responses websocket stream error:", parsed.error)
       parsed.code = parsed.error.code
       parsed.message = parsed.error.message
+      return { data: JSON.stringify(parsed), event, id }
     }
-    return {
-      event: typeof parsed.type === "string" ? parsed.type : undefined,
-      data: JSON.stringify(parsed),
-      id: typeof parsed.id === "string" ? parsed.id : undefined,
-    }
+
+    // parsed is unmutated on the non-error path, so `data` is already
+    // byte-identical to JSON.stringify(parsed) -- reuse it.
+    return { data, event, id }
   } catch {
     return { data }
   }

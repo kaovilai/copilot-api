@@ -989,23 +989,18 @@ const parseResponsesProviderStreamChunk = (
 
 const parseProviderStreamEvent = (
   data: string,
-): { data: string; model?: string; usage: UsageTokens } | null => {
+): { data: string; usage: UsageTokens } | null => {
   try {
     const parsed = JSON.parse(data) as AnthropicStreamEventData
+    // parsed is never mutated here, so the original `data` string is always
+    // byte-identical to JSON.stringify(parsed) -- reuse it, skip the re-stringify.
     if (parsed.type === "message_start") {
-      return {
-        data: JSON.stringify(parsed),
-        model: parsed.message.model,
-        usage: normalizeAnthropicUsage(parsed.message.usage),
-      }
+      return { data, usage: normalizeAnthropicUsage(parsed.message.usage) }
     }
     if (parsed.type === "message_delta") {
-      return {
-        data: JSON.stringify(parsed),
-        usage: normalizeAnthropicUsage(parsed.usage),
-      }
+      return { data, usage: normalizeAnthropicUsage(parsed.usage) }
     }
-    return { data: JSON.stringify(parsed), usage: {} }
+    return { data, usage: {} }
   } catch (error) {
     logger.error("provider.messages.streaming.adjust_tokens_error", {
       error,
