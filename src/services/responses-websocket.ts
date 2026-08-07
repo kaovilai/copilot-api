@@ -32,6 +32,7 @@ type WebSocketMessageListener = (event: { data: unknown }) => void
 
 const websocketPool = new Map<string, PooledWebSocketEntry>()
 const websocketActiveRequests = new Map<string, number>()
+const textDecoder = new TextDecoder()
 
 interface PooledWebSocketEntry {
   closed: boolean
@@ -592,9 +593,9 @@ const normalizeWebSocketMessageData = async (
   data: unknown,
 ): Promise<string> => {
   if (typeof data === "string") return data
-  if (data instanceof ArrayBuffer) return new TextDecoder().decode(data)
+  if (data instanceof ArrayBuffer) return textDecoder.decode(data)
   if (ArrayBuffer.isView(data)) {
-    return new TextDecoder().decode(
+    return textDecoder.decode(
       new Uint8Array(
         data.buffer as ArrayBuffer,
         data.byteOffset,
