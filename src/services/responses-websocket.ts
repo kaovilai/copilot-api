@@ -12,6 +12,8 @@ export interface PooledWebSocketRequest<TPayload> {
 
 export interface PooledWebSocketStreamOptions<TChunk> {
   createChunk: (data: string) => TChunk
+  firstChunkTimeoutMs?: number
+  interChunkTimeoutMs?: number
   isTerminalChunk: (chunk: TChunk) => boolean
   maxBufferedBytes: number
   maxBufferedMessages: number
@@ -20,6 +22,7 @@ export interface PooledWebSocketStreamOptions<TChunk> {
   poolIdleTimeoutMs: number
   streamErrorMessage: string
   streamInactivityTimeoutMs: number
+  streamStallMessage?: string
   terminalChunkMissingMessage: string
   unavailableErrorMessage?: string
 }
@@ -29,6 +32,16 @@ type WebSocketErrorEvent = Parameters<
   NonNullable<WebSocketInstance["onerror"]>
 >[0]
 type WebSocketMessageListener = (event: { data: unknown }) => void
+
+// A zombie connection resurrected from the pool typically never gets even one
+// reply, so time-to-first-chunk can stay tight. Once data is flowing, models can
+// pause for a long time inside thinking blocks, so the inter-chunk budget is generous.
+const DEFAULT_FIRST_CHUNK_TIMEOUT_MS = 20_000
+const DEFAULT_INTER_CHUNK_TIMEOUT_MS = 180_000
+// A wall-clock gap much larger than this poll interval means the process was
+// asleep, not just idle -- any pooled sockets from before the gap are presumed dead.
+const WAKE_GAP_CHECK_INTERVAL_MS = 30_000
+const WAKE_GAP_THRESHOLD_MS = WAKE_GAP_CHECK_INTERVAL_MS * 3
 
 const websocketPool = new Map<string, PooledWebSocketEntry>()
 const websocketActiveRequests = new Map<string, number>()
@@ -47,6 +60,10 @@ interface PooledWebSocketEntry {
 interface PooledWebSocketRequestTarget {
   entry: PooledWebSocketEntry
   pooled: boolean
+  // True only when an already-open entry was pulled back out of the pool from a
+  // prior request -- as opposed to a brand new entry that merely gets stored in
+  // the pool for later reuse. Only a genuine reuse can be a resurrected zombie.
+  reused: boolean
 }
 
 interface BufferedWebSocketMessage {
@@ -159,50 +176,67 @@ const runPooledWebSocketRequest = async function* <TPayload, TChunk>(
   request: PooledWebSocketRequest<TPayload>,
   options: PooledWebSocketStreamOptions<TChunk>,
 ): AsyncIterable<TChunk> {
-  throwIfAborted(request.signal)
-  const { entry, pooled } = getPooledWebSocketRequestTarget(request, options)
-  const release = acquirePooledWebSocketEntry(request.poolKey, entry, pooled)
-  let messageStream: WebSocketMessageStream | null = null
-  let reusable = false
+  let retriedStaleConnection = false
 
-  try {
-    const websocket = await getReadyPooledWebSocket(
-      request.poolKey,
-      entry,
-      pooled,
-      options,
-    )
+  for (;;) {
     throwIfAborted(request.signal)
-    messageStream = createWebSocketMessageStream(
-      websocket,
-      request.signal,
+    const { entry, pooled, reused } = getPooledWebSocketRequestTarget(
+      request,
       options,
     )
-    messageStream.start()
-    websocket.send(JSON.stringify(request.payload))
+    const release = acquirePooledWebSocketEntry(request.poolKey, entry, pooled)
+    let messageStream: WebSocketMessageStream | null = null
+    let reusable = false
+    let yieldedAny = false
 
-    for await (const data of messageStream.iterable) {
-      const chunk = options.createChunk(data)
-      const isTerminal = options.isTerminalChunk(chunk)
-      if (isTerminal) {
-        messageStream.complete()
-        reusable = true
+    try {
+      const websocket = await getReadyPooledWebSocket(
+        request.poolKey,
+        entry,
+        pooled,
+        options,
+      )
+      throwIfAborted(request.signal)
+      messageStream = createWebSocketMessageStream(
+        websocket,
+        request.signal,
+        options,
+      )
+      websocket.send(JSON.stringify(request.payload))
+      messageStream.start()
+
+      for await (const data of messageStream.iterable) {
+        const chunk = options.createChunk(data)
+        yieldedAny = true
+        const isTerminal = options.isTerminalChunk(chunk)
+        if (isTerminal) {
+          messageStream.complete()
+          reusable = true
+        }
+
+        yield chunk
+
+        if (isTerminal) {
+          return
+        }
       }
 
-      yield chunk
-
-      if (isTerminal) {
-        return
+      throw new Error(options.terminalChunkMissingMessage)
+    } catch (error) {
+      // A connection resurrected from the pool can fail or stall before ever
+      // producing a chunk -- nothing was consumed downstream, so it is safe to
+      // retry once on a freshly opened connection. A brand-new connection
+      // failing immediately (reused === false) is a real error, not a zombie.
+      if (reused && !yieldedAny && !retriedStaleConnection) {
+        retriedStaleConnection = true
+        continue
       }
+      throw toError(error)
+    } finally {
+      messageStream?.dispose()
+      if (!reusable) removePooledWebSocketEntry(request.poolKey, entry)
+      release(reusable)
     }
-
-    throw new Error(options.terminalChunkMissingMessage)
-  } catch (error) {
-    throw toError(error)
-  } finally {
-    messageStream?.dispose()
-    if (!reusable) removePooledWebSocketEntry(request.poolKey, entry)
-    release(reusable)
   }
 }
 
@@ -214,6 +248,7 @@ const getPooledWebSocketRequestTarget = <TPayload, TChunk>(
     return {
       entry: createPooledWebSocketEntry(request, options),
       pooled: false,
+      reused: false,
     }
   }
 
@@ -221,12 +256,20 @@ const getPooledWebSocketRequestTarget = <TPayload, TChunk>(
   if (existing && !existing.closed) {
     consola.debug("websocket from pool")
     clearPooledWebSocketIdleState(existing)
-    return { entry: existing, pooled: true }
+    return {
+      entry: existing,
+      pooled: true,
+      reused: true,
+    }
   }
 
   const entry = createPooledWebSocketEntry(request, options)
   websocketPool.set(request.poolKey, entry)
-  return { entry, pooled: true }
+  return {
+    entry,
+    pooled: true,
+    reused: false,
+  }
 }
 
 const createPooledWebSocketEntry = <TPayload, TChunk>(
@@ -478,6 +521,8 @@ const createWebSocketMessageStream = <TChunk>(
   let disposed = false
   let error: Error | null = null
   let inactivityTimer: ReturnType<typeof setTimeout> | null = null
+  let stallTimer: ReturnType<typeof setTimeout> | null = null
+  let receivedMessage = false
   let notify: (() => void) | null = null
 
   const wake = () => {
@@ -491,10 +536,21 @@ const createWebSocketMessageStream = <TChunk>(
     inactivityTimer = null
   }
 
+  const clearStallTimer = () => {
+    if (!stallTimer) return
+    clearTimeout(stallTimer)
+    stallTimer = null
+  }
+
+  const clearTimers = () => {
+    clearInactivityTimer()
+    clearStallTimer()
+  }
+
   const fail = (nextError: Error, close = true) => {
     if (error || disposed) return
     error = nextError
-    clearInactivityTimer()
+    clearTimers()
     buffer.clear()
     if (close) closeWebSocket(websocket)
     wake()
@@ -512,8 +568,32 @@ const createWebSocketMessageStream = <TChunk>(
     }, options.streamInactivityTimeoutMs)
   }
 
+  // A zombie connection resurrected from the pool can pass the (generous)
+  // inactivity timeout for a long time without ever producing a chunk. This
+  // tighter, independent timer fails fast on that case while still allowing
+  // long inter-chunk pauses (e.g. thinking blocks) once data has flowed.
+  const resetStallTimer = () => {
+    clearStallTimer()
+    if (disposed || closed || error) return
+    const stallTimeoutMs =
+      receivedMessage ?
+        (options.interChunkTimeoutMs ?? DEFAULT_INTER_CHUNK_TIMEOUT_MS)
+      : (options.firstChunkTimeoutMs ?? DEFAULT_FIRST_CHUNK_TIMEOUT_MS)
+    stallTimer = setTimeout(() => {
+      fail(
+        new Error(
+          options.streamStallMessage
+            ?? "Websocket stream stalled: no data received before timeout",
+        ),
+      )
+    }, stallTimeoutMs)
+    unrefTimer(stallTimer)
+  }
+
   const onMessage = (event: { data: unknown }) => {
     resetInactivityTimer()
+    receivedMessage = true
+    resetStallTimer()
     if (!buffer.enqueue(event.data)) {
       fail(
         new ResponsesWebSocketBufferOverflowError(
@@ -533,7 +613,7 @@ const createWebSocketMessageStream = <TChunk>(
       wasClean: event.wasClean,
     })
     closed = true
-    clearInactivityTimer()
+    clearTimers()
     wake()
   }
 
@@ -552,7 +632,7 @@ const createWebSocketMessageStream = <TChunk>(
   const dispose = () => {
     if (disposed) return
     disposed = true
-    clearInactivityTimer()
+    clearTimers()
     buffer.clear()
     websocket.removeEventListener("message", onMessage)
     websocket.removeEventListener("close", onClose)
@@ -582,10 +662,13 @@ const createWebSocketMessageStream = <TChunk>(
   })()
 
   return {
-    complete: clearInactivityTimer,
+    complete: clearTimers,
     dispose,
     iterable,
-    start: resetInactivityTimer,
+    start: () => {
+      resetInactivityTimer()
+      resetStallTimer()
+    },
   }
 }
 
@@ -676,3 +759,19 @@ const unrefTimer = (timer: ReturnType<typeof setTimeout>): void => {
     timer.unref()
   }
 }
+
+let lastWakeGapCheckAt = Date.now()
+const wakeGapCheckTimer = setInterval(() => {
+  const now = Date.now()
+  const drift = now - lastWakeGapCheckAt - WAKE_GAP_CHECK_INTERVAL_MS
+  lastWakeGapCheckAt = now
+  if (drift > WAKE_GAP_THRESHOLD_MS) {
+    consola.debug(
+      `Detected a ${Math.round(drift / 1000)}s clock gap (likely system sleep) -- flushing pooled websockets`,
+    )
+    for (const [poolKey, entry] of websocketPool) {
+      removePooledWebSocketEntry(poolKey, entry)
+    }
+  }
+}, WAKE_GAP_CHECK_INTERVAL_MS)
+unrefTimer(wakeGapCheckTimer)
