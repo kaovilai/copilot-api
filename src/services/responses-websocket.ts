@@ -45,6 +45,9 @@ const WAKE_GAP_THRESHOLD_MS = WAKE_GAP_CHECK_INTERVAL_MS * 3
 
 const websocketPool = new Map<string, PooledWebSocketEntry>()
 const websocketActiveRequests = new Map<string, number>()
+// Shared across all connections -- safe only because every decode() call
+// below is one-shot (no {stream: true}). A streaming decode call needs its
+// own decoder instance; it holds partial-multibyte state across calls.
 const textDecoder = new TextDecoder()
 
 interface PooledWebSocketEntry {
