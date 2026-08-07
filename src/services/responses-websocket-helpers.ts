@@ -35,9 +35,22 @@ export const createResponsesErrorServerSentEventChunk = (
 
 export const isTerminalResponsesStreamChunk = (chunk: {
   data?: string
+  event?: string
 }): boolean => {
   if (!chunk.data || chunk.data === "[DONE]") {
     return false
+  }
+
+  // Callers that already derive `event` from the same parse used to build
+  // the chunk (createResponsesWebSocketStreamChunk et al.) can skip a
+  // redundant JSON.parse here.
+  if (chunk.event !== undefined) {
+    return (
+      chunk.event === "response.completed"
+      || chunk.event === "response.failed"
+      || chunk.event === "response.incomplete"
+      || chunk.event === "error"
+    )
   }
 
   try {

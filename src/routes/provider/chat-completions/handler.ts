@@ -197,6 +197,12 @@ const streamProviderChatCompletions = (
 const parseChatCompletionChunkData = (
   data: string,
 ): ChatCompletionChunk | null => {
+  // Only the final chunk of a stream carries usage, which is all this parses
+  // for -- skip the JSON.parse on every other token.
+  if (!data.includes("usage")) {
+    return null
+  }
+
   try {
     return JSON.parse(data) as ChatCompletionChunk
   } catch {

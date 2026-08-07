@@ -1048,28 +1048,28 @@ const parseProviderStreamEvent = (
   data: string,
 ): {
   data: string
-  model?: string
   type: AnthropicStreamEventData["type"]
   usage: UsageTokens
 } | null => {
   try {
     const parsed = JSON.parse(data) as AnthropicStreamEventData
+    // parsed is never mutated here, so the original `data` string is always
+    // byte-identical to JSON.stringify(parsed) -- reuse it, skip the re-stringify.
     if (parsed.type === "message_start") {
       return {
-        data: JSON.stringify(parsed),
-        model: parsed.message.model,
+        data,
         type: parsed.type,
         usage: normalizeAnthropicUsage(parsed.message.usage),
       }
     }
     if (parsed.type === "message_delta") {
       return {
-        data: JSON.stringify(parsed),
+        data,
         type: parsed.type,
         usage: normalizeAnthropicUsage(parsed.usage),
       }
     }
-    return { data: JSON.stringify(parsed), type: parsed.type, usage: {} }
+    return { data, type: parsed.type, usage: {} }
   } catch (error) {
     logger.error("provider.messages.streaming.adjust_tokens_error", {
       error,
