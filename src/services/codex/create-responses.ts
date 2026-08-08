@@ -18,6 +18,7 @@ import {
   isResponsesApiWebSocketEnabled as isConfiguredResponsesApiWebSocketEnabled,
 } from "~/lib/config"
 import { HTTPError } from "~/lib/error"
+import { retryPreResponseFailures } from "~/lib/fetch-timeout"
 import { state } from "~/lib/state"
 import {
   createPooledWebSocketStream,
@@ -32,6 +33,7 @@ import {
 import {
   createResponsesHttpEventStream,
   fetchResponsesWithLifecycle,
+  ResponsesHeadersTimeoutError,
 } from "~/services/responses-http"
 import { requestContext } from "~/lib/request-context"
 import consola from "consola"
@@ -263,20 +265,26 @@ export async function forwardCodexResponses(
   const normalizedPayload = normalizeCodexResponsesPayload(payload)
 
   const transportConfig = getResponsesTransportConfig()
-  const response = await fetchResponsesWithLifecycle(
-    resolveCodexResponsesUrl(baseUrl),
-    {
-      method: "POST",
-      headers: buildCodexResponsesHeaders(requestHeaders, {
-        stream: normalizedPayload.stream,
-      }),
-      body: JSON.stringify(normalizedPayload),
-    },
-    {
-      headersTimeoutMs: transportConfig.headersTimeoutMs,
-      signal: options.signal,
-      streamInactivityTimeoutMs: transportConfig.streamInactivityTimeoutMs,
-    },
+  const response = await retryPreResponseFailures(
+    () =>
+      fetchResponsesWithLifecycle(
+        resolveCodexResponsesUrl(baseUrl),
+        {
+          method: "POST",
+          headers: buildCodexResponsesHeaders(requestHeaders, {
+            stream: normalizedPayload.stream,
+          }),
+          body: JSON.stringify(normalizedPayload),
+          signal: options.signal,
+        },
+        {
+          headersTimeoutMs: transportConfig.headersTimeoutMs,
+          signal: options.signal,
+          streamInactivityTimeoutMs: transportConfig.streamInactivityTimeoutMs,
+        },
+      ),
+    options.signal,
+    (error) => error instanceof ResponsesHeadersTimeoutError,
   )
 
   if (!response.ok) {

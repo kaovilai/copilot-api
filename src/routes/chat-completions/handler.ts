@@ -86,6 +86,7 @@ export async function handleCompletion(c: Context) {
     await chatCompletionsHandlerDependencies.createChatCompletions(payload, {
       requestId,
       sessionId,
+      signal: c.req.raw.signal,
     })
 
   if (isNonStreaming(response)) {

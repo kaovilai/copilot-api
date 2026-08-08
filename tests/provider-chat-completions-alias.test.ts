@@ -126,6 +126,7 @@ describe("provider/model aliases on top-level chat completions route", () => {
       "content-type": "application/json",
       accept: "application/json",
       authorization: "Bearer provider-key",
+      connection: "close",
     })
 
     const upstreamBody = JSON.parse((init as RequestInit).body as string) as {

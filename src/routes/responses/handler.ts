@@ -181,8 +181,8 @@ export const handleResponses = async (c: Context) => {
     subagentMarker,
     requestId,
     sessionId: fallbackSessionId,
-    signal: c.req.raw.signal,
     transport: responsesTransport,
+    signal: c.req.raw.signal,
   })
 
   if (isStreamingRequested(payload) && isAsyncIterable(response)) {

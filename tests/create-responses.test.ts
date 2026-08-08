@@ -91,6 +91,28 @@ afterEach(() => {
 })
 
 describe("createResponses", () => {
+  test("transparently retries an HTTP responses request after a hard transport error", async () => {
+    const payload: ResponsesPayload = {
+      input: "hello",
+      model: "gpt-test",
+    }
+
+    const connectionRefused = new Error("Unable to connect") as Error & {
+      code: string
+    }
+    connectionRefused.code = "ECONNREFUSED"
+    fetchMock.mockImplementationOnce(() => Promise.reject(connectionRefused))
+
+    const response = await createResponses(payload, {
+      initiator: "user",
+      requestId: "request-1",
+      vision: false,
+    })
+
+    expect(fetchMock).toHaveBeenCalledTimes(2)
+    expect(response).toEqual(createResponsesResult("gpt-test"))
+  })
+
   test("keeps HTTP responses requests using x-initiator header", async () => {
     const payload: ResponsesPayload = {
       input: "hello",
