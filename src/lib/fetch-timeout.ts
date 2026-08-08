@@ -1,5 +1,7 @@
 import { setTimeout as delay } from "node:timers/promises"
 
+import consola from "consola"
+
 import { HTTPError } from "~/lib/error"
 
 // Bounds only the time to establish a connection and receive response headers.
@@ -229,6 +231,15 @@ export interface RetryPreResponseFailuresOptions {
   steadyRetryDelayMs?: number
 }
 
+// Tracked globally (not per-request) so a fresh request that starts mid-outage
+// can report how long the upstream has actually been unreachable, not just
+// its own retry duration -- this is the "was the wifi actually down, and for
+// how long" signal, not shown by any single request's own timing.
+let lastSuccessfulConnectionAt: number | null = null
+
+const formatRetryDuration = (ms: number): string =>
+  ms < 1000 ? `${ms}ms` : `${(ms / 1000).toFixed(1)}s`
+
 export const retryPreResponseFailures = async (
   attempt: () => Promise<Response>,
   downstreamSignal: AbortSignal | undefined,
@@ -244,7 +255,15 @@ export const retryPreResponseFailures = async (
   const steadyRetryDelayMs =
     options.steadyRetryDelayMs ?? DEFAULT_STEADY_RETRY_DELAY_MS
 
-  const deadline = Date.now() + retryBudgetMs
+  const requestStartedAt = Date.now()
+  // Snapshot before this request can overwrite it with its own success below.
+  const previousSuccessAt = lastSuccessfulConnectionAt
+  const sinceLastSuccessText = (): string =>
+    previousSuccessAt === null ? "" : (
+      `, ${formatRetryDuration(Date.now() - previousSuccessAt)} since last successful connection`
+    )
+
+  const deadline = requestStartedAt + retryBudgetMs
   let attemptNumber = 0
   let ambiguousTimeoutAttempts = 0
 
@@ -256,7 +275,18 @@ export const retryPreResponseFailures = async (
     }
 
     try {
-      return await attempt()
+      const response = await attempt()
+
+      lastSuccessfulConnectionAt = Date.now()
+      if (attemptNumber > 1) {
+        const retries = attemptNumber - 1
+        consola.log(
+          `--> upstream reconnected after ${retries} ${retries === 1 ? "retry" : "retries"}`
+            + ` (${formatRetryDuration(Date.now() - requestStartedAt)} retrying)${sinceLastSuccessText()}`,
+        )
+      }
+
+      return response
     } catch (error) {
       if (downstreamSignal?.aborted) {
         throw toError(error)
@@ -278,6 +308,11 @@ export const retryPreResponseFailures = async (
         || Date.now() >= deadline
 
       if (exhausted) {
+        consola.error(
+          `--> upstream unreachable after ${attemptNumber} attempt(s)`
+            + ` (${formatRetryDuration(Date.now() - requestStartedAt)} retrying)${sinceLastSuccessText()}:`,
+          toError(error).message,
+        )
         throw new HTTPError(
           `Upstream unreachable after ${attemptNumber} attempt(s): ${toError(error).message}`,
           new Response(
