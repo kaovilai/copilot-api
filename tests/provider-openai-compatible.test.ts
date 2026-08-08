@@ -208,6 +208,7 @@ describe("openai-compatible provider messages", () => {
       "content-type": "application/json",
       accept: "application/json",
       authorization: "Bearer provider-key",
+      connection: "close",
     })
 
     const body = JSON.parse((init as RequestInit).body as string) as Record<

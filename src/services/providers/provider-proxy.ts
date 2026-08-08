@@ -6,12 +6,18 @@ import {
 
 import type { ResolvedProviderConfig } from "~/lib/config"
 import { getResponsesTransportConfig } from "~/lib/config"
-import { fetchWithConnectTimeout } from "~/lib/fetch-timeout"
+import {
+  fetchWithConnectRetry,
+  retryPreResponseFailures,
+} from "~/lib/fetch-timeout"
 import { createTimeoutDispatcher } from "~/lib/timeout-dispatcher"
 import type { AnthropicMessagesPayload } from "~/lib/types/anthropic"
 import type { ChatCompletionsPayload } from "~/lib/types/chat-completions"
 import type { ResponsesPayload } from "~/lib/types/responses"
-import { fetchResponsesWithLifecycle } from "~/services/responses-http"
+import {
+  fetchResponsesWithLifecycle,
+  ResponsesHeadersTimeoutError,
+} from "~/services/responses-http"
 
 const SHARED_FORWARDABLE_HEADERS = ["accept", "user-agent"] as const
 
@@ -88,34 +94,49 @@ export function createProviderProxyResponse(
   })
 }
 
+// Forces Bun to open a fresh TCP connection per request instead of reusing a
+// keep-alive socket -- eliminates the "resurrected zombie socket after wifi
+// reconnect" failure class outright. Verified empirically that Bun's fetch
+// honors this (see PR description / plan notes): default fetch reuses one TCP
+// connection across requests, this header forces a new one every time. Cost
+// is one extra TCP+TLS handshake (~50-150ms), negligible next to LLM latency.
+const CLOSE_CONNECTION_HEADERS = { connection: "close" } as const
+
 export async function forwardProviderMessages(
   providerConfig: ResolvedProviderConfig,
   payload: AnthropicMessagesPayload,
   requestHeaders: Headers,
+  signal: AbortSignal,
 ): Promise<Response> {
   consola.log(`<-- model: ${payload.model}`)
-  return await fetchWithConnectTimeout(
-    `${providerConfig.baseUrl}/v1/messages`,
-    {
-      method: "POST",
-      headers: buildProviderUpstreamHeaders(providerConfig, requestHeaders),
-      body: JSON.stringify(payload),
+  return await fetchWithConnectRetry(`${providerConfig.baseUrl}/v1/messages`, {
+    method: "POST",
+    headers: {
+      ...buildProviderUpstreamHeaders(providerConfig, requestHeaders),
+      ...CLOSE_CONNECTION_HEADERS,
     },
-  )
+    body: JSON.stringify(payload),
+    signal,
+  })
 }
 
 export async function forwardProviderChatCompletions(
   providerConfig: ResolvedProviderConfig,
   payload: ChatCompletionsPayload,
   requestHeaders: Headers,
+  signal: AbortSignal,
 ): Promise<Response> {
   consola.log(`<-- model: ${payload.model}`)
-  return await fetchWithConnectTimeout(
+  return await fetchWithConnectRetry(
     `${providerConfig.baseUrl}/v1/chat/completions`,
     {
       method: "POST",
-      headers: buildProviderUpstreamHeaders(providerConfig, requestHeaders),
+      headers: {
+        ...buildProviderUpstreamHeaders(providerConfig, requestHeaders),
+        ...CLOSE_CONNECTION_HEADERS,
+      },
       body: JSON.stringify(payload),
+      signal,
     },
   )
 }
@@ -128,18 +149,27 @@ export async function forwardProviderResponses(
 ): Promise<Response> {
   consola.log(`<-- model: ${payload.model}`)
   const transportConfig = getResponsesTransportConfig()
-  return await fetchResponsesWithLifecycle(
-    `${providerConfig.baseUrl}/v1/responses`,
-    {
-      method: "POST",
-      headers: buildProviderUpstreamHeaders(providerConfig, requestHeaders),
-      body: JSON.stringify(payload),
-    },
-    {
-      headersTimeoutMs: transportConfig.headersTimeoutMs,
-      signal: options.signal,
-      streamInactivityTimeoutMs: transportConfig.streamInactivityTimeoutMs,
-    },
+  return await retryPreResponseFailures(
+    () =>
+      fetchResponsesWithLifecycle(
+        `${providerConfig.baseUrl}/v1/responses`,
+        {
+          method: "POST",
+          headers: {
+            ...buildProviderUpstreamHeaders(providerConfig, requestHeaders),
+            ...CLOSE_CONNECTION_HEADERS,
+          },
+          body: JSON.stringify(payload),
+          signal: options.signal,
+        },
+        {
+          headersTimeoutMs: transportConfig.headersTimeoutMs,
+          signal: options.signal,
+          streamInactivityTimeoutMs: transportConfig.streamInactivityTimeoutMs,
+        },
+      ),
+    options.signal,
+    (error) => error instanceof ResponsesHeadersTimeoutError,
   )
 }
 

@@ -134,6 +134,7 @@ export const handleWithChatCompletions = async (
       requestId,
       sessionId,
       compactType,
+      signal: c.req.raw.signal,
     },
   )
 
@@ -263,9 +264,9 @@ export const handleWithResponsesApi = async (
     {
       vision,
       initiator,
-      signal: c.req?.raw?.signal,
       transport,
       ...requestOptions,
+      signal: c.req.raw.signal,
     },
   )
 
@@ -389,6 +390,7 @@ export const handleWithMessagesApi = async (
       requestId,
       sessionId,
       compactType,
+      signal: c.req.raw.signal,
     },
   )
 

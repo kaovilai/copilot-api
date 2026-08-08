@@ -26,6 +26,7 @@ import {
   type CopilotQuotaSnapshot,
 } from "~/lib/copilot-rate-limit"
 import { HTTPError } from "~/lib/error"
+import { retryPreResponseFailures } from "~/lib/fetch-timeout"
 import { state } from "~/lib/state"
 import {
   createPooledWebSocketStream,
@@ -39,6 +40,7 @@ import {
 import {
   createResponsesHttpEventStream,
   fetchResponsesWithLifecycle,
+  ResponsesHeadersTimeoutError,
 } from "~/services/responses-http"
 
 interface ResponsesRequestOptions {
@@ -107,18 +109,24 @@ const createHttpResponses = async (
   signal?: AbortSignal,
 ): Promise<CreateResponsesReturn> => {
   const transportConfig = getResponsesTransportConfig()
-  const response = await fetchResponsesWithLifecycle(
-    `${copilotBaseUrl(state)}/responses`,
-    {
-      method: "POST",
-      headers,
-      body: JSON.stringify(payload),
-    },
-    {
-      headersTimeoutMs: transportConfig.headersTimeoutMs,
-      signal,
-      streamInactivityTimeoutMs: transportConfig.streamInactivityTimeoutMs,
-    },
+  const response = await retryPreResponseFailures(
+    () =>
+      fetchResponsesWithLifecycle(
+        `${copilotBaseUrl(state)}/responses`,
+        {
+          method: "POST",
+          headers,
+          body: JSON.stringify(payload),
+          signal,
+        },
+        {
+          headersTimeoutMs: transportConfig.headersTimeoutMs,
+          signal,
+          streamInactivityTimeoutMs: transportConfig.streamInactivityTimeoutMs,
+        },
+      ),
+    signal,
+    (error) => error instanceof ResponsesHeadersTimeoutError,
   )
 
   logCopilotRateLimits(response.headers)

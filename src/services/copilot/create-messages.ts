@@ -17,7 +17,7 @@ import {
 } from "~/lib/api-config"
 import { logCopilotRateLimits } from "~/lib/copilot-rate-limit"
 import { HTTPError } from "~/lib/error"
-import { fetchWithConnectTimeout } from "~/lib/fetch-timeout"
+import { fetchWithConnectRetry } from "~/lib/fetch-timeout"
 import { state } from "~/lib/state"
 import { parseUserIdMetadata } from "~/lib/utils"
 
@@ -71,6 +71,7 @@ export const createMessages = async (
     requestId: string
     sessionId?: string
     compactType?: CompactType
+    signal?: AbortSignal
   },
 ): Promise<CreateMessagesReturn> => {
   if (!state.copilotToken) throw new Error("Copilot token not found")
@@ -138,12 +139,13 @@ export const createMessages = async (
 
   consola.log(`<-- model: ${payload.model}`)
 
-  const response = await fetchWithConnectTimeout(
+  const response = await fetchWithConnectRetry(
     `${copilotBaseUrl(state)}/v1/messages`,
     {
       method: "POST",
       headers,
       body: JSON.stringify(payload),
+      signal: options.signal,
     },
   )
 

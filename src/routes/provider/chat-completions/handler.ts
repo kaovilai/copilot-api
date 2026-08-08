@@ -83,6 +83,7 @@ export async function handleProviderChatCompletionsForProvider(
     providerConfig,
     payload,
     c.req.raw.headers,
+    c.req.raw.signal,
   )
 
   if (!upstreamResponse.ok) {

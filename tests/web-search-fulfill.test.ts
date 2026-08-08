@@ -47,6 +47,7 @@ const makeContext = () => {
       captured.json = value
       return { __json: value }
     },
+    req: { raw: { signal: new AbortController().signal } },
   }
   return { c: c as never, captured }
 }

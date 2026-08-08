@@ -217,6 +217,7 @@ export async function handleProviderMessagesForProvider(
         },
       payload,
       c.req.raw.headers,
+      c.req.raw.signal,
     )
 
     if (!upstreamResponse.ok) {
@@ -574,6 +575,7 @@ const handleOpenAICompatibleProviderMessages = async (
     providerConfig,
     openAIPayload,
     c.req.raw.headers,
+    c.req.raw.signal,
   )
 
   if (!upstreamResponse.ok) {

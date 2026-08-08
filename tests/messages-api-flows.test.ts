@@ -94,6 +94,7 @@ const logger = {
 const createContext = () =>
   ({
     json: (body: unknown) => Response.json(body),
+    req: { raw: { signal: new AbortController().signal } },
   }) as Parameters<typeof handleWithChatCompletions>[0]
 
 beforeEach(async () => {
