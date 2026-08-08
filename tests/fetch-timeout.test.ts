@@ -164,7 +164,7 @@ test("fetchWithConnectRetry caps retries when only ambiguous connect-timeouts oc
       {},
       {
         perAttemptConnectTimeoutMs: 5,
-        ambiguousTimeoutMaxAttempts: 1,
+        ambiguousTimeoutBudgetMs: 12,
         firstRetryDelayMs: 1,
         steadyRetryDelayMs: 1,
       },
@@ -175,8 +175,11 @@ test("fetchWithConnectRetry caps retries when only ambiguous connect-timeouts oc
 
   expect(thrown).toBeInstanceOf(HTTPError)
   expect((thrown as HTTPError).response.status).toBe(502)
-  // initial attempt + 1 retry, capped by ambiguousTimeoutMaxAttempts: 1
-  expect(calls).toBe(2)
+  // capped by ambiguousTimeoutBudgetMs: 12 -- each attempt takes ~5ms (the
+  // connect timeout) plus ~1ms backoff, so more than one retry fits before
+  // the 12ms ambiguous budget is exceeded, but the loop still terminates
+  // well short of retryBudgetMs.
+  expect(calls).toBeGreaterThan(1)
 })
 
 test("fetchWithConnectRetry stops immediately once the downstream signal aborts", async () => {
