@@ -151,14 +151,19 @@ const withBodyStallTimeout = (
 //     retry budget.
 //   - "ambiguous" errors (our own connect timeout fired) might mean a true
 //     blackhole, or might mean the server is just slow but already has the
-//     request -- capped at a few attempts so a slow-not-dead upstream isn't
-//     hammered with duplicate POSTs.
-// The numeric budget below is a safety net, not the real gate: the real gate
-// is the caller's own signal (e.g. the downstream client's disconnect) --
-// checked between attempts and during the backoff wait, so retrying stops
+//     request -- capped by their own shorter time budget (rather than the
+//     full retry budget) so a slow-not-dead upstream isn't hammered with
+//     duplicate POSTs indefinitely. The budget is time-based, not a raw
+//     attempt count, so it scales with wifi/network-handoff outages (which
+//     commonly run 10-60s+ for DHCP renewal or AP roam) instead of expiring
+//     after a fixed number of round-trips regardless of how long each one
+//     actually took.
+// The numeric budgets below are a safety net, not the real gate: the real
+// gate is the caller's own signal (e.g. the downstream client's disconnect)
+// -- checked between attempts and during the backoff wait, so retrying stops
 // immediately once nobody is left to answer, independent of the budget.
 const DEFAULT_PER_ATTEMPT_CONNECT_TIMEOUT_MS = 8_000
-const DEFAULT_AMBIGUOUS_TIMEOUT_MAX_ATTEMPTS = 3
+const DEFAULT_AMBIGUOUS_TIMEOUT_BUDGET_MS = 90_000
 const DEFAULT_RETRY_BUDGET_MS = 30 * 60_000
 const DEFAULT_FIRST_RETRY_DELAY_MS = 250
 const DEFAULT_STEADY_RETRY_DELAY_MS = 2_000
@@ -225,7 +230,7 @@ const toError = (value: unknown): Error =>
 // `isAmbiguousTimeout` lets each caller say which error class represents
 // "our own per-attempt deadline fired" for their specific attempt() shape.
 export interface RetryPreResponseFailuresOptions {
-  ambiguousTimeoutMaxAttempts?: number
+  ambiguousTimeoutBudgetMs?: number
   firstRetryDelayMs?: number
   retryBudgetMs?: number
   steadyRetryDelayMs?: number
@@ -246,9 +251,8 @@ export const retryPreResponseFailures = async (
   isAmbiguousTimeout: (error: unknown) => boolean,
   options: RetryPreResponseFailuresOptions = {},
 ): Promise<Response> => {
-  const ambiguousTimeoutMaxAttempts =
-    options.ambiguousTimeoutMaxAttempts
-    ?? DEFAULT_AMBIGUOUS_TIMEOUT_MAX_ATTEMPTS
+  const ambiguousTimeoutBudgetMs =
+    options.ambiguousTimeoutBudgetMs ?? DEFAULT_AMBIGUOUS_TIMEOUT_BUDGET_MS
   const retryBudgetMs = options.retryBudgetMs ?? DEFAULT_RETRY_BUDGET_MS
   const firstRetryDelayMs =
     options.firstRetryDelayMs ?? DEFAULT_FIRST_RETRY_DELAY_MS
@@ -264,8 +268,8 @@ export const retryPreResponseFailures = async (
     )
 
   const deadline = requestStartedAt + retryBudgetMs
+  const ambiguousDeadline = requestStartedAt + ambiguousTimeoutBudgetMs
   let attemptNumber = 0
-  let ambiguousTimeoutAttempts = 0
 
   for (;;) {
     attemptNumber++
@@ -299,12 +303,8 @@ export const retryPreResponseFailures = async (
         throw toError(error)
       }
 
-      if (isAmbiguous) {
-        ambiguousTimeoutAttempts++
-      }
-
       const exhausted =
-        (isAmbiguous && ambiguousTimeoutAttempts > ambiguousTimeoutMaxAttempts)
+        (isAmbiguous && Date.now() >= ambiguousDeadline)
         || Date.now() >= deadline
 
       if (exhausted) {
