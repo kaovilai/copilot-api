@@ -16,8 +16,9 @@ import {
 } from "~/lib/api-config"
 import { logCopilotRateLimits } from "~/lib/copilot-rate-limit"
 import { HTTPError } from "~/lib/error"
-import { fetchWithConnectRetry } from "~/lib/fetch-timeout"
 import { state } from "~/lib/state"
+
+import { fetchCopilotWithReauth } from "./fetch-with-reauth"
 
 export const createChatCompletions = async (
   payload: ChatCompletionsPayload,
@@ -64,7 +65,7 @@ export const createChatCompletions = async (
 
   consola.log(`<-- model: ${payload.model}`)
 
-  const response = await fetchWithConnectRetry(
+  const response = await fetchCopilotWithReauth(
     `${copilotBaseUrl(state)}/chat/completions`,
     {
       method: "POST",
