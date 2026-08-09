@@ -43,6 +43,8 @@ import {
   ResponsesHeadersTimeoutError,
 } from "~/services/responses-http"
 
+import { withCopilotReauth } from "./fetch-with-reauth"
+
 interface ResponsesRequestOptions {
   vision: boolean
   initiator: "agent" | "user"
@@ -109,24 +111,31 @@ const createHttpResponses = async (
   signal?: AbortSignal,
 ): Promise<CreateResponsesReturn> => {
   const transportConfig = getResponsesTransportConfig()
-  const response = await retryPreResponseFailures(
+  const response = await withCopilotReauth(
     () =>
-      fetchResponsesWithLifecycle(
-        `${copilotBaseUrl(state)}/responses`,
-        {
-          method: "POST",
-          headers,
-          body: JSON.stringify(payload),
-          signal,
-        },
-        {
-          headersTimeoutMs: transportConfig.headersTimeoutMs,
-          signal,
-          streamInactivityTimeoutMs: transportConfig.streamInactivityTimeoutMs,
-        },
+      retryPreResponseFailures(
+        () =>
+          fetchResponsesWithLifecycle(
+            `${copilotBaseUrl(state)}/responses`,
+            {
+              method: "POST",
+              headers,
+              body: JSON.stringify(payload),
+              signal,
+            },
+            {
+              headersTimeoutMs: transportConfig.headersTimeoutMs,
+              signal,
+              streamInactivityTimeoutMs:
+                transportConfig.streamInactivityTimeoutMs,
+            },
+          ),
+        signal,
+        (error) => error instanceof ResponsesHeadersTimeoutError,
       ),
-    signal,
-    (error) => error instanceof ResponsesHeadersTimeoutError,
+    () => {
+      headers.Authorization = `Bearer ${state.copilotToken}`
+    },
   )
 
   logCopilotRateLimits(response.headers)
