@@ -23,7 +23,7 @@ import { getCopilotUsage } from "~/services/github/get-copilot-usage"
 import { getDeviceCode } from "~/services/github/get-device-code"
 import { pollAccessToken } from "~/services/github/poll-access-token"
 
-import { HTTPError } from "./error"
+import { HTTPError, parseRetryAfterMs } from "./error"
 import { state } from "./state"
 
 let copilotRefreshLoopController: AbortController | null = null
@@ -229,6 +229,18 @@ export const getRefreshPollDelayMs = (
   nowMs: number = Date.now(),
 ) => Math.min(Math.max(refreshAtMs - nowMs, 0), REFRESH_POLL_INTERVAL_MS)
 
+// A 429's Retry-After overrides our own backoff schedule -- the server told
+// us exactly how long to wait, so guessing shorter would spam it and
+// guessing longer would recover slower than necessary. Returns null when
+// there's no Retry-After, so the caller falls back to its jittered backoff.
+export const getRetryAfterDelayMs = (
+  retryDelayMs: number,
+  retryAfterMs: number | null,
+): number | null =>
+  retryAfterMs === null ? null : (
+    Math.min(Math.max(retryAfterMs, retryDelayMs), MAX_RETRY_REFRESH_DELAY_MS)
+  )
+
 const runCopilotRefreshLoop = async (
   refreshIn: number,
   signal: AbortSignal,
@@ -266,10 +278,16 @@ const runCopilotRefreshLoop = async (
       }
     } catch (error) {
       failedAttempts++
-      const delayMs = Math.min(
-        retryDelayMs + Math.floor(Math.random() * RETRY_REFRESH_JITTER_MS),
-        MAX_RETRY_REFRESH_DELAY_MS,
-      )
+      const retryAfterMs =
+        error instanceof HTTPError ?
+          parseRetryAfterMs(error.response.headers)
+        : null
+      const delayMs =
+        getRetryAfterDelayMs(retryDelayMs, retryAfterMs)
+        ?? Math.min(
+          retryDelayMs + Math.floor(Math.random() * RETRY_REFRESH_JITTER_MS),
+          MAX_RETRY_REFRESH_DELAY_MS,
+        )
       refreshAtMs = Date.now() + delayMs
       retryDelayMs = Math.min(retryDelayMs * 2, MAX_RETRY_REFRESH_DELAY_MS)
 
