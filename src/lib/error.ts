@@ -12,6 +12,29 @@ export class HTTPError extends Error {
   }
 }
 
+// Parses Retry-After per RFC 9110: either delta-seconds or an HTTP-date.
+// Callers use this to pace their own retry loops against a 429/503 instead of
+// a fixed backoff that may retry sooner (spamming) or later (needlessly slow)
+// than what the server actually asked for.
+export function parseRetryAfterMs(headers: Headers): number | null {
+  const value = headers.get("retry-after")
+  if (!value) {
+    return null
+  }
+
+  const seconds = Number(value)
+  if (Number.isFinite(seconds) && value.trim() !== "") {
+    return Math.max(0, seconds * 1000)
+  }
+
+  const dateMs = Date.parse(value)
+  if (!Number.isNaN(dateMs)) {
+    return Math.max(0, dateMs - Date.now())
+  }
+
+  return null
+}
+
 export async function forwardError(
   c: Context,
   error: unknown,
