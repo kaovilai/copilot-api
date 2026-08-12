@@ -97,7 +97,25 @@ export async function persistCodexCredentials(
   applyCodexCredentials(credentials)
 }
 
-export const setupCopilotToken = async () => {
+// Concurrent 401s (or a 401 racing the background refresh loop) would each
+// call this independently, firing duplicate refresh requests at GitHub.
+// Single-flighting means the first caller does the refresh and every
+// concurrent caller just awaits that same result.
+let inFlightSetup: Promise<void> | null = null
+
+export const setupCopilotToken = async (): Promise<void> => {
+  if (inFlightSetup) {
+    return inFlightSetup
+  }
+
+  inFlightSetup = doSetupCopilotToken().finally(() => {
+    inFlightSetup = null
+  })
+
+  return inFlightSetup
+}
+
+const doSetupCopilotToken = async () => {
   if (isOpencodeOauthApp()) {
     if (!state.githubToken) throw new Error(`opencode token not found`)
 
