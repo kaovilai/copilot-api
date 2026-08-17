@@ -18,6 +18,42 @@ const USAGE_MAX_RETRY_DELAY_MS = 30_000
 const isRetriableStatus = (status: number): boolean =>
   status === 429 || status >= 500
 
+// GitHub's public Statuspage (githubstatus.com) exposes the Copilot component's
+// live health with no auth. When a retry fires we best-effort check it so the
+// log tells the operator whether this is a known GitHub outage or something
+// local. It has its own short timeout and never throws -- a status lookup must
+// not interfere with the retry loop it annotates.
+const GITHUB_STATUS_COMPONENTS_URL =
+  "https://www.githubstatus.com/api/v2/components.json"
+const GITHUB_STATUS_TIMEOUT_MS = 5_000
+
+interface StatusComponent {
+  name: string
+  status: string
+}
+
+const getCopilotOutageNote = async (): Promise<string> => {
+  try {
+    const response = await fetch(GITHUB_STATUS_COMPONENTS_URL, {
+      signal: AbortSignal.timeout(GITHUB_STATUS_TIMEOUT_MS),
+    })
+    if (!response.ok) return ""
+
+    const { components } = (await response.json()) as {
+      components?: Array<StatusComponent>
+    }
+    const copilot = components?.find((c) => c.name === "Copilot")
+    if (!copilot || copilot.status === "operational") return ""
+
+    // e.g. "major_outage" -> "major outage"
+    const readable = copilot.status.replace(/_/g, " ")
+    return ` (githubstatus.com reports Copilot: ${readable})`
+  } catch {
+    // Status page unreachable/slow -- annotate nothing, keep retrying.
+    return ""
+  }
+}
+
 // Emit the ASCII BEL so the macOS Terminal rings/bounces when service recovers.
 const ringBell = (): void => {
   process.stdout.write("")
@@ -44,8 +80,9 @@ export const getCopilotUsage = async (
     } catch (error) {
       // Network-level failure (connect/DNS/reset) -- retriable, retry forever.
       const delayMs = getUsageRetryDelayMs(attempt, null)
+      const outageNote = await getCopilotOutageNote()
       consola.warn(
-        `Failed to reach Copilot usage endpoint, retrying in ${Math.round(delayMs / 1000)}s (attempt ${attempt}): ${error instanceof Error ? error.message : String(error)}`,
+        `Failed to reach Copilot usage endpoint, retrying in ${Math.round(delayMs / 1000)}s (attempt ${attempt}): ${error instanceof Error ? error.message : String(error)}${outageNote}`,
       )
       await sleep(delayMs)
       continue
@@ -72,8 +109,9 @@ export const getCopilotUsage = async (
       attempt,
       parseRetryAfterMs(response.headers),
     )
+    const outageNote = await getCopilotOutageNote()
     consola.warn(
-      `Failed to get Copilot usage (status ${response.status}), retrying in ${Math.round(delayMs / 1000)}s (attempt ${attempt}): ${errorText}`,
+      `Failed to get Copilot usage (status ${response.status}), retrying in ${Math.round(delayMs / 1000)}s (attempt ${attempt}): ${errorText}${outageNote}`,
     )
     await sleep(delayMs)
   }
