@@ -30,6 +30,16 @@ const GITHUB_STATUS_TIMEOUT_MS = 5_000
 // Cadence for polling the status page while waiting out a known outage.
 const STATUS_POLL_INTERVAL_MS = 15_000
 
+// Statuspage components the copilot_internal/user call depends on: the Copilot
+// service and its model providers, plus "API Requests" which covers GitHub API
+// auth/token handling. An outage in any one can surface as our transient
+// failure, so we wait on all of them.
+const WATCHED_STATUS_COMPONENTS = [
+  "Copilot",
+  "Copilot AI Model Providers",
+  "API Requests",
+]
+
 type CopilotHealth = "operational" | "outage" | "unknown"
 
 interface StatusComponent {
@@ -39,11 +49,11 @@ interface StatusComponent {
 
 interface CopilotHealthResult {
   health: CopilotHealth
-  // Human-readable component status when in outage, e.g. "major outage".
+  // Human-readable summary when in outage, e.g. "Copilot: major outage".
   label: string
 }
 
-// Best-effort read of the Copilot component's live health. Own short timeout,
+// Best-effort read of the watched components' live health. Own short timeout,
 // never throws: any failure is reported as "unknown" so callers fall back to
 // retrying GitHub directly rather than trusting a status page we couldn't reach.
 const getCopilotHealth = async (): Promise<CopilotHealthResult> => {
@@ -56,13 +66,25 @@ const getCopilotHealth = async (): Promise<CopilotHealthResult> => {
     const { components } = (await response.json()) as {
       components?: Array<StatusComponent>
     }
-    const copilot = components?.find((c) => c.name === "Copilot")
-    if (!copilot) return { health: "unknown", label: "" }
-    if (copilot.status === "operational") {
-      return { health: "operational", label: "" }
+    const watched = WATCHED_STATUS_COMPONENTS.map((name) =>
+      components?.find((c) => c.name === name),
+    )
+    // If we can't find any watched component the page shape is unexpected.
+    if (watched.every((c) => c === undefined)) {
+      return { health: "unknown", label: "" }
     }
-    // e.g. "major_outage" -> "major outage"
-    return { health: "outage", label: copilot.status.replace(/_/g, " ") }
+
+    const down = watched.filter(
+      (c): c is StatusComponent =>
+        c !== undefined && c.status !== "operational",
+    )
+    if (down.length === 0) return { health: "operational", label: "" }
+
+    // e.g. "Copilot: major outage, API Requests: partial outage"
+    const label = down
+      .map((c) => `${c.name}: ${c.status.replace(/_/g, " ")}`)
+      .join(", ")
+    return { health: "outage", label }
   } catch {
     return { health: "unknown", label: "" }
   }
@@ -93,12 +115,12 @@ const waitBeforeRetry = async (
 
   if (health === "outage") {
     consola.warn(
-      `githubstatus.com reports Copilot: ${label}; polling the status page instead of GitHub until it recovers`,
+      `githubstatus.com reports ${label}; polling the status page instead of GitHub until it recovers`,
     )
     const recovered = await waitForCopilotOperational()
     if (recovered) {
       consola.info(
-        "githubstatus.com reports Copilot operational again; retrying GitHub now",
+        "githubstatus.com reports Copilot services operational again; retrying GitHub now",
       )
       return
     }

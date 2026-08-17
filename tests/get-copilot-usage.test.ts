@@ -172,19 +172,29 @@ test("retries network errors indefinitely until success", async () => {
   expect(usageMock).toHaveBeenCalledTimes(6)
 })
 
-// Route GitHub calls and status-page calls separately, with the status page
-// reporting outage until `pollsUntilGreen` reads have elapsed, then operational.
+// Route GitHub calls and status-page calls separately, with the named status
+// component reporting outage until `pollsUntilGreen` reads have elapsed, then
+// operational. All other watched components stay operational throughout.
 const installOutageFetch = (
   pollsUntilGreen: number,
+  outageComponent = "Copilot",
 ): { ghCalls: () => number; statusCalls: () => number } => {
   let ghCalls = 0
   let statusPolls = 0
   globalThis.fetch = ((url: string | URL) => {
     if (String(url) === STATUS_URL) {
       statusPolls++
-      const status =
-        statusPolls >= pollsUntilGreen ? "operational" : "major_outage"
-      return makeResponse(200, { components: [{ name: "Copilot", status }] })
+      const down = statusPolls < pollsUntilGreen
+      const components = [
+        "Copilot",
+        "Copilot AI Model Providers",
+        "API Requests",
+      ].map((name) => ({
+        name,
+        status:
+          down && name === outageComponent ? "major_outage" : "operational",
+      }))
+      return makeResponse(200, { components })
     }
     ghCalls++
     return ghCalls === 1 ?
@@ -202,6 +212,14 @@ test("during a known outage, polls the status page and does not hit GitHub until
   expect(result).toEqual(usageBody)
   // GitHub hit exactly twice: the initial 503, then the immediate retry on
   // recovery -- never during the outage window.
+  expect(ghCalls()).toBe(2)
+})
+
+test("waits out an API Requests (auth) outage, not just Copilot", async () => {
+  const { ghCalls } = installOutageFetch(4, "API Requests")
+
+  const result = await getCopilotUsage()
+  expect(result).toEqual(usageBody)
   expect(ghCalls()).toBe(2)
 })
 
