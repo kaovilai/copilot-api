@@ -19,39 +19,99 @@ const isRetriableStatus = (status: number): boolean =>
   status === 429 || status >= 500
 
 // GitHub's public Statuspage (githubstatus.com) exposes the Copilot component's
-// live health with no auth. When a retry fires we best-effort check it so the
-// log tells the operator whether this is a known GitHub outage or something
-// local. It has its own short timeout and never throws -- a status lookup must
-// not interfere with the retry loop it annotates.
+// live health with no auth and is served from a CDN built to be polled. When a
+// GitHub API call fails and the status page reports a known Copilot outage, we
+// stop hitting GitHub entirely and poll only this cheap endpoint until it turns
+// green -- then retry GitHub immediately. That waits out the outage without
+// spamming GitHub's servers, yet resumes the instant service is restored.
 const GITHUB_STATUS_COMPONENTS_URL =
   "https://www.githubstatus.com/api/v2/components.json"
 const GITHUB_STATUS_TIMEOUT_MS = 5_000
+// Cadence for polling the status page while waiting out a known outage.
+const STATUS_POLL_INTERVAL_MS = 15_000
+
+type CopilotHealth = "operational" | "outage" | "unknown"
 
 interface StatusComponent {
   name: string
   status: string
 }
 
-const getCopilotOutageNote = async (): Promise<string> => {
+interface CopilotHealthResult {
+  health: CopilotHealth
+  // Human-readable component status when in outage, e.g. "major outage".
+  label: string
+}
+
+// Best-effort read of the Copilot component's live health. Own short timeout,
+// never throws: any failure is reported as "unknown" so callers fall back to
+// retrying GitHub directly rather than trusting a status page we couldn't reach.
+const getCopilotHealth = async (): Promise<CopilotHealthResult> => {
   try {
     const response = await fetch(GITHUB_STATUS_COMPONENTS_URL, {
       signal: AbortSignal.timeout(GITHUB_STATUS_TIMEOUT_MS),
     })
-    if (!response.ok) return ""
+    if (!response.ok) return { health: "unknown", label: "" }
 
     const { components } = (await response.json()) as {
       components?: Array<StatusComponent>
     }
     const copilot = components?.find((c) => c.name === "Copilot")
-    if (!copilot || copilot.status === "operational") return ""
-
+    if (!copilot) return { health: "unknown", label: "" }
+    if (copilot.status === "operational") {
+      return { health: "operational", label: "" }
+    }
     // e.g. "major_outage" -> "major outage"
-    const readable = copilot.status.replace(/_/g, " ")
-    return ` (githubstatus.com reports Copilot: ${readable})`
+    return { health: "outage", label: copilot.status.replace(/_/g, " ") }
   } catch {
-    // Status page unreachable/slow -- annotate nothing, keep retrying.
-    return ""
+    return { health: "unknown", label: "" }
   }
+}
+
+// Poll only the status page until Copilot is operational again, so we ride out a
+// known outage without touching GitHub. Returns true once green; returns false
+// if health becomes undeterminable, so the caller can fall back to GitHub
+// backoff instead of polling a status page it can no longer read.
+const waitForCopilotOperational = async (): Promise<boolean> => {
+  for (;;) {
+    await sleep(STATUS_POLL_INTERVAL_MS)
+    const { health } = await getCopilotHealth()
+    if (health === "operational") return true
+    if (health === "unknown") return false
+    // still in outage -- keep polling the cheap status page, not GitHub.
+  }
+}
+
+// Decide how long to wait before the next GitHub attempt. During a known Copilot
+// outage this polls the status page (not GitHub) and returns the moment it
+// recovers; otherwise it sleeps the normal capped exponential backoff.
+const waitBeforeRetry = async (
+  attempt: number,
+  retryAfterMs: number | null,
+): Promise<void> => {
+  const { health, label } = await getCopilotHealth()
+
+  if (health === "outage") {
+    consola.warn(
+      `githubstatus.com reports Copilot: ${label}; polling the status page instead of GitHub until it recovers`,
+    )
+    const recovered = await waitForCopilotOperational()
+    if (recovered) {
+      consola.info(
+        "githubstatus.com reports Copilot operational again; retrying GitHub now",
+      )
+      return
+    }
+    consola.warn(
+      "Could not confirm Copilot status; falling back to GitHub backoff",
+    )
+  }
+
+  const delayMs = getUsageRetryDelayMs(attempt, retryAfterMs)
+  consola.warn(
+    `Retrying in ${Math.round(delayMs / 1000)}s (attempt ${attempt})`,
+  )
+  await sleep(delayMs)
 }
 
 // Emit the ASCII BEL so the macOS Terminal rings/bounces when service recovers.
@@ -79,12 +139,10 @@ export const getCopilotUsage = async (
       })
     } catch (error) {
       // Network-level failure (connect/DNS/reset) -- retriable, retry forever.
-      const delayMs = getUsageRetryDelayMs(attempt, null)
-      const outageNote = await getCopilotOutageNote()
       consola.warn(
-        `Failed to reach Copilot usage endpoint, retrying in ${Math.round(delayMs / 1000)}s (attempt ${attempt}): ${error instanceof Error ? error.message : String(error)}${outageNote}`,
+        `Failed to reach Copilot usage endpoint (attempt ${attempt}): ${error instanceof Error ? error.message : String(error)}`,
       )
-      await sleep(delayMs)
+      await waitBeforeRetry(attempt, null)
       continue
     }
 
@@ -105,15 +163,10 @@ export const getCopilotUsage = async (
       throw new HTTPError("Failed to get Copilot usage", response)
     }
 
-    const delayMs = getUsageRetryDelayMs(
-      attempt,
-      parseRetryAfterMs(response.headers),
-    )
-    const outageNote = await getCopilotOutageNote()
     consola.warn(
-      `Failed to get Copilot usage (status ${response.status}), retrying in ${Math.round(delayMs / 1000)}s (attempt ${attempt}): ${errorText}${outageNote}`,
+      `Failed to get Copilot usage (status ${response.status}, attempt ${attempt}): ${errorText}`,
     )
-    await sleep(delayMs)
+    await waitBeforeRetry(attempt, parseRetryAfterMs(response.headers))
   }
 }
 
