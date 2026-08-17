@@ -172,38 +172,65 @@ test("retries network errors indefinitely until success", async () => {
   expect(usageMock).toHaveBeenCalledTimes(6)
 })
 
-test("annotates retry log with githubstatus.com Copilot outage", async () => {
-  let calls = 0
-  installFetch(
-    () => {
-      calls++
-      return calls < 2 ?
-          makeResponse(503, { message: "down" })
-        : makeResponse(200, usageBody)
-    },
-    () =>
-      makeResponse(200, {
-        components: [{ name: "Copilot", status: "major_outage" }],
-      }),
-  )
+// Route GitHub calls and status-page calls separately, with the status page
+// reporting outage until `pollsUntilGreen` reads have elapsed, then operational.
+const installOutageFetch = (
+  pollsUntilGreen: number,
+): { ghCalls: () => number; statusCalls: () => number } => {
+  let ghCalls = 0
+  let statusPolls = 0
+  globalThis.fetch = ((url: string | URL) => {
+    if (String(url) === STATUS_URL) {
+      statusPolls++
+      const status =
+        statusPolls >= pollsUntilGreen ? "operational" : "major_outage"
+      return makeResponse(200, { components: [{ name: "Copilot", status }] })
+    }
+    ghCalls++
+    return ghCalls === 1 ?
+        makeResponse(503, { message: "down" })
+      : makeResponse(200, usageBody)
+  }) as unknown as typeof fetch
+  return { ghCalls: () => ghCalls, statusCalls: () => statusPolls }
+}
 
-  const messages: Array<string> = []
+test("during a known outage, polls the status page and does not hit GitHub until green", async () => {
+  // Status page: initial check + two outage polls, then operational (4th read).
+  const { ghCalls } = installOutageFetch(4)
+
+  const result = await getCopilotUsage()
+  expect(result).toEqual(usageBody)
+  // GitHub hit exactly twice: the initial 503, then the immediate retry on
+  // recovery -- never during the outage window.
+  expect(ghCalls()).toBe(2)
+})
+
+test("logs Copilot outage and recovery when polling the status page", async () => {
+  installOutageFetch(2)
+
   const { default: consola } = await import("consola")
+  const messages: Array<string> = []
   const originalWarn = consola.warn
-  consola.warn = ((msg: string) => {
-    messages.push(String(msg))
+  const originalInfo = consola.info
+  consola.warn = ((m: string) => {
+    messages.push(String(m))
   }) as typeof consola.warn
+  consola.info = ((m: string) => {
+    messages.push(String(m))
+  }) as typeof consola.info
 
   try {
     await getCopilotUsage()
   } finally {
     consola.warn = originalWarn
+    consola.info = originalInfo
   }
 
   expect(messages.some((m) => m.includes("Copilot: major outage"))).toBe(true)
+  expect(messages.some((m) => m.includes("operational again"))).toBe(true)
 })
 
-test("keeps retrying when the status page itself is unreachable", async () => {
+test("falls back to GitHub backoff when the status page is unreachable", async () => {
   let calls = 0
   const usageMock = installFetch(
     () => {
