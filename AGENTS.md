@@ -12,7 +12,7 @@ This is a Bun/TypeScript API gateway project. Core server and route code lives i
 - `bun run build:desktop`: build the desktop server bundle.
 - `bun run typecheck`: run TypeScript checks with `noEmit`.
 - `bun run lint` or `bun run lint:all`: run ESLint and Prettier checks.
-- `bun test`: run all Bun tests.
+- `bun test --isolate`: run all Bun tests. `--isolate` is required — several test files call `mock.module()` on shared modules (e.g. `~/lib/token`), and without isolation Bun's process-wide module registry lets one file's mock leak into another depending on load order.
 - `bun test tests/provider-resolver.test.ts`: run one test file.
 
 ## Coding Style & Naming Conventions
