@@ -1,0 +1,5 @@
+version: "1"
+rules:
+  - base: dev # Target branch
+    upstream: caozhiyuan:dev # Upstream repository, must be in the same fork network
+    mergeMethod: rebase # Sync using rebase
