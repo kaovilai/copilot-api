@@ -28,7 +28,6 @@ import {
 import { HTTPError, UpstreamHeadersTimeoutError } from "~/lib/error"
 import { retryPreResponseFailures } from "~/lib/fetch-timeout"
 import { state } from "~/lib/state"
-import { sleep } from "~/lib/utils"
 import {
   createPooledWebSocketStream,
   createWebSocketUrl,
@@ -52,12 +51,6 @@ interface ResponsesRequestOptions {
   compactType?: CompactType
   transport?: ResponsesTransport
   clientSignal?: AbortSignal
-}
-
-const ROOT_AGENT_MESSAGE_DELAY_MS = 1_000
-
-export const createResponsesDependencies = {
-  sleep,
 }
 
 export const createResponses = async (
@@ -94,11 +87,6 @@ export const createResponses = async (
 
   if (payload.stream === true && effectiveTransport === "websocket") {
     clientSignal?.throwIfAborted()
-    if (shouldDelaySubagentRequestAfterRootMessage(payload.input)) {
-      // A subagent can start before Copilot has made the root agent's encrypted
-      // function output available, causing decrypt or decode failures.
-      await createResponsesDependencies.sleep(ROOT_AGENT_MESSAGE_DELAY_MS)
-    }
     const websocketRequest = prepareResponsesWebSocketRequest(
       payload,
       headers,
@@ -115,22 +103,6 @@ export const createResponses = async (
   }
 
   return await createHttpResponses(payload, headers, clientSignal)
-}
-
-const shouldDelaySubagentRequestAfterRootMessage = (
-  input: ResponsesPayload["input"],
-): boolean => {
-  if (!Array.isArray(input)) return false
-
-  const lastItem: unknown = input.at(-1)
-  return (
-    typeof lastItem === "object"
-    && lastItem !== null
-    && "type" in lastItem
-    && lastItem.type === "agent_message"
-    && "author" in lastItem
-    && lastItem.author === "/root"
-  )
 }
 
 const createHttpResponses = async (
