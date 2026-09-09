@@ -18,6 +18,20 @@ on:
       - '**.md'
   workflow_dispatch:
 
+# Only the newest push to dev should ever end up published as :latest --
+# without this, two overlapping runs (e.g. a quick follow-up push before the
+# first build finishes) could finish out of order and let an OLDER commit's
+# build overwrite :latest after a newer one already did. Cancelling the
+# in-progress older run instead of letting both race to publish means only
+# the latest commit's build ever actually completes and pushes.
+concurrency:
+  group: docker-build-dev-${{ github.ref }}
+  cancel-in-progress: true
+
+# Deny-by-default at the workflow level; the job below grants back only what
+# it actually needs (contents:read to checkout, packages:write to push).
+permissions: {}
+
 env:
   REGISTRY: ghcr.io
   IMAGE_NAME: ${{ github.repository }}
@@ -30,13 +44,15 @@ jobs:
       packages: write
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
 
       - name: Log in to the Container registry
-        uses: docker/login-action@v3
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
         with:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
@@ -44,7 +60,7 @@ jobs:
 
       - name: Extract metadata
         id: meta
-        uses: docker/metadata-action@v5
+        uses: docker/metadata-action@c299e40c65443455700f0fdfc63efafe5b349051 # v5
         with:
           images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
           tags: |
@@ -52,7 +68,7 @@ jobs:
             type=sha,prefix=dev-,suffix=-{{date 'YYYYMMDDHHmmss'}}
 
       - name: Build and push
-        uses: docker/build-push-action@v5
+        uses: docker/build-push-action@ca052bb54ab0790a636c9b5f226502c73d547a25 # v5
         with:
           context: .
           platforms: linux/amd64
