@@ -290,6 +290,85 @@ describe("chat completions streaming usage pre-check", () => {
     expect(toolCallIndices).toEqual([0, 0])
   })
 
+  test("does not throw on a chunk whose raw text mentions tool_calls but has no usable choices/delta", async () => {
+    // The remap guard only substring-checks the raw data for "tool_calls"
+    // before parsing (a cheap fast-path to skip JSON.parse on plain content
+    // chunks) -- a malformed or unexpected upstream chunk that happens to
+    // contain that substring without a real choices/delta shape must not
+    // crash the remap function itself, or it kills the whole stream (caught
+    // by the outer try/catch now, but still ends the response early and
+    // logs as an unexpected error for what should just be a no-op).
+    createChatCompletions.mockImplementation(() =>
+      Promise.resolve(
+        streamChunks([
+          {
+            // No `choices` field at all.
+            data: JSON.stringify({
+              created: 0,
+              id: "chatcmpl-1",
+              model: "gpt-test",
+              note: "mentions tool_calls but carries no real payload",
+              object: "chat.completion.chunk",
+            }),
+          },
+          {
+            // `choices` present, but the choice has no `delta`.
+            data: JSON.stringify({
+              choices: [{ finish_reason: "stop", index: 0 }],
+              created: 0,
+              id: "chatcmpl-1",
+              model: "gpt-test",
+              note: "tool_calls",
+              object: "chat.completion.chunk",
+            }),
+          },
+          {
+            data: JSON.stringify({
+              choices: [{ delta: { content: "still works" }, index: 0 }],
+              created: 0,
+              id: "chatcmpl-1",
+              model: "gpt-test",
+              object: "chat.completion.chunk",
+            }),
+          },
+          {
+            data: "[DONE]",
+          },
+        ]),
+      ),
+    )
+
+    const app = createApp()
+    const response = await app.request("/v1/chat/completions", {
+      body: JSON.stringify({
+        messages: [{ content: "hi", role: "user" }],
+        model: "gpt-test",
+        stream: true,
+      }),
+      headers: {
+        "content-type": "application/json",
+      },
+      method: "POST",
+    })
+
+    expect(response.status).toBe(200)
+    const body = await response.text()
+    const dataLines = body
+      .split("\n")
+      .filter((line) => line.startsWith("data:"))
+      .map((line) => line.slice("data:".length).trim())
+
+    // All 4 chunks (including "[DONE]") made it through unchanged -- the
+    // malformed ones were passed through as-is (remap returns null), not
+    // dropped or used to abort the stream early.
+    expect(dataLines).toHaveLength(4)
+    expect(dataLines[3]).toBe("[DONE]")
+    const lastContentChunk = JSON.parse(dataLines[2]) as {
+      choices: Array<{ delta: { content?: string } }>
+    }
+    expect(lastContentChunk.choices[0]?.delta.content).toBe("still works")
+  })
+
   test("gracefully ends the stream on client abort instead of crashing", async () => {
     // Simulates a client disconnect mid-stream (or the request otherwise
     // being cancelled) aborting the upstream read. Previously unhandled:
