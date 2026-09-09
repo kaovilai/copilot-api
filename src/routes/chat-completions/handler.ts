@@ -107,20 +107,39 @@ export async function handleCompletion(c: Context) {
     let usage: UsageTokens = {}
     const toolCallIndexMap = new Map<number, number>()
 
-    for await (const chunk of response) {
-      debugJson(logger, "Streaming chunk:", chunk)
-      const parsedChunk = parseChatCompletionChunk(chunk)
-      if (parsedChunk?.usage || parsedChunk?.copilot_usage) {
-        usage = {
-          ...normalizeOpenAIUsage(parsedChunk.usage),
-          total_nano_aiu: normalizeOptionalToken(
-            parsedChunk.copilot_usage?.total_nano_aiu,
-          ),
+    try {
+      for await (const chunk of response) {
+        debugJson(logger, "Streaming chunk:", chunk)
+        const parsedChunk = parseChatCompletionChunk(chunk)
+        if (parsedChunk?.usage || parsedChunk?.copilot_usage) {
+          usage = {
+            ...normalizeOpenAIUsage(parsedChunk.usage),
+            total_nano_aiu: normalizeOptionalToken(
+              parsedChunk.copilot_usage?.total_nano_aiu,
+            ),
+          }
         }
-      }
 
-      const remapped = remapToolCallChunkIndices(chunk, toolCallIndexMap)
-      await stream.writeSSE((remapped ?? chunk) as SSEMessage)
+        const remapped = remapToolCallChunkIndices(chunk, toolCallIndexMap)
+        await stream.writeSSE((remapped ?? chunk) as SSEMessage)
+      }
+    } catch (error) {
+      // A client disconnect (or the request otherwise being cancelled) aborts
+      // the upstream stream mid-read -- expected, not a bug. Previously
+      // unhandled here: route.ts's try/catch only wraps handleCompletion's
+      // synchronous return of the streamSSE Response, not this async
+      // callback, which streamSSE invokes AFTER that Response has already
+      // been returned. An uncaught abort here surfaced as a raw, unformatted
+      // DOMException dump in logs and left the connection just stop instead
+      // of closing cleanly -- confirmed live. Log quietly for an abort
+      // (matching forwardError's existing handling for the non-streaming
+      // path), loudly for anything else, and still record whatever partial
+      // usage was captured either way rather than silently dropping it.
+      if (c.req.raw.signal.aborted || isAbortError(error)) {
+        logger.debug("Streaming response aborted (client disconnected)")
+      } else {
+        consola.error("Error in streaming response:", error)
+      }
     }
 
     recordUsage(usage)
@@ -130,6 +149,9 @@ export async function handleCompletion(c: Context) {
 const isNonStreaming = (
   response: Awaited<ReturnType<typeof createCopilotChatCompletions>>,
 ): response is ChatCompletionResponse => Object.hasOwn(response, "choices")
+
+const isAbortError = (error: unknown): boolean =>
+  error instanceof Error && error.name === "AbortError"
 
 /**
  * GitHub Copilot's upstream chat-completions response omits `object` on the

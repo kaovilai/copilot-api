@@ -289,6 +289,65 @@ describe("chat completions streaming usage pre-check", () => {
 
     expect(toolCallIndices).toEqual([0, 0])
   })
+
+  test("gracefully ends the stream on client abort instead of crashing", async () => {
+    // Simulates a client disconnect mid-stream (or the request otherwise
+    // being cancelled) aborting the upstream read. Previously unhandled:
+    // route.ts's try/catch only wraps handleCompletion's synchronous return
+    // of the streamSSE Response, not this async generator loop -- an
+    // uncaught abort here surfaced as a raw, unformatted error dump and left
+    // the connection just stop instead of closing cleanly.
+    async function* streamThenAbort() {
+      await Promise.resolve()
+      yield {
+        data: JSON.stringify({
+          choices: [
+            { delta: { content: "partial" }, finish_reason: null, index: 0 },
+          ],
+          created: 0,
+          id: "chatcmpl-1",
+          model: "gpt-test",
+          object: "chat.completion.chunk",
+        }),
+      }
+      const abortError = new Error("The connection was closed.")
+      abortError.name = "AbortError"
+      throw abortError
+    }
+
+    createChatCompletions.mockImplementation(() =>
+      Promise.resolve(streamThenAbort()),
+    )
+
+    const app = createApp()
+    const response = await app.request("/v1/chat/completions", {
+      body: JSON.stringify({
+        messages: [{ content: "hi", role: "user" }],
+        model: "gpt-test",
+        stream: true,
+      }),
+      headers: {
+        "content-type": "application/json",
+      },
+      method: "POST",
+    })
+
+    expect(response.status).toBe(200)
+    // Must not throw/hang -- this is exactly what an uncaught abort in the
+    // generator loop previously broke.
+    const body = await response.text()
+
+    const dataLines = body
+      .split("\n")
+      .filter((line) => line.startsWith("data:"))
+      .map((line) => line.slice("data:".length).trim())
+
+    expect(dataLines).toHaveLength(1)
+    const firstChunk = JSON.parse(dataLines[0]) as {
+      choices: Array<{ delta: { content?: string } }>
+    }
+    expect(firstChunk.choices[0]?.delta.content).toBe("partial")
+  })
 })
 
 describe("chat completions non-streaming response normalization", () => {
