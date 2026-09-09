@@ -105,6 +105,7 @@ export async function handleCompletion(c: Context) {
   logger.debug("Streaming response")
   return streamSSE(c, async (stream) => {
     let usage: UsageTokens = {}
+    const toolCallIndexMap = new Map<number, number>()
 
     for await (const chunk of response) {
       debugJson(logger, "Streaming chunk:", chunk)
@@ -117,7 +118,9 @@ export async function handleCompletion(c: Context) {
           ),
         }
       }
-      await stream.writeSSE(chunk as SSEMessage)
+
+      const remapped = remapToolCallChunkIndices(chunk, toolCallIndexMap)
+      await stream.writeSSE((remapped ?? chunk) as SSEMessage)
     }
 
     recordUsage(usage)
@@ -170,4 +173,60 @@ const parseChatCompletionChunk = (
   } catch {
     return null
   }
+}
+
+/**
+ * GitHub Copilot's upstream stream reuses Anthropic content-block indices
+ * for `tool_calls[].index` -- when a text block precedes a tool call, the
+ * text consumes "block 0", so the first tool call streams with `index: 1`
+ * instead of `0`, leaving a hole at index 0. Streaming AI SDK clients (n8n's
+ * bundled @ai-sdk/provider-utils among them, per vercel/ai#18333) track
+ * streamed tool calls in an array positioned BY this index, and their
+ * flush() handler iterates that array with a bare `for...of` (which does
+ * not skip holes), crashing with "Cannot read properties of undefined
+ * (reading 'hasFinished')" on the empty slot. Confirmed live: n8n 2.37.10's
+ * AI Assistant crashed on exactly this pattern (a one-sentence preamble
+ * before a tool call) against this gateway.
+ *
+ * Remaps each tool call's raw index to a sequential, zero-based one (in
+ * order of first appearance in this stream) before forwarding, matching
+ * what OpenAI's own real API always does. `indexMap` is fresh per request/
+ * stream (see caller). Returns null (pass the original chunk through
+ * unchanged) when there's nothing to remap or the chunk doesn't parse.
+ */
+function remapToolCallChunkIndices(
+  chunk: unknown,
+  indexMap: Map<number, number>,
+): { data: string } | null {
+  const data = (chunk as { data?: string }).data
+  if (!data || data === "[DONE]" || !data.includes("tool_calls")) {
+    return null
+  }
+
+  let parsed: ChatCompletionChunk
+  try {
+    parsed = JSON.parse(data) as ChatCompletionChunk
+  } catch {
+    return null
+  }
+
+  let changed = false
+  for (const choice of parsed.choices) {
+    const toolCalls = choice.delta.tool_calls
+    if (!toolCalls) continue
+    for (const toolCall of toolCalls) {
+      if (toolCall.index == null) continue
+      let mapped = indexMap.get(toolCall.index)
+      if (mapped == null) {
+        mapped = indexMap.size
+        indexMap.set(toolCall.index, mapped)
+      }
+      if (mapped !== toolCall.index) {
+        toolCall.index = mapped
+        changed = true
+      }
+    }
+  }
+
+  return changed ? { ...(chunk as object), data: JSON.stringify(parsed) } : null
 }
