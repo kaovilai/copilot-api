@@ -105,7 +105,7 @@ export async function handleCompletion(c: Context) {
   logger.debug("Streaming response")
   return streamSSE(c, async (stream) => {
     let usage: UsageTokens = {}
-    const toolCallIndexMap = new Map<number, number>()
+    const toolCallIndexMap = new Map<string, number>()
 
     try {
       for await (const chunk of response) {
@@ -139,6 +139,25 @@ export async function handleCompletion(c: Context) {
         logger.debug("Streaming response aborted (client disconnected)")
       } else {
         consola.error("Error in streaming response:", error)
+        // Best-effort: without this, a genuinely unexpected (non-abort)
+        // failure mid-stream silently truncated the response with no
+        // signal to the client -- indistinguishable from the model just
+        // finishing early. The connection may already be dead by the time
+        // we get here (the same failure that broke the loop could also
+        // have broken the write), so this must not throw past the outer
+        // catch it's already inside.
+        try {
+          await stream.writeSSE({
+            data: JSON.stringify({
+              error: {
+                message: error instanceof Error ? error.message : String(error),
+                type: "upstream_error",
+              },
+            }),
+          })
+        } catch {
+          // Client is already gone -- nothing more to report.
+        }
       }
     }
 
@@ -213,12 +232,18 @@ const parseChatCompletionChunk = (
  * Remaps each tool call's raw index to a sequential, zero-based one (in
  * order of first appearance in this stream) before forwarding, matching
  * what OpenAI's own real API always does. `indexMap` is fresh per request/
- * stream (see caller). Returns null (pass the original chunk through
- * unchanged) when there's nothing to remap or the chunk doesn't parse.
+ * stream (see caller), keyed by `"<choiceIndex>:<rawToolCallIndex>"` rather
+ * than the raw index alone -- an `n > 1` request can carry multiple
+ * `choices`, each numbering its own tool calls independently starting from
+ * 0, and a raw-index-only key would conflate two different tool calls (one
+ * per choice) that happen to share the same raw index. Sequencing is
+ * per-choice too, so each choice's tool calls remap to their own 0, 1, 2...
+ * Returns null (pass the original chunk through unchanged) when there's
+ * nothing to remap or the chunk doesn't parse.
  */
 function remapToolCallChunkIndices(
   chunk: unknown,
-  indexMap: Map<number, number>,
+  indexMap: Map<string, number>,
 ): { data: string } | null {
   const data = (chunk as { data?: string }).data
   if (!data || data === "[DONE]" || !data.includes("tool_calls")) {
@@ -233,15 +258,19 @@ function remapToolCallChunkIndices(
   }
 
   let changed = false
-  for (const choice of parsed.choices) {
-    const toolCalls = choice.delta.tool_calls
+  for (const choice of parsed.choices ?? []) {
+    const toolCalls = choice.delta?.tool_calls
     if (!toolCalls) continue
+    const choiceIndex = choice.index ?? 0
     for (const toolCall of toolCalls) {
       if (toolCall.index == null) continue
-      let mapped = indexMap.get(toolCall.index)
+      const key = `${choiceIndex}:${toolCall.index}`
+      let mapped = indexMap.get(key)
       if (mapped == null) {
-        mapped = indexMap.size
-        indexMap.set(toolCall.index, mapped)
+        mapped = [...indexMap.keys()].filter((k) =>
+          k.startsWith(`${choiceIndex}:`),
+        ).length
+        indexMap.set(key, mapped)
       }
       if (mapped !== toolCall.index) {
         toolCall.index = mapped
