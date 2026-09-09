@@ -99,7 +99,7 @@ export async function handleCompletion(c: Context) {
         response.copilot_usage?.total_nano_aiu,
       ),
     })
-    return c.json(response)
+    return c.json(normalizeChatCompletionResponse(response))
   }
 
   logger.debug("Streaming response")
@@ -127,6 +127,33 @@ export async function handleCompletion(c: Context) {
 const isNonStreaming = (
   response: Awaited<ReturnType<typeof createCopilotChatCompletions>>,
 ): response is ChatCompletionResponse => Object.hasOwn(response, "choices")
+
+/**
+ * GitHub Copilot's upstream chat-completions response omits `object` on the
+ * top-level response and `index`/`logprobs` on each choice -- fields this
+ * type already declares as required, and fields the OpenAI spec (and strict
+ * clients like the official `@ai-sdk/openai` package, used by e.g. n8n's
+ * "Connect a model" verification) actually require. Without this, such
+ * clients reject an otherwise-valid response with a generic
+ * "Invalid JSON response" error, since their Zod schema validation fails on
+ * the missing required fields -- confirmed live against n8n 2.37.10.
+ * Fills in only what's missing, so a response that already has these (e.g.
+ * from a future upstream change, or a different provider routed through
+ * this same handler) passes through unchanged.
+ */
+function normalizeChatCompletionResponse(
+  response: ChatCompletionResponse,
+): ChatCompletionResponse {
+  return {
+    ...response,
+    object: response.object ?? "chat.completion",
+    choices: response.choices.map((choice, index) => ({
+      ...choice,
+      index: choice.index ?? index,
+      logprobs: choice.logprobs ?? null,
+    })),
+  }
+}
 
 const parseChatCompletionChunk = (
   chunk: unknown,
