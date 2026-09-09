@@ -174,3 +174,92 @@ describe("chat completions streaming usage pre-check", () => {
     expect(page.items[0]?.total_nano_aiu).toBe(42)
   })
 })
+
+describe("chat completions non-streaming response normalization", () => {
+  test("fills in object/index/logprobs that upstream Copilot omits, matching what strict OpenAI clients require", async () => {
+    // Mirrors the actual shape confirmed live from GitHub Copilot's own
+    // chat-completions response -- it omits `object` and per-choice
+    // `index`/`logprobs`, which this repo's own ChatCompletionResponse type
+    // (and the OpenAI spec) declare as required. Strict clients like the
+    // official @ai-sdk/openai package (used by e.g. n8n's "Connect a model"
+    // verification) reject a response missing these with a generic
+    // "Invalid JSON response" error.
+    createChatCompletions.mockImplementation(() =>
+      Promise.resolve({
+        choices: [
+          {
+            finish_reason: "stop",
+            message: { content: "OK", role: "assistant" },
+          },
+        ],
+        created: 0,
+        id: "chatcmpl-1",
+        model: "gpt-test",
+        usage: { completion_tokens: 1, prompt_tokens: 1, total_tokens: 2 },
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any -- deliberately missing required fields to test the fill-in
+      } as any),
+    )
+
+    const app = createApp()
+    const response = await app.request("/v1/chat/completions", {
+      body: JSON.stringify({
+        messages: [{ content: "hi", role: "user" }],
+        model: "gpt-test",
+      }),
+      headers: {
+        "content-type": "application/json",
+      },
+      method: "POST",
+    })
+
+    expect(response.status).toBe(200)
+    const body = (await response.json()) as {
+      choices: Array<{ index?: number; logprobs?: object | null }>
+      object?: string
+    }
+    expect(body.object).toBe("chat.completion")
+    expect(body.choices[0]?.index).toBe(0)
+    expect(body.choices[0]?.logprobs).toBeNull()
+  })
+
+  test("leaves object/index/logprobs unchanged when upstream already includes them", async () => {
+    createChatCompletions.mockImplementation(() =>
+      Promise.resolve({
+        choices: [
+          {
+            finish_reason: "stop",
+            index: 5,
+            logprobs: { content: [] },
+            message: { content: "OK", role: "assistant" },
+          },
+        ],
+        created: 0,
+        id: "chatcmpl-1",
+        model: "gpt-test",
+        object: "chat.completion",
+        usage: { completion_tokens: 1, prompt_tokens: 1, total_tokens: 2 },
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      } as any),
+    )
+
+    const app = createApp()
+    const response = await app.request("/v1/chat/completions", {
+      body: JSON.stringify({
+        messages: [{ content: "hi", role: "user" }],
+        model: "gpt-test",
+      }),
+      headers: {
+        "content-type": "application/json",
+      },
+      method: "POST",
+    })
+
+    const body = (await response.json()) as {
+      choices: Array<{ index?: number; logprobs?: object | null }>
+      object?: string
+    }
+    expect(body.object).toBe("chat.completion")
+    expect(body.choices[0]?.index).toBe(5)
+    expect(body.choices[0]?.logprobs).toEqual({ content: [] })
+  })
+})
