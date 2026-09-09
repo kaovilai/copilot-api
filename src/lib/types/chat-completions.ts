@@ -42,6 +42,7 @@ export interface Delta {
   reasoning_text?: string | null
   reasoning_content?: string | null
   reasoning_opaque?: string | null
+  reasoning?: string | null
 }
 
 export interface Choice {
@@ -84,6 +85,7 @@ interface ResponseMessage {
   reasoning_text?: string | null
   reasoning_content?: string | null
   reasoning_opaque?: string | null
+  reasoning?: string | null
   tool_calls?: Array<ToolCall>
 }
 
@@ -153,6 +155,7 @@ export interface Message {
   reasoning_content?: string | null
   reasoning_text?: string | null
   reasoning_opaque?: string | null
+  reasoning?: string | null
   copilot_cache_control?: CopilotCacheControl
 }
 

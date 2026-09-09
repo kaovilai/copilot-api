@@ -29,6 +29,22 @@ import { state } from "./state"
 let copilotRefreshLoopController: AbortController | null = null
 let codexRefreshLoopController: AbortController | null = null
 
+interface CopilotUserIdentity {
+  endpoints: { api: string }
+  login: string
+  token_based_billing?: boolean
+}
+
+export interface CopilotTokenDependencies {
+  getCopilotToken: () => Promise<GetCopilotTokenResponse>
+  getCopilotUsage: () => Promise<CopilotUserIdentity | null>
+}
+
+const defaultCopilotTokenDependencies: CopilotTokenDependencies = {
+  getCopilotToken,
+  getCopilotUsage,
+}
+
 export const stopCopilotRefreshLoop = () => {
   if (!copilotRefreshLoopController) {
     return
@@ -120,19 +136,21 @@ export const applyCopilotTokenResponse = (
 // concurrent caller just awaits that same result.
 let inFlightSetup: Promise<void> | null = null
 
-export const setupCopilotToken = async (): Promise<void> => {
+export const setupCopilotToken = async (
+  dependencies: CopilotTokenDependencies = defaultCopilotTokenDependencies,
+): Promise<void> => {
   if (inFlightSetup) {
     return inFlightSetup
   }
 
-  inFlightSetup = doSetupCopilotToken().finally(() => {
+  inFlightSetup = doSetupCopilotToken(dependencies).finally(() => {
     inFlightSetup = null
   })
 
   return inFlightSetup
 }
 
-const doSetupCopilotToken = async () => {
+const doSetupCopilotToken = async (dependencies: CopilotTokenDependencies) => {
   if (isOpencodeOauthApp()) {
     if (!state.githubToken) throw new Error(`opencode token not found`)
 
@@ -147,7 +165,7 @@ const doSetupCopilotToken = async () => {
     return
   }
 
-  const response = await getCopilotToken()
+  const response = await dependencies.getCopilotToken()
   applyCopilotTokenResponse(response)
 
   // Display the Copilot token to the screen
@@ -161,7 +179,7 @@ const doSetupCopilotToken = async () => {
   const controller = new AbortController()
   copilotRefreshLoopController = controller
 
-  runCopilotRefreshLoop(response.refresh_in, controller.signal)
+  runCopilotRefreshLoop(response.refresh_in, controller.signal, dependencies)
     .catch(() => {
       consola.warn("Copilot token refresh loop stopped")
     })
@@ -262,6 +280,7 @@ export const getRetryAfterDelayMs = (
 const runCopilotRefreshLoop = async (
   refreshIn: number,
   signal: AbortSignal,
+  dependencies: Pick<CopilotTokenDependencies, "getCopilotToken">,
 ) => {
   let refreshAtMs = getRefreshDeadlineMs(refreshIn)
   let retryDelayMs = RETRY_REFRESH_DELAY_MS
@@ -278,7 +297,7 @@ const runCopilotRefreshLoop = async (
     consola.debug("Refreshing Copilot token")
 
     try {
-      const response = await getCopilotToken()
+      const response = await dependencies.getCopilotToken()
       applyCopilotTokenResponse(response)
       refreshAtMs = getRefreshDeadlineMs(response.refresh_in)
       retryDelayMs = RETRY_REFRESH_DELAY_MS
@@ -415,8 +434,13 @@ export async function setupGitHubToken(
   }
 }
 
-export async function logUser() {
-  const copilotUser = await getCopilotUsage()
+export async function logUser(
+  dependencies: Pick<
+    CopilotTokenDependencies,
+    "getCopilotUsage"
+  > = defaultCopilotTokenDependencies,
+) {
+  const copilotUser = await dependencies.getCopilotUsage()
   if (!copilotUser) {
     throw new Error("GitHub token not found")
   }

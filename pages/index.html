@@ -423,9 +423,12 @@
                 id="token-usage-period"
                 class="select-control input-focus"
               >
-                <option value="day">Day</option>
-                <option value="week">Week</option>
-                <option value="month">Month</option>
+                <option value="today">Today</option>
+                <option value="this_week">This week</option>
+                <option value="last_7_days">Last 7 days</option>
+                <option value="this_month">This month</option>
+                <option value="last_30_days">Last 30 days</option>
+                <option value="lifetime">Lifetime</option>
               </select>
             </div>
             <button id="fetch-button" type="submit" class="primary-action">
@@ -463,13 +466,21 @@
         });
 
         const DEFAULT_ENDPOINT = "http://localhost:4141/usage";
-        const DEFAULT_TOKEN_USAGE_PERIOD = "day";
+        const DEFAULT_TOKEN_USAGE_PERIOD = "today";
         const DEFAULT_TOKEN_USAGE_EVENTS_PAGE_SIZE = 20;
+        const MAX_LIFETIME_TREND_POINTS = 180;
         const ALL_METRICS_VALUE = "__all__";
         const ALL_MODELS_VALUE = "__all__";
         const LEGACY_API_KEY_STORAGE_KEY = "copilot-api.usage-viewer.x-api-key";
         const CREDENTIAL_STORAGE_PREFIX = "copilot-api.usage-viewer.credential.";
-        const VALID_PERIODS = new Set(["day", "week", "month"]);
+        const VALID_PERIODS = new Set([
+          "today",
+          "this_week",
+          "last_7_days",
+          "this_month",
+          "last_30_days",
+          "lifetime",
+        ]);
         const EMPTY_TOKEN_USAGE_TOTALS = {
           cache_creation_input_tokens: 0,
           cache_read_input_tokens: 0,
@@ -495,7 +506,7 @@
           tokenUsageSummaryError: null,
           tokenUsageEventsError: null,
           tokenUsagePeriod: DEFAULT_TOKEN_USAGE_PERIOD,
-          tokenUsageTrendDayIndex: null,
+          tokenUsageTrendDay: null,
           tokenUsageTrendMetric: ALL_METRICS_VALUE,
           tokenUsageTrendModel: ALL_MODELS_VALUE,
         };
@@ -536,10 +547,17 @@
           );
         }
 
+        const LEGACY_PERIODS = {
+          day: "today",
+          week: "last_7_days",
+          month: "last_30_days",
+        };
+
         function normalizePeriod(value) {
-          return VALID_PERIODS.has(value)
-            ? value
-            : DEFAULT_TOKEN_USAGE_PERIOD;
+          if (VALID_PERIODS.has(value)) {
+            return value;
+          }
+          return LEGACY_PERIODS[value] || DEFAULT_TOKEN_USAGE_PERIOD;
         }
 
         function getSelectedPeriod() {
@@ -895,20 +913,40 @@
           return trimmed || "—";
         }
 
+        function formatRangeDate(value) {
+          const date = new Date(value);
+          if (!Number.isFinite(date.getTime())) {
+            return "N/A";
+          }
+          const options = { day: "numeric", month: "short" };
+          if (date.getFullYear() !== new Date().getFullYear()) {
+            options.year = "numeric";
+          }
+          return date.toLocaleDateString("en-US", options);
+        }
+
+        function formatRangeText(range) {
+          const start = formatRangeDate(range.start_ms);
+          const end = formatRangeDate(range.end_ms - 1);
+          return start === end ? start : `${start} - ${end}`;
+        }
+
         function renderTokenUsageRangeText(period, range) {
           const labels = {
-            day: "Day window",
-            week: "Last 7 days",
-            month: "Last 30 days",
+            today: "Today",
+            this_week: "This week",
+            last_7_days: "Last 7 days",
+            this_month: "This month",
+            last_30_days: "Last 30 days",
+            lifetime: "Lifetime",
           };
+          const label = labels[period] || labels.today;
 
-          if (!range) {
-            return labels[period] || labels.day;
+          if (!range || range.end_ms <= range.start_ms) {
+            return label;
           }
 
-          return `${labels[period] || labels.day}: ${formatDateTime(
-            range.start_ms
-          )} - ${formatDateTime(range.end_ms)}`;
+          return `${label}: ${formatRangeText(range)}`;
         }
 
         /**
@@ -1334,8 +1372,46 @@
           return parts.length === 3 ? `${parts[1]}/${parts[2]}` : value;
         }
 
+        function getTokenUsageTrendDays(dailySummary, selectedModel) {
+          const days = dailySummary?.days || [];
+          if (
+            state.tokenUsagePeriod !== "lifetime"
+            || days.length <= MAX_LIFETIME_TREND_POINTS
+          ) {
+            return days;
+          }
+
+          const usageIndexes = days.reduce((indexes, day, index) => {
+            if (getDailyTrendTotals(day, selectedModel).request_count > 0) {
+              indexes.push(index);
+            }
+            return indexes;
+          }, []);
+          if (usageIndexes.length >= MAX_LIFETIME_TREND_POINTS) {
+            const step =
+              (usageIndexes.length - 1) / (MAX_LIFETIME_TREND_POINTS - 1);
+            return Array.from(
+              { length: MAX_LIFETIME_TREND_POINTS },
+              (_, index) => days[usageIndexes[Math.round(index * step)]]
+            );
+          }
+          const indexes = new Set(usageIndexes);
+          const sampleCount = Math.max(
+            1,
+            MAX_LIFETIME_TREND_POINTS - usageIndexes.length
+          );
+          const step = (days.length - 1) / (sampleCount - 1 || 1);
+          for (let index = 0; index < sampleCount; index += 1) {
+            indexes.add(Math.round(index * step));
+          }
+          return [...indexes]
+            .sort((left, right) => left - right)
+            .slice(0, MAX_LIFETIME_TREND_POINTS)
+            .map((index) => days[index]);
+        }
+
         function renderTokenUsageDailyTrend(dailySummary, error) {
-          if (state.tokenUsagePeriod === "day") {
+          if (state.tokenUsagePeriod === "today") {
             return "";
           }
 
@@ -1435,7 +1511,6 @@
         }
 
         function renderTokenUsageTrendChart(dailySummary, selectedModel) {
-          const days = dailySummary?.days || [];
           const metrics = getTokenUsageTrendMetrics();
           const visibleMetrics =
             state.tokenUsageTrendMetric === ALL_METRICS_VALUE
@@ -1443,6 +1518,7 @@
               : metrics.filter(
                   (metric) => metric.key === state.tokenUsageTrendMetric
                 );
+          const days = getTokenUsageTrendDays(dailySummary, selectedModel);
           const hasUsage = days.some(
             (day) => getDailyTrendTotals(day, selectedModel).request_count > 0
           );
@@ -1451,11 +1527,12 @@
               ? index
               : latest;
           }, -1);
+          const selectedDayIndex = days.findIndex(
+            (day) => day.date === state.tokenUsageTrendDay
+          );
           const activeIndex =
-            Number.isInteger(state.tokenUsageTrendDayIndex)
-              && state.tokenUsageTrendDayIndex >= 0
-              && state.tokenUsageTrendDayIndex < days.length
-              ? state.tokenUsageTrendDayIndex
+            selectedDayIndex >= 0
+              ? selectedDayIndex
               : latestUsageIndex >= 0
                 ? latestUsageIndex
                 : Math.max(0, days.length - 1);
@@ -1544,7 +1621,7 @@
                     value
                   )}" r="2.5" fill="${
                     metric.color
-                  }" data-trend-day-index="${index}">
+                  }" data-trend-day="${escapeHtml(day.date)}">
                     <title>${escapeHtml(
                       `${formatChartDate(day.date)} ${metric.label}: ${formatNumber(
                         value
@@ -1588,7 +1665,7 @@
               ].join("\n");
               return `<rect x="${hitStart}" y="${padding.top}" width="${
                 hitEnd - hitStart
-              }" height="${plotHeight}" fill="transparent" style="cursor: pointer;" data-trend-day-index="${index}">
+              }" height="${plotHeight}" fill="transparent" style="cursor: pointer;" data-trend-day="${escapeHtml(day.date)}">
                 <title>${escapeHtml(title)}</title>
               </rect>`;
             })
@@ -2153,14 +2230,11 @@
             return;
           }
 
-          const trendPoint = event.target.closest("[data-trend-day-index]");
+          const trendPoint = event.target.closest("[data-trend-day]");
           if (trendPoint) {
-            const index = Number.parseInt(
-              trendPoint.getAttribute("data-trend-day-index") || "",
-              10
-            );
-            if (Number.isFinite(index) && index >= 0) {
-              state.tokenUsageTrendDayIndex = index;
+            const day = trendPoint.getAttribute("data-trend-day");
+            if (day) {
+              state.tokenUsageTrendDay = day;
               render();
             }
             return;

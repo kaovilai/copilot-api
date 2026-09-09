@@ -14,6 +14,7 @@ import {
   prepareForCompact,
   prepareInteractionHeaders,
 } from "~/lib/api-config"
+import { getUpstreamTransportConfig } from "~/lib/config"
 import { logCopilotRateLimits } from "~/lib/copilot-rate-limit"
 import { HTTPError } from "~/lib/error"
 import { state } from "~/lib/state"
@@ -23,11 +24,11 @@ import { fetchCopilotWithReauth } from "./fetch-with-reauth"
 export const createChatCompletions = async (
   payload: ChatCompletionsPayload,
   options: {
+    clientSignal?: AbortSignal
     subagentMarker?: SubagentMarker | null
     requestId: string
     sessionId?: string
     compactType?: CompactType
-    signal?: AbortSignal
   },
 ) => {
   if (!state.copilotToken) throw new Error("Copilot token not found")
@@ -65,13 +66,18 @@ export const createChatCompletions = async (
 
   consola.log(`<-- model: ${payload.model}`)
 
+  const transportConfig = getUpstreamTransportConfig()
   const response = await fetchCopilotWithReauth(
     `${copilotBaseUrl(state)}/chat/completions`,
     {
       method: "POST",
       headers,
       body: JSON.stringify(payload),
-      signal: options.signal,
+    },
+    {
+      clientSignal: options.clientSignal,
+      headersTimeoutMs: transportConfig.headersTimeoutMs,
+      streamInactivityTimeoutMs: transportConfig.streamInactivityTimeoutMs,
     },
   )
 

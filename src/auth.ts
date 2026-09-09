@@ -21,6 +21,7 @@ import {
   QUICK_PROVIDER_CONFIGS,
   type QuickProviderName,
 } from "./lib/quick-providers"
+import { prompt } from "./lib/interactive-prompt"
 import { state } from "./lib/state"
 import { persistCodexCredentials, setupGitHubToken } from "./lib/token"
 
@@ -117,7 +118,7 @@ async function resolveProviderSelection(
     return availableProviders[0]
   }
 
-  const provider = await consola.prompt("Select a provider to log in with", {
+  const provider = await prompt("Select a provider to log in with", {
     type: "select",
     options: availableProviders.map((providerName) => ({
       label: `${AUTH_PROVIDER_LABELS[providerName]} (${providerName})`,
@@ -154,7 +155,7 @@ async function promptRequiredText(
   message: string,
   fieldName: string,
 ): Promise<string> {
-  const value = await consola.prompt(message, { type: "text" })
+  const value = await prompt(message, { type: "text" })
   const normalizedValue = typeof value === "string" ? value.trim() : ""
   if (!normalizedValue) {
     throw new Error(`${fieldName} must be a non-empty string`)
@@ -172,7 +173,7 @@ function canUseMaskedPrompt(): boolean {
 
 async function promptMaskedText(message: string): Promise<string> {
   if (!canUseMaskedPrompt()) {
-    const value = await consola.prompt(message, { type: "text" })
+    const value = await prompt(message, { type: "text" })
     return typeof value === "string" ? value : ""
   }
 
@@ -260,7 +261,7 @@ async function promptCustomProviderName(): Promise<string> {
 }
 
 async function promptCustomProviderType(): Promise<ProviderType> {
-  const providerType = await consola.prompt("Select provider type", {
+  const providerType = await prompt("Select provider type", {
     type: "select",
     options: SUPPORTED_PROVIDER_TYPES.map((type) => ({
       label: type,
@@ -281,7 +282,7 @@ async function promptCustomProviderType(): Promise<ProviderType> {
 async function promptQuickProviderType(
   defaultType: ProviderType,
 ): Promise<ProviderType> {
-  const providerType = await consola.prompt(
+  const providerType = await prompt(
     `Select provider type (default: ${defaultType})`,
     {
       type: "select",
@@ -322,7 +323,7 @@ async function promptCustomProviderAuthType(
   providerType: ProviderType,
 ): Promise<ProviderAuthType | undefined> {
   const defaultAuthType = getDefaultProviderAuthType(providerType)
-  const authType = await consola.prompt("Select provider auth type", {
+  const authType = await prompt("Select provider auth type", {
     type: "select",
     options: [
       {
@@ -350,7 +351,7 @@ async function promptCustomProviderAuthType(
 async function promptQuickProviderBaseUrl(
   defaultBaseUrl: string,
 ): Promise<string> {
-  const value = await consola.prompt(
+  const value = await prompt(
     `Enter provider baseUrl (default: ${defaultBaseUrl})`,
     {
       type: "text",
@@ -463,9 +464,7 @@ async function loginWithCodex(): Promise<void> {
       }
     },
     onPrompt(message) {
-      return consola.prompt(message, {
-        type: "text",
-      })
+      return prompt(message, { type: "text" }).then((value) => value ?? "")
     },
     onProgress(message) {
       consola.debug(message)

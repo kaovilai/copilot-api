@@ -8,6 +8,7 @@
     "allowJs": true,
     "moduleResolution": "Bundler",
     "moduleDetection": "force",
+    "resolveJsonModule": true,
     "erasableSyntaxOnly": true,
     "verbatimModuleSyntax": true,
     "noEmit": true,

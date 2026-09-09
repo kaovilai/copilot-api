@@ -1,10 +1,7 @@
 import { afterEach, expect, test } from "bun:test"
 
 import { HTTPError } from "../src/lib/error"
-import {
-  fetchWithConnectRetry,
-  fetchWithConnectTimeout,
-} from "../src/lib/fetch-timeout"
+import { retryPreResponseFailures } from "../src/lib/fetch-timeout"
 
 const originalFetch = globalThis.fetch
 
@@ -12,86 +9,10 @@ afterEach(() => {
   globalThis.fetch = originalFetch
 })
 
-test("fetchWithConnectTimeout resolves normally when headers arrive quickly", async () => {
-  const response = new Response("ok")
-  globalThis.fetch = (() =>
-    Promise.resolve(response)) as unknown as typeof fetch
+class TestAmbiguousTimeoutError extends Error {}
 
-  const result = await fetchWithConnectTimeout(
-    "https://example.com",
-    {},
-    { connectTimeoutMs: 50 },
-  )
-
-  expect(result.status).toBe(response.status)
-  expect(await result.text()).toBe("ok")
-})
-
-test("fetchWithConnectTimeout aborts when the connection never resolves in time", async () => {
-  globalThis.fetch = ((_input: unknown, init?: RequestInit) =>
-    new Promise<Response>((_resolve, reject) => {
-      init?.signal?.addEventListener("abort", () => {
-        const reason: unknown = init.signal?.reason
-        reject(reason instanceof Error ? reason : new Error("aborted"))
-      })
-    })) as unknown as typeof fetch
-
-  let thrown: unknown
-  try {
-    await fetchWithConnectTimeout(
-      "https://example.com",
-      {},
-      { connectTimeoutMs: 10 },
-    )
-  } catch (error) {
-    thrown = error
-  }
-
-  expect(thrown).toBeInstanceOf(Error)
-  expect((thrown as Error).message).toBe("Connection timed out after 10ms")
-})
-
-test("fetchWithConnectTimeout clears its timer once headers arrive, leaving the stream unarmed", async () => {
-  let capturedSignal: AbortSignal | undefined
-  globalThis.fetch = ((_input: unknown, init?: RequestInit) => {
-    capturedSignal = init?.signal ?? undefined
-    return Promise.resolve(new Response("ok"))
-  }) as unknown as typeof fetch
-
-  await fetchWithConnectTimeout(
-    "https://example.com",
-    {},
-    { connectTimeoutMs: 10 },
-  )
-
-  // Give the timer that would have fired well past its original deadline a
-  // chance to run -- it must not, since a live stream body must never be
-  // aborted just because the connect window elapsed.
-  await new Promise<void>((resolve) => {
-    setTimeout(resolve, 30)
-  })
-
-  expect(capturedSignal?.aborted).toBe(false)
-})
-
-test("fetchWithConnectTimeout still honors a caller-provided signal", async () => {
-  const callerController = new AbortController()
-  let capturedSignal: AbortSignal | undefined
-  globalThis.fetch = ((_input: unknown, init?: RequestInit) => {
-    capturedSignal = init?.signal ?? undefined
-    return Promise.resolve(new Response("ok"))
-  }) as unknown as typeof fetch
-
-  await fetchWithConnectTimeout(
-    "https://example.com",
-    { signal: callerController.signal },
-    { connectTimeoutMs: 1000 },
-  )
-
-  expect(capturedSignal?.aborted).toBe(false)
-  callerController.abort(new Error("caller cancelled"))
-  expect(capturedSignal?.aborted).toBe(true)
-})
+const isAmbiguousTimeout = (error: unknown): boolean =>
+  error instanceof TestAmbiguousTimeoutError
 
 const hardTransportError = (): Error => {
   const error = new Error(
@@ -101,7 +22,7 @@ const hardTransportError = (): Error => {
   return error
 }
 
-test("fetchWithConnectRetry retries a hard transport error until it succeeds", async () => {
+test("retryPreResponseFailures retries a hard transport error until it succeeds", async () => {
   let calls = 0
   const response = new Response("ok")
   globalThis.fetch = (() => {
@@ -111,9 +32,10 @@ test("fetchWithConnectRetry retries a hard transport error until it succeeds", a
       : Promise.resolve(response)
   }) as unknown as typeof fetch
 
-  const result = await fetchWithConnectRetry(
-    "https://example.com",
-    {},
+  const result = await retryPreResponseFailures(
+    () => fetch("https://example.com"),
+    undefined,
+    isAmbiguousTimeout,
     { firstRetryDelayMs: 1, steadyRetryDelayMs: 1 },
   )
 
@@ -122,7 +44,7 @@ test("fetchWithConnectRetry retries a hard transport error until it succeeds", a
   expect(calls).toBe(3)
 })
 
-test("fetchWithConnectRetry gives up once the retry budget elapses and throws an HTTPError", async () => {
+test("retryPreResponseFailures gives up once the retry budget elapses and throws an HTTPError", async () => {
   let calls = 0
   globalThis.fetch = (() => {
     calls++
@@ -131,9 +53,10 @@ test("fetchWithConnectRetry gives up once the retry budget elapses and throws an
 
   let thrown: unknown
   try {
-    await fetchWithConnectRetry(
-      "https://example.com",
-      {},
+    await retryPreResponseFailures(
+      () => fetch("https://example.com"),
+      undefined,
+      isAmbiguousTimeout,
       { firstRetryDelayMs: 1, steadyRetryDelayMs: 1, retryBudgetMs: 5 },
     )
   } catch (error) {
@@ -145,25 +68,19 @@ test("fetchWithConnectRetry gives up once the retry budget elapses and throws an
   expect(calls).toBeGreaterThan(1)
 })
 
-test("fetchWithConnectRetry caps retries when only ambiguous connect-timeouts occur", async () => {
+test("retryPreResponseFailures caps retries when only ambiguous timeouts occur", async () => {
   let calls = 0
-  globalThis.fetch = ((_input: unknown, init?: RequestInit) => {
-    calls++
-    return new Promise<Response>((_resolve, reject) => {
-      init?.signal?.addEventListener("abort", () => {
-        const reason: unknown = init.signal?.reason
-        reject(reason instanceof Error ? reason : new Error("aborted"))
-      })
-    })
-  }) as unknown as typeof fetch
 
   let thrown: unknown
   try {
-    await fetchWithConnectRetry(
-      "https://example.com",
-      {},
+    await retryPreResponseFailures(
+      () => {
+        calls++
+        return Promise.reject(new TestAmbiguousTimeoutError("timed out"))
+      },
+      undefined,
+      isAmbiguousTimeout,
       {
-        perAttemptConnectTimeoutMs: 5,
         ambiguousTimeoutBudgetMs: 12,
         firstRetryDelayMs: 1,
         steadyRetryDelayMs: 1,
@@ -175,29 +92,29 @@ test("fetchWithConnectRetry caps retries when only ambiguous connect-timeouts oc
 
   expect(thrown).toBeInstanceOf(HTTPError)
   expect((thrown as HTTPError).response.status).toBe(502)
-  // capped by ambiguousTimeoutBudgetMs: 12 -- each attempt takes ~5ms (the
-  // connect timeout) plus ~1ms backoff, so more than one retry fits before
-  // the 12ms ambiguous budget is exceeded, but the loop still terminates
-  // well short of retryBudgetMs.
+  // capped by ambiguousTimeoutBudgetMs: 12 -- each attempt is near-instant
+  // here, so several retries fit before the 12ms ambiguous budget is
+  // exceeded, but the loop still terminates well short of retryBudgetMs.
   expect(calls).toBeGreaterThan(1)
 })
 
-test("fetchWithConnectRetry stops immediately once the downstream signal aborts", async () => {
+test("retryPreResponseFailures stops immediately once the downstream signal aborts", async () => {
   let calls = 0
   const downstreamController = new AbortController()
-  globalThis.fetch = (() => {
+  const attempt = () => {
     calls++
     // Simulate the caller (e.g. Claude Code) disconnecting right after the
     // first attempt fails, before any retry would otherwise happen.
     downstreamController.abort(new Error("client disconnected"))
     return Promise.reject(hardTransportError())
-  }) as unknown as typeof fetch
+  }
 
   let thrown: unknown
   try {
-    await fetchWithConnectRetry(
-      "https://example.com",
-      { signal: downstreamController.signal },
+    await retryPreResponseFailures(
+      attempt,
+      downstreamController.signal,
+      isAmbiguousTimeout,
       { firstRetryDelayMs: 5, steadyRetryDelayMs: 5 },
     )
   } catch (error) {
@@ -208,24 +125,28 @@ test("fetchWithConnectRetry stops immediately once the downstream signal aborts"
   expect(calls).toBe(1)
 })
 
-test("fetchWithConnectRetry does not retry once any response has been received", async () => {
+test("retryPreResponseFailures does not retry once any response has been received", async () => {
   let calls = 0
   const errorResponse = new Response("bad", { status: 500 })
-  globalThis.fetch = (() => {
+  const attempt = () => {
     calls++
     return Promise.resolve(errorResponse)
-  }) as unknown as typeof fetch
+  }
 
-  const result = await fetchWithConnectRetry("https://example.com", {})
+  const result = await retryPreResponseFailures(
+    attempt,
+    undefined,
+    isAmbiguousTimeout,
+  )
 
   expect(result.status).toBe(500)
   expect(calls).toBe(1)
 })
 
-test("fetchWithConnectRetry recognizes a Node/undici-style nested cause code as a hard transport error", async () => {
+test("retryPreResponseFailures recognizes a Node/undici-style nested cause code as a hard transport error", async () => {
   let calls = 0
   const response = new Response("ok")
-  globalThis.fetch = (() => {
+  const attempt = () => {
     calls++
     if (calls < 2) {
       const undiciStyleError = new Error("fetch failed")
@@ -235,11 +156,12 @@ test("fetchWithConnectRetry recognizes a Node/undici-style nested cause code as 
       return Promise.reject(undiciStyleError)
     }
     return Promise.resolve(response)
-  }) as unknown as typeof fetch
+  }
 
-  const result = await fetchWithConnectRetry(
-    "https://example.com",
-    {},
+  const result = await retryPreResponseFailures(
+    attempt,
+    undefined,
+    isAmbiguousTimeout,
     { firstRetryDelayMs: 1, steadyRetryDelayMs: 1 },
   )
 
@@ -247,16 +169,16 @@ test("fetchWithConnectRetry recognizes a Node/undici-style nested cause code as 
   expect(calls).toBe(2)
 })
 
-test("fetchWithConnectRetry does not retry an unrecognized error", async () => {
+test("retryPreResponseFailures does not retry an unrecognized error", async () => {
   let calls = 0
-  globalThis.fetch = (() => {
+  const attempt = () => {
     calls++
     return Promise.reject(new Error("something unrelated broke"))
-  }) as unknown as typeof fetch
+  }
 
   let thrown: unknown
   try {
-    await fetchWithConnectRetry("https://example.com", {})
+    await retryPreResponseFailures(attempt, undefined, isAmbiguousTimeout)
   } catch (error) {
     thrown = error
   }

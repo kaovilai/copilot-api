@@ -15,6 +15,7 @@ import {
   prepareInteractionHeaders,
   prepareMessageProxyHeaders,
 } from "~/lib/api-config"
+import { getUpstreamTransportConfig } from "~/lib/config"
 import { logCopilotRateLimits } from "~/lib/copilot-rate-limit"
 import { HTTPError } from "~/lib/error"
 import { state } from "~/lib/state"
@@ -68,11 +69,11 @@ export const createMessages = async (
   payload: AnthropicMessagesPayload,
   anthropicBetaHeader: string | undefined,
   options: {
+    clientSignal?: AbortSignal
     subagentMarker?: SubagentMarker | null
     requestId: string
     sessionId?: string
     compactType?: CompactType
-    signal?: AbortSignal
   },
 ): Promise<CreateMessagesReturn> => {
   if (!state.copilotToken) throw new Error("Copilot token not found")
@@ -140,13 +141,18 @@ export const createMessages = async (
 
   consola.log(`<-- model: ${payload.model}`)
 
+  const transportConfig = getUpstreamTransportConfig()
   const response = await fetchCopilotWithReauth(
     `${copilotBaseUrl(state)}/v1/messages`,
     {
       method: "POST",
       headers,
       body: JSON.stringify(payload),
-      signal: options.signal,
+    },
+    {
+      clientSignal: options.clientSignal,
+      headersTimeoutMs: transportConfig.headersTimeoutMs,
+      streamInactivityTimeoutMs: transportConfig.streamInactivityTimeoutMs,
     },
   )
 

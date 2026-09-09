@@ -74,9 +74,12 @@ const en: Locale = {
     tokenUsageModelBreakdown: 'Model breakdown',
     tokenUsageOutput: 'Output',
     tokenUsagePage: 'Page {{page}} / {{total}}',
-    tokenUsagePeriodDay: 'Day',
-    tokenUsagePeriodMonth: '30 days',
-    tokenUsagePeriodWeek: '7 days',
+    tokenUsagePeriodToday: 'Today',
+    tokenUsagePeriodThisWeek: 'This week',
+    tokenUsagePeriodLast7Days: '7 days',
+    tokenUsagePeriodThisMonth: 'This month',
+    tokenUsagePeriodLast30Days: '30 days',
+    tokenUsagePeriodLifetime: 'Lifetime',
     tokenUsageProvider: 'Provider',
     tokenUsageRequests: 'Requests',
     tokenUsageSession: 'Session',
@@ -140,6 +143,8 @@ const en: Locale = {
     startTimeout:
       'Server startup timed out, port {{port}} may already be in use',
     processExit: 'Process exited with code {{code}}',
+    invalidHost:
+      'Invalid listening host; use an address such as 127.0.0.1 or 0.0.0.0',
   },
   settings: {
     title: 'Settings',
@@ -167,6 +172,10 @@ const en: Locale = {
     adminKeyDesc:
       'Used for /admin/* endpoints. Leave empty to remove it; the next server start generates a new one automatically.',
     sectionNetwork: 'Network',
+    host: 'Listening host',
+    hostDesc:
+      'Address the API server binds to; leave empty for 127.0.0.1. Takes effect the next time the server starts',
+    hostInvalid: 'Invalid listening host, for example 127.0.0.1 or 0.0.0.0',
     proxySystemNote:
       'System proxy is used by default. When custom proxy is selected, Electron and newly started local services use the settings below; when no proxy is selected, network requests connect directly. Restart any running service to apply changes.',
     proxyMode: 'Proxy mode',

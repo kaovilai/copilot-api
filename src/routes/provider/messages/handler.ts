@@ -22,11 +22,14 @@ import type {
 
 import {
   type ModelConfig,
+  type ProviderAuthType,
   type ResolvedProviderConfig,
+  type ProviderType,
   getClaudeAutoModel,
   resolveEffectiveProviderType,
   resolveProviderAuthType,
 } from "~/lib/config"
+import { builtinProviderModelRegistry } from "~/lib/builtin-provider-models"
 import { logCodexRateLimitsEvent } from "~/lib/codex-rate-limit"
 import {
   applyDashScopePreserveThinkingDefault,
@@ -36,6 +39,7 @@ import {
 import { HTTPError } from "~/lib/error"
 import { createHandlerLogger, debugJson, debugLazy } from "~/lib/logger"
 import { resolveProviderConfig } from "~/lib/provider-resolver"
+import { writeSSEIfConnected } from "~/lib/sse"
 import { resolveBridgeToolSearchName } from "~/lib/tool-search"
 import {
   createProviderTokenUsageRecorder,
@@ -102,6 +106,22 @@ const logger = createHandlerLogger("provider-messages-handler")
 
 export const providerMessagesHandlerDependencies = {
   resolveProviderConfig,
+}
+
+const resolveOverrideProviderAuthType = (
+  providerConfig: ResolvedProviderConfig,
+  effectiveType: ProviderType,
+): ProviderAuthType => {
+  // azure-entra and oauth2 are explicit credentials, never protocol defaults:
+  // recomputing the auth type for the override would drop them and send the
+  // token with the wrong scheme (e.g. an Entra token as x-api-key).
+  if (
+    providerConfig.authType === "azure-entra"
+    || providerConfig.authType === "oauth2"
+  ) {
+    return providerConfig.authType
+  }
+  return resolveProviderAuthType(providerConfig.name, undefined, effectiveType)
 }
 
 export async function handleProviderMessages(
@@ -209,15 +229,14 @@ export async function handleProviderMessagesForProvider(
       : {
           ...providerConfig,
           type: effectiveType,
-          authType: resolveProviderAuthType(
-            providerConfig.name,
-            undefined,
+          authType: resolveOverrideProviderAuthType(
+            providerConfig,
             effectiveType,
           ),
         },
       payload,
       c.req.raw.headers,
-      c.req.raw.signal,
+      { clientSignal: c.req.raw.signal },
     )
 
     if (!upstreamResponse.ok) {
@@ -292,7 +311,7 @@ const handleOpenAIResponsesProviderWebSearchMessages = async (
       responsesPayload,
       c.req.raw.headers,
       providerConfig.baseUrl,
-      { signal: c.req.raw.signal },
+      { clientSignal: c.req.raw.signal },
     )
 
     if (isResponsesStream(upstreamResponse)) {
@@ -327,7 +346,7 @@ const handleOpenAIResponsesProviderWebSearchMessages = async (
     providerConfig,
     responsesPayload,
     c.req.raw.headers,
-    { signal: c.req.raw.signal },
+    { clientSignal: c.req.raw.signal },
   )
 
   if (!upstreamResponse.ok) {
@@ -347,10 +366,7 @@ const handleOpenAIResponsesProviderWebSearchMessages = async (
       errorMessagePrefix: `${provider} web search responses stream`,
       parseEvent: (data) =>
         parseResponsesProviderStreamChunk(data, providerConfig),
-      upstreamResponse: createResponsesHttpEventStream(
-        upstreamResponse,
-        c.req.raw.signal,
-      ),
+      upstreamResponse: createResponsesHttpEventStream(upstreamResponse),
       logger,
     })
     return respondWebSearchProviderMessagesJson(c, {
@@ -425,7 +441,7 @@ const handleOpenAIResponsesProviderMessages = async (
       responsesPayload,
       c.req.raw.headers,
       providerConfig.baseUrl,
-      { signal: c.req.raw.signal },
+      { clientSignal: c.req.raw.signal },
     )
 
     if (isResponsesStream(upstreamResponse)) {
@@ -475,7 +491,7 @@ const handleOpenAIResponsesProviderMessages = async (
     providerConfig,
     responsesPayload,
     c.req.raw.headers,
-    { signal: c.req.raw.signal },
+    { clientSignal: c.req.raw.signal },
   )
 
   if (!upstreamResponse.ok) {
@@ -492,8 +508,7 @@ const handleOpenAIResponsesProviderMessages = async (
       provider,
       providerConfig,
       upstreamResponse: createResponsesSafeStream(
-        createResponsesHttpEventStream(upstreamResponse, c.req.raw.signal),
-        { signal: c.req.raw.signal },
+        createResponsesHttpEventStream(upstreamResponse),
       ),
       usageEndpoint,
     })
@@ -575,7 +590,7 @@ const handleOpenAICompatibleProviderMessages = async (
     providerConfig,
     openAIPayload,
     c.req.raw.headers,
-    c.req.raw.signal,
+    { clientSignal: c.req.raw.signal },
   )
 
   if (!upstreamResponse.ok) {
@@ -644,7 +659,10 @@ const createOpenAICompatiblePayload = (
     }
   }
 
-  normalizeOpenAICompatibleReasoningContent(openAIPayload)
+  normalizeOpenAICompatibleReasoningContent(openAIPayload, {
+    modelConfig,
+    providerConfig,
+  })
 
   applyOpenAICompatibleRequestOverrides(openAIPayload, {
     extraBody: modelConfig?.extraBody,
@@ -678,17 +696,43 @@ const createOpenAICompatiblePayload = (
 
 const normalizeOpenAICompatibleReasoningContent = (
   payload: ChatCompletionsPayload,
+  options: {
+    modelConfig: ModelConfig | undefined
+    providerConfig: ResolvedProviderConfig
+  },
 ): void => {
+  // Some models (e.g. opencode-go hy3/hy4) follow the OpenRouter convention
+  // and expect the reasoning text in the "reasoning" field of assistant
+  // history messages instead of the default "reasoning_content" field
+  const reasoningField =
+    options.modelConfig?.reasoningField
+    ?? builtinProviderModelRegistry.getModelConfig(
+      options.providerConfig.name,
+      payload.model,
+    )?.reasoningField
+    ?? "reasoning_content"
+
   for (const message of payload.messages) {
     if (message.role !== "assistant") {
       continue
     }
 
-    if (
-      message.reasoning_content === undefined
-      && message.reasoning_text !== undefined
-    ) {
-      message.reasoning_content = message.reasoning_text
+    const reasoningText =
+      message.reasoning_text ?? message.reasoning_content ?? message.reasoning
+    if (reasoningText && reasoningText.length > 0) {
+      if (reasoningField === "reasoning") {
+        message.reasoning ??= reasoningText
+      } else {
+        message.reasoning_content ??= reasoningText
+      }
+    }
+
+    // Send exactly one reasoning field upstream, even when the history
+    // message carries an empty value in the field this model does not use
+    if (reasoningField === "reasoning") {
+      delete message.reasoning_content
+    } else {
+      delete message.reasoning
     }
 
     delete message.reasoning_text
@@ -750,7 +794,10 @@ const streamProviderMessages = ({
         logger.debug("provider.messages.raw_stream_event:", chunk.data)
         const eventName = chunk.event
         if (eventName === "ping") {
-          await stream.writeSSE({ event: "ping", data: '{"type":"ping"}' })
+          await writeSSEIfConnected(stream, {
+            event: "ping",
+            data: '{"type":"ping"}',
+          })
           continue
         }
 
@@ -783,7 +830,7 @@ const streamProviderMessages = ({
             )
           : [{ data, event: eventName }]
         for (const streamEvent of streamEvents) {
-          await stream.writeSSE({
+          await writeSSEIfConnected(stream, {
             event: streamEvent.event,
             data: streamEvent.data,
           })
@@ -796,7 +843,7 @@ const streamProviderMessages = ({
     if (!messageStopSeen && !errorSeen) {
       logger.warn("provider.messages.stream_incomplete:", { provider })
       const errorEvent = translateErrorToAnthropicErrorEvent()
-      await stream.writeSSE({
+      await writeSSEIfConnected(stream, {
         event: errorEvent.type,
         data: JSON.stringify(errorEvent),
       })
@@ -850,7 +897,10 @@ const streamOpenAICompatibleProviderMessages = ({
         )
         const eventName = chunk.event
         if (eventName === "ping") {
-          await stream.writeSSE({ event: "ping", data: '{"type":"ping"}' })
+          await writeSSEIfConnected(stream, {
+            event: "ping",
+            data: '{"type":"ping"}',
+          })
           continue
         }
 
@@ -877,7 +927,7 @@ const streamOpenAICompatibleProviderMessages = ({
             "provider.messages.openai_compatible.translated_event:",
             eventData,
           ])
-          await stream.writeSSE({
+          await writeSSEIfConnected(stream, {
             event: event.type,
             data: eventData,
           })
@@ -896,7 +946,7 @@ const streamOpenAICompatibleProviderMessages = ({
         "provider.messages.openai_compatible.translated_event:",
         eventData,
       ])
-      await stream.writeSSE({
+      await writeSSEIfConnected(stream, {
         event: event.type,
         data: eventData,
       })
@@ -907,7 +957,7 @@ const streamOpenAICompatibleProviderMessages = ({
         provider,
       })
       const errorEvent = translateErrorToAnthropicErrorEvent()
-      await stream.writeSSE({
+      await writeSSEIfConnected(stream, {
         event: errorEvent.type,
         data: JSON.stringify(errorEvent),
       })
@@ -956,7 +1006,10 @@ const streamResponsesProviderMessages = ({
       logger.debug("provider.messages.responses.raw_stream_event:", chunk.data)
       const eventName = chunk.event
       if (eventName === "ping") {
-        await stream.writeSSE({ event: "ping", data: '{"type":"ping"}' })
+        await writeSSEIfConnected(stream, {
+          event: "ping",
+          data: '{"type":"ping"}',
+        })
         continue
       }
 
@@ -990,7 +1043,7 @@ const streamResponsesProviderMessages = ({
           "provider.messages.responses.translated_event:",
           eventData,
         ])
-        await stream.writeSSE({
+        await writeSSEIfConnected(stream, {
           event: event.type,
           data: eventData,
         })
@@ -999,9 +1052,9 @@ const streamResponsesProviderMessages = ({
 
     if (!streamState.messageCompleted) {
       const errorEvent = buildErrorEvent(
-        `${provider} stream ended without a completion event`,
+        `${provider} stream ended without a completion event, retry your request.`,
       )
-      await stream.writeSSE({
+      await writeSSEIfConnected(stream, {
         event: errorEvent.type,
         data: JSON.stringify(errorEvent),
       })
@@ -1322,7 +1375,7 @@ const respondWebSearchProviderMessagesJson = (
     for (const event of buildSyntheticStreamEvents(response)) {
       const data = JSON.stringify(event)
       logger.debug(`Web search stream event`, data)
-      await stream.writeSSE({
+      await writeSSEIfConnected(stream, {
         event: event.type,
         data: data,
       })

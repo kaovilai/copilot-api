@@ -1,5 +1,14 @@
 import { afterEach, beforeEach, expect, mock, test } from "bun:test"
 
+import {
+  applyCopilotTokenResponse,
+  type CopilotTokenDependencies,
+  logUser,
+  setupCopilotToken,
+  stopCopilotRefreshLoop,
+} from "~/lib/token"
+import { state } from "~/lib/state"
+
 type TokenResponse = {
   token: string
   refresh_in: number
@@ -31,22 +40,10 @@ const getCopilotUsageMock = mock(() =>
   }),
 )
 
-await mock.module("~/services/github/get-copilot-token", () => ({
+const dependencies: CopilotTokenDependencies = {
   getCopilotToken: getCopilotTokenMock,
-}))
-
-await mock.module("~/services/github/get-copilot-usage", () => ({
   getCopilotUsage: getCopilotUsageMock,
-}))
-
-const {
-  applyCopilotTokenResponse,
-  logUser,
-  setupCopilotToken,
-  stopCopilotRefreshLoop,
-} = await import("~/lib/token")
-
-const { state } = await import("~/lib/state")
+}
 
 beforeEach(() => {
   state.githubToken = "github-token"
@@ -70,7 +67,7 @@ afterEach(() => {
 })
 
 test("token exchange endpoint overrides the /user endpoints.api (enterprise seat)", async () => {
-  await logUser()
+  await logUser(dependencies)
   expect(state.copilotApiUrl).toBe(BUSINESS_API_URL)
 
   getCopilotTokenMock.mockImplementation(
@@ -83,14 +80,14 @@ test("token exchange endpoint overrides the /user endpoints.api (enterprise seat
       }),
   )
 
-  await setupCopilotToken()
+  await setupCopilotToken(dependencies)
 
   expect(state.copilotToken).toBe("copilot-token-enterprise")
   expect(state.copilotApiUrl).toBe(ENTERPRISE_API_URL)
 })
 
 test("keeps the /user endpoints.api when the token response carries no endpoints", async () => {
-  await logUser()
+  await logUser(dependencies)
   expect(state.copilotApiUrl).toBe(BUSINESS_API_URL)
 
   getCopilotTokenMock.mockImplementation(
@@ -102,7 +99,7 @@ test("keeps the /user endpoints.api when the token response carries no endpoints
       }),
   )
 
-  await setupCopilotToken()
+  await setupCopilotToken(dependencies)
 
   expect(state.copilotToken).toBe("copilot-token-plain")
   expect(state.copilotApiUrl).toBe(BUSINESS_API_URL)
@@ -152,14 +149,14 @@ test("applyCopilotTokenResponse keeps an empty endpoints.api fallback", () => {
 test("opencode oauth app mode skips token exchange and keeps the GitHub token", async () => {
   process.env.COPILOT_API_OAUTH_APP = "opencode"
 
-  await setupCopilotToken()
+  await setupCopilotToken(dependencies)
 
   expect(getCopilotTokenMock).not.toHaveBeenCalled()
   expect(state.copilotToken).toBe("github-token")
 })
 
 test("refresh loop re-applies the exchanged endpoints.api", async () => {
-  await logUser()
+  await logUser(dependencies)
   expect(state.copilotApiUrl).toBe(BUSINESS_API_URL)
 
   getCopilotTokenMock.mockImplementation(
@@ -172,7 +169,7 @@ test("refresh loop re-applies the exchanged endpoints.api", async () => {
       }),
   )
 
-  await setupCopilotToken()
+  await setupCopilotToken(dependencies)
   expect(state.copilotApiUrl).toBe(ENTERPRISE_API_URL)
   expect(getCopilotTokenMock).toHaveBeenCalledTimes(1)
 

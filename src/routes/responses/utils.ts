@@ -23,6 +23,8 @@ import {
   type ResponsesReasoningEffort,
 } from "~/lib/reasoning-effort"
 
+import { isMessagesReasoningId } from "./messages-translation"
+
 export const RESPONSES_ENDPOINT = "/responses"
 export const RESPONSES_WS_ENDPOINT = "ws:/responses"
 export const DEFAULT_RESPONSES_COMPACT_THRESHOLD_RATIO = 0.85
@@ -384,6 +386,18 @@ const createCompactionContextManagement = (
     compact_threshold: compactThreshold,
   },
 ]
+
+export const filterReasoningForTransport = (
+  payload: ResponsesPayload,
+  useMessagesFallback: boolean,
+): void => {
+  if (!Array.isArray(payload.input)) return
+
+  payload.input = payload.input.filter((item) => {
+    if (item.type !== "reasoning") return true
+    return isMessagesReasoningId(item.id) === useMessagesFallback
+  })
+}
 
 export const applyResponsesApiContextManagement = (
   payload: ResponsesPayload,

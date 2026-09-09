@@ -420,19 +420,14 @@ describe("Anthropic to OpenAI translation logic", () => {
       {
         role: "tool",
         tool_call_id: "tool_123",
-        content: [
-          {
-            type: "text",
-            text: "Tool AskUserQuestion loaded",
-          },
-        ],
+        content: "Tool AskUserQuestion loaded",
       },
     ])
   })
 })
 
 describe("tool content support translation", () => {
-  test("keeps Copilot chat translation compatible with array and image tool results", () => {
+  test("moves Copilot image tool results to a user message by default", () => {
     const anthropicPayload: AnthropicMessagesPayload = {
       model: "gpt-4o",
       messages: [
@@ -469,7 +464,15 @@ describe("tool content support translation", () => {
       {
         role: "tool",
         tool_call_id: "tool_image",
+        content: "screenshot",
+      },
+      {
+        role: "user",
         content: [
+          {
+            type: "text",
+            text: "Tool result for tool_image:",
+          },
           {
             type: "text",
             text: "screenshot",
@@ -485,7 +488,7 @@ describe("tool content support translation", () => {
     ])
   })
 
-  test("keeps Copilot image tool content while downgrading unsupported PDFs", () => {
+  test("downgrades PDFs and moves rich Copilot tool results to a user message by default", () => {
     const anthropicPayload: AnthropicMessagesPayload = {
       model: "gpt-4o",
       messages: [
@@ -535,7 +538,16 @@ describe("tool content support translation", () => {
       {
         role: "tool",
         tool_call_id: "tool_pdf",
+        content:
+          "screenshot\nPDF file read: report.pdf\nPDF/document content is not supported by this Chat Completions upstream. Use the available text extracted from the document.",
+      },
+      {
+        role: "user",
         content: [
+          {
+            type: "text",
+            text: "Tool result for tool_pdf:",
+          },
           {
             type: "text",
             text: "screenshot",

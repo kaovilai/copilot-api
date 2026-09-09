@@ -335,7 +335,8 @@ test("messages Chat Completions flow emits an error event when the stream breaks
   expect(JSON.parse(events.at(-1)?.data ?? "{}")).toEqual({
     type: "error",
     error: {
-      message: "An unexpected error occurred during streaming.",
+      message:
+        "An unexpected error occurred during streaming, retry your request.",
       type: "api_error",
     },
   })
@@ -596,7 +597,7 @@ test("messages Messages flow records Copilot AIU from streaming message delta", 
   const usageEvents = await getTokenUsageEventsPage({
     page: 1,
     pageSize: 10,
-    period: "day",
+    period: "today",
   })
 
   expect(capturedMessagesPayload?.model).toBe("claude-sonnet-4.6")
@@ -681,7 +682,8 @@ test("messages Messages flow emits an error event when the stream ends without m
   expect(JSON.parse(events.at(-1)?.data ?? "{}")).toEqual({
     type: "error",
     error: {
-      message: "An unexpected error occurred during streaming.",
+      message:
+        "An unexpected error occurred during streaming, retry your request.",
       type: "api_error",
     },
   })
@@ -881,7 +883,7 @@ test("messages Messages flow records Copilot AIU from non-streaming response", a
   const usageEvents = await getTokenUsageEventsPage({
     page: 1,
     pageSize: 10,
-    period: "day",
+    period: "today",
   })
 
   expect(capturedMessagesPayload?.model).toBe("claude-sonnet-4.6")

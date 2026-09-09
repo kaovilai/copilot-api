@@ -5,6 +5,7 @@
     "electron/**/*",
     "tests/**/*",
     "src/lib/auto-start-server.ts",
+    "src/lib/server-url.ts",
     "src/locales/**/*",
     "src/types/**/*",
     "../src/lib/api-config.ts",
@@ -27,6 +28,8 @@
     "../src/lib/quick-providers.ts",
     "../src/lib/request-auth.ts",
     "../src/lib/request-context.ts",
+    "../src/lib/server-host.ts",
+    "../src/lib/server-host-shared.ts",
     "../src/lib/sqlite.ts",
     "../src/lib/state.ts",
     "../src/lib/subagent.ts",
@@ -45,6 +48,7 @@
     "../src/services/responses-http.ts",
     "../src/services/responses-websocket-helpers.ts",
     "../src/services/responses-websocket.ts",
+    "../src/services/upstream-http.ts",
     "../src/lib/electron-fetch.ts"
   ],
   "compilerOptions": {

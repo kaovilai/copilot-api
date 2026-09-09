@@ -17,6 +17,11 @@ const { fetchCopilotWithReauth } = await import(
 const originalFetch = globalThis.fetch
 const originalCopilotToken = state.copilotToken
 
+const lifecycleOptions = {
+  headersTimeoutMs: 5_000,
+  streamInactivityTimeoutMs: 5_000,
+}
+
 const jsonResponse = (status: number) =>
   ({
     status,
@@ -45,7 +50,11 @@ test("refreshes token and retries once on 401, then succeeds", async () => {
   globalThis.fetch = fetchMock as unknown as typeof fetch
 
   const init = { headers: { Authorization: "Bearer stale-token" } }
-  const response = await fetchCopilotWithReauth("https://example.test", init)
+  const response = await fetchCopilotWithReauth(
+    "https://example.test",
+    init,
+    lifecycleOptions,
+  )
 
   expect(response.status).toBe(200)
   expect(fetchMock).toHaveBeenCalledTimes(2)
@@ -61,7 +70,11 @@ test("returns second 401 response when refresh doesn't fix it, without looping",
   globalThis.fetch = fetchMock as unknown as typeof fetch
 
   const init = { headers: { Authorization: "Bearer stale-token" } }
-  const response = await fetchCopilotWithReauth("https://example.test", init)
+  const response = await fetchCopilotWithReauth(
+    "https://example.test",
+    init,
+    lifecycleOptions,
+  )
 
   expect(response.status).toBe(401)
   expect(fetchMock).toHaveBeenCalledTimes(2)
@@ -76,7 +89,11 @@ test("returns original 401 response when reauth itself throws", async () => {
   globalThis.fetch = fetchMock as unknown as typeof fetch
 
   const init = { headers: { Authorization: "Bearer stale-token" } }
-  const response = await fetchCopilotWithReauth("https://example.test", init)
+  const response = await fetchCopilotWithReauth(
+    "https://example.test",
+    init,
+    lifecycleOptions,
+  )
 
   expect(response.status).toBe(401)
   expect(fetchMock).toHaveBeenCalledTimes(1)
@@ -87,7 +104,11 @@ test("does not reauth or retry on a non-401 response", async () => {
   globalThis.fetch = fetchMock as unknown as typeof fetch
 
   const init = { headers: { Authorization: "Bearer stale-token" } }
-  const response = await fetchCopilotWithReauth("https://example.test", init)
+  const response = await fetchCopilotWithReauth(
+    "https://example.test",
+    init,
+    lifecycleOptions,
+  )
 
   expect(response.status).toBe(500)
   expect(fetchMock).toHaveBeenCalledTimes(1)

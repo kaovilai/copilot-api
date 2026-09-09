@@ -494,9 +494,10 @@ describe("provider Responses context management", () => {
     })
   })
 
-  test("propagates provider-scoped client cancellation upstream without a 500", async () => {
+  test("drains provider-scoped requests after client cancellation", async () => {
     let upstreamSignal: AbortSignal | undefined
     const upstreamStarted = createDeferred()
+    const upstreamCompletion = createResponseDeferred()
     fetchMock.mockImplementation((_url, init) => {
       const signal = init?.signal
       if (!(signal instanceof AbortSignal)) {
@@ -504,26 +505,7 @@ describe("provider Responses context management", () => {
       }
       upstreamSignal = signal
       upstreamStarted.resolve()
-      return new Promise<Response>((_resolve, reject) => {
-        if (signal.aborted) {
-          reject(
-            signal.reason instanceof Error ?
-              signal.reason
-            : new Error("Provider request aborted"),
-          )
-          return
-        }
-        signal.addEventListener(
-          "abort",
-          () =>
-            reject(
-              signal.reason instanceof Error ?
-                signal.reason
-              : new Error("Provider request aborted"),
-            ),
-          { once: true },
-        )
-      })
+      return upstreamCompletion.promise
     })
     const controller = new AbortController()
     const responsePromise = createApp().fetch(
@@ -537,17 +519,20 @@ describe("provider Responses context management", () => {
     await upstreamStarted.promise
 
     controller.abort()
+    expect(upstreamSignal?.aborted).toBe(false)
+    upstreamCompletion.resolve(createJsonResponsesResponse("gpt-test"))
 
     const response = await responsePromise
-    expect(upstreamSignal?.aborted).toBe(true)
-    expect(response.status).toBe(499)
+    expect(response.status).toBe(200)
+    expect(upstreamSignal?.aborted).toBe(false)
   })
 
-  test("propagates provider-prefixed Codex cancellation upstream", async () => {
+  test("drains provider-prefixed Codex requests after client cancellation", async () => {
     const originalCodexAccessToken = state.codexAccessToken
     const originalCodexAccountId = state.codexAccountId
     let upstreamSignal: AbortSignal | undefined
     const upstreamStarted = createDeferred()
+    const upstreamCompletion = createResponseDeferred()
     providerConfig = {
       apiKey: "",
       authType: "oauth2",
@@ -566,18 +551,7 @@ describe("provider Responses context management", () => {
       }
       upstreamSignal = signal
       upstreamStarted.resolve()
-      return new Promise<Response>((_resolve, reject) => {
-        signal.addEventListener(
-          "abort",
-          () =>
-            reject(
-              signal.reason instanceof Error ?
-                signal.reason
-              : new Error("Codex request aborted"),
-            ),
-          { once: true },
-        )
-      })
+      return upstreamCompletion.promise
     })
 
     try {
@@ -593,10 +567,12 @@ describe("provider Responses context management", () => {
       await upstreamStarted.promise
 
       controller.abort()
+      expect(upstreamSignal?.aborted).toBe(false)
+      upstreamCompletion.resolve(createJsonResponsesResponse("gpt-test"))
 
       const response = await responsePromise
-      expect(upstreamSignal?.aborted).toBe(true)
-      expect(response.status).toBe(499)
+      expect(response.status).toBe(200)
+      expect(upstreamSignal?.aborted).toBe(false)
     } finally {
       state.codexAccessToken = originalCodexAccessToken
       state.codexAccountId = originalCodexAccountId
@@ -859,6 +835,108 @@ describe("provider Responses context management", () => {
   })
 })
 
+describe("provider Responses reasoning transport isolation", () => {
+  test("keeps only Messages reasoning when falling back to an Anthropic provider", async () => {
+    providerConfig = {
+      apiKey: "provider-key",
+      authType: "x-api-key",
+      baseUrl: "https://anthropic.example",
+      models: { "claude-test": {} },
+      name: "anthropic",
+      type: "anthropic",
+    }
+    fetchMock.mockImplementation(() =>
+      Promise.resolve(
+        Response.json({
+          content: [{ type: "text", text: "done" }],
+          id: "msg-switch",
+          model: "claude-test",
+          role: "assistant",
+          stop_reason: "end_turn",
+          stop_sequence: null,
+          type: "message",
+          usage: { input_tokens: 8, output_tokens: 2 },
+        }),
+      ),
+    )
+
+    const response = await createApp().request("/v1/responses", {
+      body: JSON.stringify({
+        model: "anthropic/claude-test",
+        input: [
+          {
+            id: "rs_native",
+            type: "reasoning",
+            summary: [],
+            encrypted_content: "native-reasoning",
+          },
+          { role: "assistant", type: "message", content: "Visible answer" },
+          {
+            id: "rs_messages__a1",
+            type: "reasoning",
+            summary: [],
+            encrypted_content: "messages-reasoning",
+          },
+          { role: "user", type: "message", content: "Continue" },
+        ],
+      }),
+      headers: { "content-type": "application/json" },
+      method: "POST",
+    })
+
+    expect(response.status).toBe(200)
+    const [, init] = fetchMock.mock.calls[0] ?? []
+    const body = parseJsonRequestBody((init as RequestInit).body) as {
+      messages: Array<{ content: unknown }>
+    }
+    const blocks = body.messages.flatMap((message) =>
+      Array.isArray(message.content) ?
+        (message.content as Array<Record<string, unknown>>)
+      : [],
+    )
+    const signatures = blocks
+      .filter((block) => block.type === "thinking")
+      .map((block) => block.signature)
+    expect(signatures).toEqual(["messages-reasoning"])
+    expect(blocks).toContainEqual({ type: "text", text: "Visible answer" })
+  })
+
+  test("drops Messages reasoning when forwarding to an openai-responses provider", async () => {
+    const response = await createApp().request("/v1/responses", {
+      body: JSON.stringify({
+        model: "openai/gpt-test",
+        input: [
+          {
+            id: "rs_native",
+            type: "reasoning",
+            summary: [],
+            encrypted_content: "native-reasoning",
+          },
+          {
+            id: "rs_messages__a1",
+            type: "reasoning",
+            summary: [],
+            encrypted_content: "messages-reasoning",
+          },
+          { role: "user", type: "message", content: "Continue" },
+        ],
+      }),
+      headers: { "content-type": "application/json" },
+      method: "POST",
+    })
+
+    expect(response.status).toBe(200)
+    const [, init] = fetchMock.mock.calls[0] ?? []
+    const body = parseJsonRequestBody((init as RequestInit).body) as {
+      input: Array<Record<string, unknown>>
+    }
+    const reasoningIds = body.input
+      .filter((item) => item.type === "reasoning")
+      .map((item) => item.id)
+    expect(reasoningIds).toEqual(["rs_native"])
+  })
+})
+
 const createDeferred = (): {
   promise: Promise<void>
   resolve: () => void
@@ -869,3 +947,19 @@ const createDeferred = (): {
   })
   return { promise, resolve }
 }
+
+const createResponseDeferred = (): {
+  promise: Promise<Response>
+  resolve: (response: Response) => void
+} => {
+  let resolve!: (response: Response) => void
+  const promise = new Promise<Response>((deferredResolve) => {
+    resolve = deferredResolve
+  })
+  return { promise, resolve }
+}
+
+const createJsonResponsesResponse = (model: string): Response =>
+  new Response(JSON.stringify(createResponsesResult(model)), {
+    headers: { "content-type": "application/json" },
+  })

@@ -357,7 +357,7 @@ describe("auth login validation", () => {
     })
   })
 
-  test("configures kimi with anthropic defaults and an editable type", () => {
+  test("configures kimi with openai-compatible defaults and an editable type", () => {
     const tempDir = createTempDir()
     writeConfigFile(tempDir, {})
 
@@ -380,7 +380,7 @@ describe("auth login validation", () => {
       baseUrl: "https://api.kimi.com/coding",
       enabled: true,
       pricingCurrency: "USD",
-      type: "anthropic",
+      type: "openai-compatible",
     })
   })
 

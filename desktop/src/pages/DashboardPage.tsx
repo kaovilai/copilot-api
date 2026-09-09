@@ -15,6 +15,7 @@ import {
   shouldShowCopilotUsageSummary,
 } from '../lib/copilot-usage-display'
 import { formatTokenCost, formatTokenCosts } from '../lib/token-usage-format'
+import { buildServerBaseUrl } from '../lib/server-url'
 import ModelMappingsPage from './ModelMappingsPage'
 import type {
   DesktopAuthMode,
@@ -32,6 +33,7 @@ import type {
 interface DashboardPageProps {
   authMode: DesktopAuthMode
   defaultPort: number
+  defaultHost: string
   initialServerStatus?: ServerStatus
   onChangeAuth: () => void
 }
@@ -65,6 +67,7 @@ const numberFormatter = new Intl.NumberFormat()
 const TOKEN_USAGE_EVENTS_PAGE_SIZE = 10
 const ALL_METRICS_VALUE = '__all__'
 const ALL_MODELS_VALUE = '__all__'
+const MAX_LIFETIME_TREND_POINTS = 180
 const EMPTY_TOKEN_USAGE_TOTALS: TokenUsageTotals = {
   cache_creation_input_tokens: 0,
   cache_read_input_tokens: 0,
@@ -249,6 +252,7 @@ function formatCellText(value: string | null | undefined): string {
 export default function DashboardPage({
   authMode,
   defaultPort,
+  defaultHost,
   initialServerStatus,
   onChangeAuth,
 }: DashboardPageProps) {
@@ -256,6 +260,9 @@ export default function DashboardPage({
   const [started, setStarted] = useState(initialServerStatus?.running ?? false)
   const [port, setPort] = useState<string>(
     String(initialServerStatus?.port ?? defaultPort),
+  )
+  const [host, setHost] = useState<string>(
+    initialServerStatus?.host ?? defaultHost,
   )
   const [starting, setStarting] = useState(false)
   const [startError, setStartError] = useState(
@@ -275,7 +282,7 @@ export default function DashboardPage({
     useState<TokenUsageEventsPage | null>(null)
   const [tokenUsageEventsPage, setTokenUsageEventsPage] = useState(1)
   const [tokenUsagePeriod, setTokenUsagePeriod] =
-    useState<TokenUsagePeriod>('day')
+    useState<TokenUsagePeriod>('today')
   const [models, setModels] = useState<Model[]>([])
   const [serverAuthInfo, setServerAuthInfo] = useState<ServerAuthInfo>({
     enabled: false,
@@ -296,8 +303,9 @@ export default function DashboardPage({
   const tokenUsageEventsRequestId = useRef(0)
 
   const portNum = parseInt(port, 10)
-  const openaiUrl = `http://localhost:${portNum}/v1`
-  const anthropicUrl = `http://localhost:${portNum}`
+  const normalizedHost = host.trim()
+  const openaiUrl = `${buildServerBaseUrl(host, portNum)}/v1`
+  const anthropicUrl = buildServerBaseUrl(host, portNum)
 
   useEffect(() => {
     let active = true
@@ -306,7 +314,12 @@ export default function DashboardPage({
       .getServerStatus()
       .then((status) => {
         if (!active) return
-        if (status.port) setPort(String(status.port))
+        // Only a running server reports the host and port it actually bound,
+        // so an idle status must not overwrite the saved settings.
+        if (status.running) {
+          if (status.port) setPort(String(status.port))
+          if (status.host !== undefined) setHost(status.host)
+        }
         setStarted(status.running)
       })
       .catch(() => {})
@@ -388,7 +401,11 @@ export default function DashboardPage({
     setServerError('')
     setLogs([])
     try {
-      const status = await window.electronAPI.startServer(portNum, authMode)
+      const status = await window.electronAPI.startServer(
+        portNum,
+        authMode,
+        normalizedHost,
+      )
       if (status.running) {
         setStarted(true)
       } else {
@@ -440,9 +457,14 @@ export default function DashboardPage({
     setLogs([])
     try {
       await window.electronAPI.stopServer()
-      const status = await window.electronAPI.startServer(portNum, authMode)
+      const status = await window.electronAPI.startServer(
+        portNum,
+        authMode,
+        normalizedHost,
+      )
       if (status.running) {
         if (status.port) setPort(String(status.port))
+        if (status.host !== undefined) setHost(status.host)
         setStarted(true)
       } else {
         setStarted(false)
@@ -475,6 +497,17 @@ export default function DashboardPage({
 
   const handleChangeAuth = () => {
     onChangeAuth()
+  }
+
+  // The listening host is configured in the settings modal, so reload the
+  // saved value once the modal closes.
+  const handleSettingsClose = () => {
+    void window.electronAPI
+      .getSettings()
+      .then((saved) => {
+        if (saved.host !== undefined) setHost(saved.host)
+      })
+      .catch(() => {})
   }
 
   const fetchData = async () => {
@@ -707,6 +740,7 @@ export default function DashboardPage({
         onChangeAuth={handleChangeAuth}
         onRestart={handleRestart}
         onStop={handleStop}
+        onSettingsClose={handleSettingsClose}
         isRunning={started && !stopping}
         isRestarting={restarting}
       />
@@ -1186,9 +1220,12 @@ function TokenUsagePanel({
   const [trendModel, setTrendModel] = useState(ALL_MODELS_VALUE)
   const totals = tokenUsage?.totals ?? EMPTY_TOKEN_USAGE_TOTALS
   const periods: Array<{ key: TokenUsagePeriod; label: string }> = [
-    { key: 'day', label: t('dashboard.tokenUsagePeriodDay') },
-    { key: 'week', label: t('dashboard.tokenUsagePeriodWeek') },
-    { key: 'month', label: t('dashboard.tokenUsagePeriodMonth') },
+    { key: 'today', label: t('dashboard.tokenUsagePeriodToday') },
+    { key: 'this_week', label: t('dashboard.tokenUsagePeriodThisWeek') },
+    { key: 'last_7_days', label: t('dashboard.tokenUsagePeriodLast7Days') },
+    { key: 'this_month', label: t('dashboard.tokenUsagePeriodThisMonth') },
+    { key: 'last_30_days', label: t('dashboard.tokenUsagePeriodLast30Days') },
+    { key: 'lifetime', label: t('dashboard.tokenUsagePeriodLifetime') },
   ]
   const trendModels = dailyUsage?.byModel ?? tokenUsage?.byModel ?? []
   const selectedTrendModel =
@@ -1205,21 +1242,19 @@ function TokenUsagePanel({
           {t('dashboard.tokenUsage')}
         </h3>
         <div className="flex flex-wrap items-center gap-2">
-          <div className="grid grid-cols-3 rounded-lg border border-line bg-sunken p-0.5">
+          <select
+            value={period}
+            onChange={(event) =>
+              onPeriodChange(event.target.value as TokenUsagePeriod)
+            }
+            className="h-7 rounded-md border border-line bg-surface px-2 text-[13px] text-ink-soft focus:outline-none focus:ring-2 focus:ring-accent/30"
+          >
             {periods.map((item) => (
-              <button
-                key={item.key}
-                onClick={() => onPeriodChange(item.key)}
-                className={`px-2.5 py-1 text-[13px] rounded-md transition-colors ${
-                  period === item.key ?
-                    'bg-surface text-ink shadow-sm font-semibold'
-                  : 'text-ink-soft hover:text-ink'
-                }`}
-              >
+              <option key={item.key} value={item.key}>
                 {item.label}
-              </button>
+              </option>
             ))}
-          </div>
+          </select>
         </div>
       </div>
 
@@ -1267,12 +1302,13 @@ function TokenUsagePanel({
         />
       </div>
 
-      {period !== 'day' && (
+      {period !== 'today' && (
         <TokenUsageTrendChart
           dailyUsage={dailyUsage}
           loading={loading}
           models={trendModels}
           onModelChange={setTrendModel}
+          period={period}
           selectedModel={selectedTrendModel}
           t={t}
         />
@@ -1469,6 +1505,44 @@ function getTrendTotals(
   )
 }
 
+function sampleTrendDays(
+  days: TokenUsageDailySummary['days'],
+  selectedModel: string,
+  period: TokenUsagePeriod,
+): TokenUsageDailySummary['days'] {
+  if (period !== 'lifetime' || days.length <= MAX_LIFETIME_TREND_POINTS) {
+    return days
+  }
+
+  const usageIndexes = days.reduce<Array<number>>((indexes, day, index) => {
+    if (getTrendTotals(day, selectedModel).request_count > 0) {
+      indexes.push(index)
+    }
+    return indexes
+  }, [])
+  if (usageIndexes.length >= MAX_LIFETIME_TREND_POINTS) {
+    const step = (usageIndexes.length - 1) / (MAX_LIFETIME_TREND_POINTS - 1)
+    return Array.from(
+      { length: MAX_LIFETIME_TREND_POINTS },
+      (_, index) => days[usageIndexes[Math.round(index * step)]],
+    )
+  }
+
+  const indexes = new Set(usageIndexes)
+  const sampleCount = Math.max(
+    1,
+    MAX_LIFETIME_TREND_POINTS - usageIndexes.length,
+  )
+  const step = (days.length - 1) / (sampleCount - 1 || 1)
+  for (let index = 0; index < sampleCount; index += 1) {
+    indexes.add(Math.round(index * step))
+  }
+  return [...indexes]
+    .sort((left, right) => left - right)
+    .slice(0, MAX_LIFETIME_TREND_POINTS)
+    .map((index) => days[index])
+}
+
 function formatChartDate(value: string): string {
   const [, month, day] = value.split('-')
   return month && day ? `${month}/${day}` : value
@@ -1479,6 +1553,7 @@ function TokenUsageTrendChart({
   loading,
   models,
   onModelChange,
+  period,
   selectedModel,
   t,
 }: {
@@ -1486,6 +1561,7 @@ function TokenUsageTrendChart({
   loading: boolean
   models: TokenUsageModelSummary[]
   onModelChange: (model: string) => void
+  period: TokenUsagePeriod
   selectedModel: string
   t: TranslateFn
 }) {
@@ -1527,7 +1603,7 @@ function TokenUsageTrendChart({
     selectedMetric === ALL_METRICS_VALUE ? metrics : (
       metrics.filter((metric) => metric.key === selectedMetric)
     )
-  const days = dailyUsage?.days ?? []
+  const days = sampleTrendDays(dailyUsage?.days ?? [], selectedModel, period)
   const hasUsage = days.some(
     (day) => getTrendTotals(day, selectedModel).request_count > 0,
   )

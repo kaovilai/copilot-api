@@ -4,20 +4,19 @@ import {
   type RequestInit as UndiciRequestInit,
 } from "undici"
 
-import type { ResolvedProviderConfig } from "~/lib/config"
-import { getResponsesTransportConfig } from "~/lib/config"
 import {
-  fetchWithConnectRetry,
-  retryPreResponseFailures,
-} from "~/lib/fetch-timeout"
+  getUpstreamTransportConfig,
+  type ResolvedProviderConfig,
+} from "~/lib/config"
+import { retryPreResponseFailures } from "~/lib/fetch-timeout"
+import { requestContext } from "~/lib/request-context"
 import { createTimeoutDispatcher } from "~/lib/timeout-dispatcher"
 import type { AnthropicMessagesPayload } from "~/lib/types/anthropic"
 import type { ChatCompletionsPayload } from "~/lib/types/chat-completions"
 import type { ResponsesPayload } from "~/lib/types/responses"
-import {
-  fetchResponsesWithLifecycle,
-  ResponsesHeadersTimeoutError,
-} from "~/services/responses-http"
+import { UpstreamHeadersTimeoutError } from "~/lib/error"
+import { parseUserIdMetadata } from "~/lib/utils"
+import { fetchUpstreamWithLifecycle } from "~/services/upstream-http"
 
 const SHARED_FORWARDABLE_HEADERS = ["accept", "user-agent"] as const
 
@@ -77,6 +76,37 @@ export function buildProviderUpstreamHeaders(
   return headers
 }
 
+const OPENCODE_GO_PROVIDER_NAME = "opencode-go"
+const OPENCODE_SESSION_HEADER = "x-opencode-session"
+
+const resolveOpencodeMessagesSession = (
+  payload: AnthropicMessagesPayload,
+): string | undefined => {
+  const sessionAffinity = requestContext.getStore()?.sessionAffinity?.trim()
+  if (sessionAffinity) {
+    return sessionAffinity
+  }
+
+  const userId = payload.metadata?.user_id
+  if (!userId?.trim()) {
+    return undefined
+  }
+
+  const { sessionId } = parseUserIdMetadata(userId)
+  return sessionId ?? userId
+}
+
+const applyOpencodeSessionHeader = (
+  providerConfig: ResolvedProviderConfig,
+  headers: Record<string, string>,
+  session: string | undefined,
+): void => {
+  if (providerConfig.name !== OPENCODE_GO_PROVIDER_NAME || !session) {
+    return
+  }
+  headers[OPENCODE_SESSION_HEADER] = session
+}
+
 export function createProviderProxyResponse(
   upstreamResponse: Response,
   body?: ReadableStream<Uint8Array> | null,
@@ -106,38 +136,67 @@ export async function forwardProviderMessages(
   providerConfig: ResolvedProviderConfig,
   payload: AnthropicMessagesPayload,
   requestHeaders: Headers,
-  signal: AbortSignal,
+  options: { clientSignal?: AbortSignal } = {},
 ): Promise<Response> {
   consola.log(`<-- model: ${payload.model}`)
-  return await fetchWithConnectRetry(`${providerConfig.baseUrl}/v1/messages`, {
-    method: "POST",
-    headers: {
-      ...buildProviderUpstreamHeaders(providerConfig, requestHeaders),
-      ...CLOSE_CONNECTION_HEADERS,
-    },
-    body: JSON.stringify(payload),
-    signal,
-  })
+  const headers = buildProviderUpstreamHeaders(providerConfig, requestHeaders)
+  applyOpencodeSessionHeader(
+    providerConfig,
+    headers,
+    resolveOpencodeMessagesSession(payload),
+  )
+  const transportConfig = getUpstreamTransportConfig()
+  return await retryPreResponseFailures(
+    () =>
+      fetchUpstreamWithLifecycle(
+        `${providerConfig.baseUrl}/v1/messages`,
+        {
+          method: "POST",
+          headers: { ...headers, ...CLOSE_CONNECTION_HEADERS },
+          body: JSON.stringify(payload),
+        },
+        {
+          clientSignal: options.clientSignal,
+          headersTimeoutMs: transportConfig.headersTimeoutMs,
+          streamInactivityTimeoutMs: transportConfig.streamInactivityTimeoutMs,
+        },
+      ),
+    options.clientSignal,
+    (error) => error instanceof UpstreamHeadersTimeoutError,
+  )
 }
 
 export async function forwardProviderChatCompletions(
   providerConfig: ResolvedProviderConfig,
   payload: ChatCompletionsPayload,
   requestHeaders: Headers,
-  signal: AbortSignal,
+  options: { clientSignal?: AbortSignal } = {},
 ): Promise<Response> {
   consola.log(`<-- model: ${payload.model}`)
-  return await fetchWithConnectRetry(
-    `${providerConfig.baseUrl}/v1/chat/completions`,
-    {
-      method: "POST",
-      headers: {
-        ...buildProviderUpstreamHeaders(providerConfig, requestHeaders),
-        ...CLOSE_CONNECTION_HEADERS,
-      },
-      body: JSON.stringify(payload),
-      signal,
-    },
+  const headers = buildProviderUpstreamHeaders(providerConfig, requestHeaders)
+  applyOpencodeSessionHeader(
+    providerConfig,
+    headers,
+    payload.prompt_cache_key?.trim() || undefined,
+  )
+  const transportConfig = getUpstreamTransportConfig()
+  return await retryPreResponseFailures(
+    () =>
+      fetchUpstreamWithLifecycle(
+        `${providerConfig.baseUrl}/v1/chat/completions`,
+        {
+          method: "POST",
+          headers: { ...headers, ...CLOSE_CONNECTION_HEADERS },
+          body: JSON.stringify(payload),
+        },
+        {
+          clientSignal: options.clientSignal,
+          headersTimeoutMs: transportConfig.headersTimeoutMs,
+          streamInactivityTimeoutMs: transportConfig.streamInactivityTimeoutMs,
+        },
+      ),
+    options.clientSignal,
+    (error) => error instanceof UpstreamHeadersTimeoutError,
   )
 }
 
@@ -145,31 +204,33 @@ export async function forwardProviderResponses(
   providerConfig: ResolvedProviderConfig,
   payload: ResponsesPayload,
   requestHeaders: Headers,
-  options: { signal?: AbortSignal } = {},
+  options: { clientSignal?: AbortSignal } = {},
 ): Promise<Response> {
   consola.log(`<-- model: ${payload.model}`)
-  const transportConfig = getResponsesTransportConfig()
+  const transportConfig = getUpstreamTransportConfig()
+  const headers = buildProviderUpstreamHeaders(providerConfig, requestHeaders)
+  applyOpencodeSessionHeader(
+    providerConfig,
+    headers,
+    payload.prompt_cache_key?.trim() || undefined,
+  )
   return await retryPreResponseFailures(
     () =>
-      fetchResponsesWithLifecycle(
+      fetchUpstreamWithLifecycle(
         `${providerConfig.baseUrl}/v1/responses`,
         {
           method: "POST",
-          headers: {
-            ...buildProviderUpstreamHeaders(providerConfig, requestHeaders),
-            ...CLOSE_CONNECTION_HEADERS,
-          },
+          headers: { ...headers, ...CLOSE_CONNECTION_HEADERS },
           body: JSON.stringify(payload),
-          signal: options.signal,
         },
         {
+          clientSignal: options.clientSignal,
           headersTimeoutMs: transportConfig.headersTimeoutMs,
-          signal: options.signal,
           streamInactivityTimeoutMs: transportConfig.streamInactivityTimeoutMs,
         },
       ),
-    options.signal,
-    (error) => error instanceof ResponsesHeadersTimeoutError,
+    options.clientSignal,
+    (error) => error instanceof UpstreamHeadersTimeoutError,
   )
 }
 
@@ -208,17 +269,24 @@ function resolveProviderRequestUrl(
 export async function forwardProviderAlphaSearch(
   providerConfig: ResolvedProviderConfig,
   request: Request,
+  options: { clientSignal?: AbortSignal } = {},
 ): Promise<Response> {
   const headers = buildProviderUpstreamHeaders(providerConfig, request.headers)
   const body = await request.arrayBuffer()
+  const transportConfig = getUpstreamTransportConfig()
 
-  return await fetch(
+  return await fetchUpstreamWithLifecycle(
     resolveProviderRequestUrl(providerConfig, request.url, "/v1/alpha/search"),
     {
       method: "POST",
       headers,
       body,
       signal: AbortSignal.timeout(PROVIDER_JSON_REQUEST_TIMEOUT_MS),
+    },
+    {
+      clientSignal: options.clientSignal,
+      headersTimeoutMs: transportConfig.headersTimeoutMs,
+      streamInactivityTimeoutMs: transportConfig.streamInactivityTimeoutMs,
     },
   )
 }

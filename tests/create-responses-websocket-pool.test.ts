@@ -601,7 +601,7 @@ test("Responses websocket stream failure includes the underlying reason", async 
   expect(chunks).toHaveLength(1)
   expect(chunks[0]?.event).toBe("error")
   expect(chunks[0]?.data).toContain(
-    '"message":"Responses websocket stream error: socket hang up"',
+    '"message":"Upstream connection lost, Responses websocket stream error: socket hang up"',
   )
 })
 
@@ -632,7 +632,7 @@ test("Responses websocket emits an error event when the websocket closes without
   expect(chunks).toHaveLength(1)
   expect(chunks[0]?.event).toBe("error")
   expect(chunks[0]?.data).toContain(
-    '"message":"Responses websocket ended without a terminal response"',
+    '"message":"Responses websocket ended without a terminal response, retry your request."',
   )
 })
 

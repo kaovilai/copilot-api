@@ -6,6 +6,7 @@ import { streamSSE, type SSEMessage } from "hono/streaming"
 import { resolveMappedModel } from "~/lib/config"
 import { createHandlerLogger, debugJson } from "~/lib/logger"
 import { findEndpointModel } from "~/lib/models"
+import { writeSSEIfConnected } from "~/lib/sse"
 import { resolveConfiguredProviderModelAlias } from "~/lib/provider-resolver"
 import {
   createCopilotTokenUsageRecorder,
@@ -86,9 +87,9 @@ export async function handleCompletion(c: Context) {
 
   const response =
     await chatCompletionsHandlerDependencies.createChatCompletions(payload, {
+      clientSignal: c.req.raw.signal,
       requestId,
       sessionId,
-      signal: c.req.raw.signal,
     })
 
   if (isNonStreaming(response)) {
@@ -121,7 +122,7 @@ export async function handleCompletion(c: Context) {
         }
 
         const remapped = remapToolCallChunkIndices(chunk, toolCallIndexMap)
-        await stream.writeSSE((remapped ?? chunk) as SSEMessage)
+        await writeSSEIfConnected(stream, (remapped ?? chunk) as SSEMessage)
       }
     } catch (error) {
       // A client disconnect (or the request otherwise being cancelled) aborts

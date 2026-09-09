@@ -40,6 +40,15 @@ describe("effective provider type", () => {
     ).toBe("openai-responses")
   })
 
+  test("uses OpenAI Responses for OpenCode Go Muse Spark models", () => {
+    expect(
+      resolveEffectiveProviderType(
+        createProviderConfig(),
+        "muse-spark-1.2-contributor",
+      ),
+    ).toBe("openai-responses")
+  })
+
   test("keeps OpenCode Go's OpenAI-compatible default for other models", () => {
     const providerConfig = createProviderConfig()
 

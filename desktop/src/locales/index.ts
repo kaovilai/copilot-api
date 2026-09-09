@@ -74,9 +74,12 @@ export interface Locale {
     tokenUsageModelBreakdown: string
     tokenUsageOutput: string
     tokenUsagePage: string
-    tokenUsagePeriodDay: string
-    tokenUsagePeriodMonth: string
-    tokenUsagePeriodWeek: string
+    tokenUsagePeriodToday: string
+    tokenUsagePeriodThisWeek: string
+    tokenUsagePeriodLast7Days: string
+    tokenUsagePeriodThisMonth: string
+    tokenUsagePeriodLast30Days: string
+    tokenUsagePeriodLifetime: string
     tokenUsageProvider: string
     tokenUsageRequests: string
     tokenUsageSession: string
@@ -136,6 +139,7 @@ export interface Locale {
     startFailed: string
     startTimeout: string
     processExit: string
+    invalidHost: string
   }
   settings: {
     title: string
@@ -156,6 +160,9 @@ export interface Locale {
     adminKeyPlaceholder: string
     adminKeyDesc: string
     sectionNetwork: string
+    host: string
+    hostDesc: string
+    hostInvalid: string
     proxySystemNote: string
     proxyMode: string
     proxyModeSystem: string

@@ -212,12 +212,12 @@ describe("codex api helpers", () => {
     expect(models.object).toBe("list")
     expect(models.data.map((model) => model.id)).toEqual([
       "gpt-5.3-codex-spark",
-      "gpt-5.4",
       "gpt-5.4-mini",
       "gpt-5.5",
       "gpt-5.6-sol",
       "gpt-5.6-terra",
       "gpt-5.6-luna",
+      "gpt-6-astra",
     ])
     expect(
       models.data.every(

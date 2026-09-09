@@ -3,6 +3,7 @@ import { Hono } from "hono"
 
 import type { ResolvedProviderConfig } from "~/lib/config"
 import type { ModelsResponse } from "~/lib/types/models"
+import bundledCodexCatalogJson from "~/routes/models/models.json"
 
 const actualConfigModule = await import("~/lib/config")
 const actualTokenModule = await import("~/lib/token")
@@ -74,6 +75,18 @@ const createDefaultCodexCatalogModels = () => [
     available_in_plans: ["pro"],
   },
 ]
+
+const bundledCodexModels = (
+  bundledCodexCatalogJson as {
+    models: Array<{
+      slug: string
+      visibility?: string
+      supported_in_api?: boolean
+      model_messages?: { instructions_template?: string }
+    }>
+  }
+).models
+const bundledCodexSlugs = bundledCodexModels.map((model) => model.slug)
 
 let codexCatalogModels: Array<Record<string, unknown>> =
   createDefaultCodexCatalogModels()
@@ -311,6 +324,7 @@ describe("model routes", () => {
       models: Array<Record<string, unknown> & { slug: string }>
     }
     expect(body.models.map((model) => model.slug)).toEqual([
+      ...bundledCodexSlugs,
       "claude-sonnet-4-6",
     ])
   })
@@ -345,6 +359,7 @@ describe("model routes", () => {
       context_window: 1_000_000,
       input_modalities: ["text"],
       max_output_tokens: 64_000,
+      shell_type: "shell_command",
     })
     expect(body.models.find((model) => model.slug === "kimi/k3")).toMatchObject(
       {
@@ -442,7 +457,7 @@ describe("model routes", () => {
 
     expect(response.status).toBe(200)
     const body = (await response.json()) as { data: Array<{ id: string }> }
-    expect(body.data.map((model) => model.id)).toContain("codex/gpt-5.4")
+    expect(body.data.map((model) => model.id)).toContain("codex/gpt-6-astra")
     expect(body.data.map((model) => model.id)).toContain("codex/gpt-5.6-sol")
     expect(fetchMock).not.toHaveBeenCalled()
   })
@@ -563,15 +578,18 @@ describe("model routes", () => {
       models: Array<Record<string, unknown> & { slug: string }>
     }
     expect(body.models.map((model) => model.slug)).toEqual([
+      ...bundledCodexSlugs,
       "gpt-responses-http",
       "gpt-responses-websocket",
     ])
-    expect(body.models[0]?.description).toBe(
-      "gpt-responses-http through the Copilot Responses API.",
-    )
-    expect(body.models[1]?.description).toBe(
-      "gpt-responses-websocket through the Copilot Responses API.",
-    )
+    expect(
+      body.models.find((model) => model.slug === "gpt-responses-http")
+        ?.description,
+    ).toBe("gpt-responses-http through the Copilot Responses API.")
+    expect(
+      body.models.find((model) => model.slug === "gpt-responses-websocket")
+        ?.description,
+    ).toBe("gpt-responses-websocket through the Copilot Responses API.")
   })
 
   test("describes non-GPT Responses-capable Copilot models as adapter-backed", async () => {
@@ -594,15 +612,16 @@ describe("model routes", () => {
     const body = (await response.json()) as {
       models: Array<Record<string, unknown> & { slug: string }>
     }
-    expect(body.models[0]?.description).toBe(
-      "claude-sonnet-4.6 through the Copilot Messages adapter.",
-    )
-    expect(body.models[1]?.description).toBe(
-      "gemini-3-pro through the Copilot Messages-to-Responses adapter.",
-    )
+    expect(
+      body.models.find((model) => model.slug === "claude-sonnet-4-6")
+        ?.description,
+    ).toBe("claude-sonnet-4.6 through the Copilot Messages adapter.")
+    expect(
+      body.models.find((model) => model.slug === "gemini-3-pro")?.description,
+    ).toBe("gemini-3-pro through the Copilot Messages-to-Responses adapter.")
   })
 
-  test("uses the default Codex template when the Codex provider is missing", async () => {
+  test("uses the bundled Codex catalog when the Codex provider is missing", async () => {
     const copilotModels = createCopilotModels(["claude-sonnet-4.6"])
     copilotModels.data[0].supported_endpoints = ["/v1/messages"]
     copilotModels.data[0].capabilities.supports.tool_calls = true
@@ -625,13 +644,18 @@ describe("model routes", () => {
     )
     expect(synthetic).toMatchObject({
       display_name: "claude-sonnet-4.6",
+      shell_type: "unified_exec",
     })
     expect(synthetic?.available_in_plans).toContain("pro")
+    const template = bundledCodexModels.find(
+      (model) =>
+        model.visibility === "list" && model.supported_in_api !== false,
+    )
     const modelMessages = synthetic?.model_messages as
       | { instructions_template?: string }
       | undefined
-    expect(modelMessages?.instructions_template).toContain(
-      "You are Codex, an agent based on GPT-5.",
+    expect(modelMessages?.instructions_template).toBe(
+      template?.model_messages?.instructions_template,
     )
   })
 
@@ -818,6 +842,7 @@ describe("model routes", () => {
       models: Array<Record<string, unknown> & { slug: string }>
     }
     expect(body.models.map((model) => model.slug)).toEqual([
+      ...bundledCodexSlugs,
       "claude-sonnet-4-6",
     ])
   })
@@ -891,7 +916,7 @@ describe("model routes", () => {
   })
 
   test("adds ultra reasoning effort at the end when it is missing", async () => {
-    const copilotModels = createCopilotModels(["gpt-5.6-sol"])
+    const copilotModels = createCopilotModels(["gpt-reasoning-test"])
     copilotModels.data[0].supported_endpoints = ["/v1/messages"]
     copilotModels.data[0].capabilities.supports.tool_calls = true
     copilotModels.data[0].capabilities.supports.reasoning_effort = [
@@ -911,7 +936,7 @@ describe("model routes", () => {
       models: Array<Record<string, unknown> & { slug: string }>
     }
     expect(
-      body.models.find((model) => model.slug === "gpt-5.6-sol"),
+      body.models.find((model) => model.slug === "gpt-reasoning-test"),
     ).toMatchObject({
       default_reasoning_level: "low",
       supported_reasoning_levels: [
@@ -1051,7 +1076,7 @@ describe("model routes", () => {
 
     expect(response.status).toBe(200)
     const body = (await response.json()) as { data: Array<{ id: string }> }
-    expect(body.data.map((model) => model.id)).toContain("gpt-5.4")
+    expect(body.data.map((model) => model.id)).toContain("gpt-6-astra")
     expect(body.data.map((model) => model.id)).toContain("gpt-5.6-sol")
     expect(fetchMock).not.toHaveBeenCalled()
   })

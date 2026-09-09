@@ -1,7 +1,7 @@
 {
   "$schema": "https://json.schemastore.org/package.json",
   "name": "@jeffreycao/copilot-api",
-  "version": "2.3.7",
+  "version": "2.5.3",
   "description": "GitHub Copilot, OpenAI Codex, OpenCode Go, and third-party AI provider gateway with OpenAI and Anthropic API compatibility.",
   "keywords": [
     "github-copilot",
@@ -32,24 +32,31 @@
     "dev": "NODE_USE_SYSTEM_CA=1 bun run --watch ./src/main.ts",
     "knip": "knip-bun",
     "lint": "eslint --cache",
-    "lint:all": "eslint --cache .",
+    "lint:all": "bun run lint && bun run --cwd desktop lint",
+    "lint:desktop": "bun run --cwd desktop lint",
     "prepack": "bun run build",
     "prepare": "simple-git-hooks",
     "release": "bumpp && bun publish --access public",
     "start": "NODE_USE_SYSTEM_CA=1 NODE_ENV=production bun run ./src/main.ts",
-    "typecheck": "tsc"
+    "typecheck": "tsc",
+    "typecheck:all": "bun run typecheck && bun run --cwd desktop typecheck",
+    "typecheck:desktop": "bun run --cwd desktop typecheck"
   },
   "simple-git-hooks": {
     "pre-commit": "bunx lint-staged"
   },
   "lint-staged": {
-    "*": "bun run lint --fix"
+    "*": "bun run lint --fix",
+    "desktop/**/*": "eslint --config desktop/eslint.config.mjs --cache --fix"
   },
   "overrides": {
     "@hono/node-server": "^1.19.15",
     "rolldown": "1.0.0-rc.18"
   },
   "dependencies": {
+    "@azure/identity": "^4.13.2",
+    "@clack/prompts": "^1.7.0",
+    "@fastify/busboy": "^3.2.2",
     "@modelcontextprotocol/sdk": "^1.29.0",
     "citty": "^0.1.6",
     "clipboardy": "^5.0.0",

@@ -9,13 +9,28 @@ import {
 
 export const tokenUsageRoute = new Hono()
 
-const periods = new Set<TokenUsagePeriod>(["day", "week", "month"])
+const periods = new Set<TokenUsagePeriod>([
+  "today",
+  "this_week",
+  "last_7_days",
+  "this_month",
+  "last_30_days",
+  "lifetime",
+])
 const DEFAULT_EVENTS_PAGE_SIZE = 20
 
+const legacyPeriods: Record<string, TokenUsagePeriod> = {
+  day: "today",
+  week: "last_7_days",
+  month: "last_30_days",
+}
+
 function parsePeriod(value: string | undefined): TokenUsagePeriod {
-  return periods.has(value as TokenUsagePeriod) ?
-      (value as TokenUsagePeriod)
-    : "day"
+  if (periods.has(value as TokenUsagePeriod)) {
+    return value as TokenUsagePeriod
+  }
+
+  return (value ? legacyPeriods[value] : undefined) ?? "today"
 }
 
 function parsePositiveInt(value: string | undefined, fallback: number): number {

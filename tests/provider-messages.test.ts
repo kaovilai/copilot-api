@@ -2,8 +2,8 @@ import { afterEach, beforeEach, describe, expect, mock, test } from "bun:test"
 import { Hono } from "hono"
 
 import type { ResolvedProviderConfig } from "~/lib/config"
+import { UpstreamStreamInactivityTimeoutError } from "~/lib/error"
 import type { UsageTokens } from "~/lib/token-usage"
-import { ResponsesStreamInactivityTimeoutError } from "~/services/responses-http"
 
 const actualConfigModule = await import("~/lib/config")
 const actualTokenUsageModule = await import("~/lib/token-usage")
@@ -28,6 +28,10 @@ await mock.module("~/lib/token-usage", () => ({
 
 const { providerMessageRoutes } = await import(
   "~/routes/provider/messages/route"
+)
+
+const { providerMessagesHandlerDependencies } = await import(
+  "~/routes/provider/messages/handler"
 )
 
 const originalFetch = globalThis.fetch
@@ -158,7 +162,7 @@ const createFailingResponsesStream = (): Response =>
   new Response(
     new ReadableStream<Uint8Array>({
       start(controller) {
-        controller.error(new ResponsesStreamInactivityTimeoutError(25))
+        controller.error(new UpstreamStreamInactivityTimeoutError(25))
       },
     }),
     {
@@ -348,7 +352,8 @@ describe("provider Messages Anthropic forwarding", () => {
     expect(eventTypes).not.toContain("message_stop")
     expect(events.at(-1)).toEqual({
       error: {
-        message: "An unexpected error occurred during streaming.",
+        message:
+          "An unexpected error occurred during streaming, retry your request.",
         type: "api_error",
       },
       type: "error",
@@ -378,7 +383,8 @@ describe("provider Messages Anthropic forwarding", () => {
     expect(parseStreamData(await response.text())).toEqual([
       {
         error: {
-          message: "An unexpected error occurred during streaming.",
+          message:
+            "An unexpected error occurred during streaming, retry your request.",
           type: "api_error",
         },
         type: "error",
@@ -443,12 +449,79 @@ describe("provider Messages Responses forwarding", () => {
     expect(parseStreamData(await response.text())).toEqual([
       {
         error: {
-          message: "Responses upstream stream was inactive for 25ms",
+          message: "Upstream stream was inactive for 25ms",
           type: "api_error",
         },
         type: "error",
       },
     ])
     expect(recordedUsages).toEqual([{}])
+  })
+})
+
+describe("provider Messages per-model type override auth", () => {
+  const originalResolveProviderConfig =
+    providerMessagesHandlerDependencies.resolveProviderConfig
+
+  afterEach(() => {
+    providerMessagesHandlerDependencies.resolveProviderConfig =
+      originalResolveProviderConfig
+  })
+
+  const stubResolvedConfig = (config: ResolvedProviderConfig): void => {
+    providerMessagesHandlerDependencies.resolveProviderConfig = () =>
+      Promise.resolve(config)
+  }
+
+  const lastUpstreamHeaders = (): Record<string, string> => {
+    const lastCall = fetchMock.mock.calls.at(-1) as unknown as [
+      unknown,
+      { headers: Record<string, string> },
+    ]
+    return lastCall[1].headers
+  }
+
+  test("preserves azure-entra auth when a model overrides the provider type", async () => {
+    stubResolvedConfig({
+      apiKey: "entra-access-token",
+      authType: "azure-entra",
+      baseUrl: "https://foundry.example/openai",
+      models: { "claude-sonnet-4": { type: "anthropic" } },
+      name: "foundry",
+      type: "openai-compatible",
+    })
+
+    const response = await createApp().request("/foundry/v1/messages", {
+      body: JSON.stringify(createMessagesPayload()),
+      headers: { "content-type": "application/json" },
+      method: "POST",
+    })
+
+    expect(response.status).toBe(200)
+    const headers = lastUpstreamHeaders()
+    expect(headers.authorization).toBe("Bearer entra-access-token")
+    expect(headers["x-api-key"]).toBeUndefined()
+  })
+
+  test("falls back to the override type default for regular auth types", async () => {
+    stubResolvedConfig({
+      apiKey: "provider-key",
+      authType: "authorization",
+      baseUrl: "https://mixed.example",
+      models: { "claude-sonnet-4": { type: "anthropic" } },
+      name: "mixed",
+      type: "openai-compatible",
+    })
+
+    const response = await createApp().request("/mixed/v1/messages", {
+      body: JSON.stringify(createMessagesPayload()),
+      headers: { "content-type": "application/json" },
+      method: "POST",
+    })
+
+    expect(response.status).toBe(200)
+    const headers = lastUpstreamHeaders()
+    expect(headers["x-api-key"]).toBe("provider-key")
+    expect(headers.authorization).toBeUndefined()
   })
 })

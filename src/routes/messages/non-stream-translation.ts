@@ -36,10 +36,6 @@ import { parseUserIdMetadata } from "~/lib/utils"
 export const THINKING_TEXT = "Thinking..."
 export const RICH_TOOL_RESULT_MOVED_TEXT =
   "Rich tool result content was moved to a user message because this upstream does not support it in tool messages."
-const COPILOT_TOOL_CONTENT_SUPPORT_TYPE: Array<ToolContentSupportType> = [
-  "array",
-  "image",
-]
 
 interface TranslationCapabilities {
   supportPdf: boolean
@@ -86,8 +82,7 @@ export function translateToOpenAI(
   const promptCacheKey = metadataPromptCacheKey ?? sessionAffinity
   const capabilities = {
     supportPdf: options.supportPdf ?? false,
-    toolContentSupportType:
-      options.toolContentSupportType ?? COPILOT_TOOL_CONTENT_SUPPORT_TYPE,
+    toolContentSupportType: options.toolContentSupportType ?? [],
   }
   return {
     model: modelId,
@@ -636,8 +631,11 @@ function mapOpenAIChatCompletionUsage(
 function getOpenAIReasoningText(message: {
   reasoning_content?: string | null
   reasoning_text?: string | null
+  reasoning?: string | null
 }): string | null | undefined {
-  return message.reasoning_text ?? message.reasoning_content
+  return (
+    message.reasoning_text ?? message.reasoning_content ?? message.reasoning
+  )
 }
 
 function getAnthropicTextBlocks(

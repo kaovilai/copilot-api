@@ -15,7 +15,7 @@ export const QUICK_PROVIDER_CONFIGS = {
     editableType: false,
   },
   kimi: {
-    type: "anthropic",
+    type: "openai-compatible",
     baseUrl: "https://api.kimi.com/coding",
     pricingCurrency: "USD",
     editableType: true,
