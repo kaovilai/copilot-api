@@ -6,8 +6,9 @@ on:
 permissions:
   contents: read
   pull-requests: read
+  copilot-requests: write
 
-engine: claude
+engine: copilot
 
 tools:
   bash: ["git:*", "bun:*", "cat", "ls", "grep", "find"]
