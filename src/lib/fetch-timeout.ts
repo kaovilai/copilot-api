@@ -29,7 +29,12 @@ import { HTTPError } from "~/lib/error"
 // gate is the caller's own signal (e.g. the downstream client's disconnect)
 // -- checked between attempts and during the backoff wait, so retrying stops
 // immediately once nobody is left to answer, independent of the budget.
-const DEFAULT_AMBIGUOUS_TIMEOUT_BUDGET_MS = 90_000
+// Kept below downstream clients' own stream-inactivity watchdogs (n8n's own
+// AI Assistant, observed live, gives up and reports "stream stalled" at
+// exactly 90s) -- our last retry attempt's own per-attempt timeout can push
+// the actual failure a few seconds past this deadline, so budgeting at 90s
+// meant our 502 sometimes landed after the client had already given up.
+const DEFAULT_AMBIGUOUS_TIMEOUT_BUDGET_MS = 80_000
 const DEFAULT_RETRY_BUDGET_MS = 30 * 60_000
 const DEFAULT_FIRST_RETRY_DELAY_MS = 250
 const DEFAULT_STEADY_RETRY_DELAY_MS = 2_000
