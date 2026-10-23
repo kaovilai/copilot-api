@@ -108,7 +108,7 @@ const createContext = () =>
       header: () => undefined,
       raw: { signal: new AbortController().signal },
     },
-  }) as Parameters<typeof handleWithChatCompletions>[0]
+  }) as unknown as Parameters<typeof handleWithChatCompletions>[0]
 
 beforeEach(async () => {
   process.env[DB_PATH_ENV] = ":memory:"
