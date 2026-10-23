@@ -1,19 +1,19 @@
 #!/usr/bin/env node
 
 import { defineCommand } from "citty"
-import clipboard from "clipboardy"
 import consola from "consola"
 import { serve, type ServerHandler } from "srvx"
-import invariant from "tiny-invariant"
 
 import { runProviderSetup } from "./auth"
+import { isGitHubCopilotEnabled } from "./lib/github-copilot-provider"
 import { listEnabledProviders, mergeConfigWithDefaults } from "./lib/config"
+import { setupCopilotRuntime } from "~/lib/copilot-runtime"
 import {
   GITHUB_TOKEN_ENV,
   readGitHubToken,
   readGitHubTokenFromEnv,
 } from "./lib/credential-store"
-import { getLatestModelForFamily } from "./lib/models"
+import { startModelsDevCache } from "./lib/models-dev-cache"
 import { initOpencodeVersion } from "./lib/opencode"
 import { ensurePaths } from "./lib/paths"
 import { initProxyFromEnv } from "./lib/proxy"
@@ -26,23 +26,13 @@ import {
   formatServerUrl,
   resolveServerBinding,
 } from "./lib/server-host"
-import { generateEnvScript } from "./lib/shell"
 import { state } from "./lib/state"
-import { logUser, setupCopilotToken } from "./lib/token"
-import { cacheModels } from "./services/copilot/models-cache"
-import {
-  cacheMacMachineId,
-  cacheVSCodeVersion,
-  cacheVsCodeSessionId,
-  cacheVsCodeDeviceId,
-} from "./services/vscode-env"
 
 interface RunServerOptions {
   host: string
   port: number
   verbose: boolean
   githubToken?: string
-  claudeCode: boolean
   showToken: boolean
   proxyEnv: boolean
 }
@@ -69,10 +59,8 @@ async function resolveGitHubToken(
 async function setupCopilotMode(
   githubToken: string,
   source: GitHubTokenSource,
-  serverUrl: string,
-  claudeCode: boolean,
 ): Promise<void> {
-  state.githubToken = githubToken
+  state.githubTokenSource = source
   consola.info(
     source === "cli" ? "Using provided GitHub token"
     : source === "env" ?
@@ -80,84 +68,10 @@ async function setupCopilotMode(
     : "Using GitHub token from local file",
   )
 
-  await logUser()
-
-  await cacheVSCodeVersion()
-  cacheMacMachineId()
-  cacheVsCodeSessionId()
-  await cacheVsCodeDeviceId()
-
-  await setupCopilotToken()
-  await cacheModels()
-
-  consola.info(
-    `Available models: \n${state.models?.data.map((model) => `- ${model.id}`).join("\n")}`,
-  )
-
-  if (claudeCode) {
-    runClaudeCode(serverUrl)
-  }
+  await setupCopilotRuntime(githubToken)
 }
 
-function runClaudeCode(serverUrl: string): void {
-  consola.log(
-    "\n💡 Tip: The --claude-code flag simply generates a clipboard command for launching Claude Code. \n"
-      + "All models remain fully accessible without this flag, just configure the model ID directly in your settings.json file.",
-  )
-
-  invariant(state.models, "Models should be loaded by now")
-
-  // Default to the latest available model for each Claude Code size tier so
-  // opus maps to opus, sonnet maps to sonnet, and haiku maps to haiku.
-  const opusModel = getLatestModelForFamily("opus")?.id
-  const sonnetModel = getLatestModelForFamily("sonnet")?.id
-  const haikuModel = getLatestModelForFamily("haiku")?.id
-
-  consola.info(
-    "Selected default Claude Code models:\n"
-      + `- Opus:   ${opusModel ?? "(none available)"}\n`
-      + `- Sonnet: ${sonnetModel ?? "(none available)"}\n`
-      + `- Haiku:  ${haikuModel ?? "(none available)"}`,
-  )
-
-  const command = generateEnvScript(
-    {
-      ANTHROPIC_BASE_URL: serverUrl,
-      ANTHROPIC_AUTH_TOKEN: "dummy",
-      ANTHROPIC_MODEL: sonnetModel ?? opusModel,
-      ANTHROPIC_DEFAULT_OPUS_MODEL: opusModel,
-      ANTHROPIC_DEFAULT_SONNET_MODEL: sonnetModel,
-      ANTHROPIC_DEFAULT_HAIKU_MODEL: haikuModel,
-      CLAUDE_CODE_USE_VERTEX: "0",
-      CLAUDE_CODE_USE_BEDROCK: "0",
-      DISABLE_NON_ESSENTIAL_MODEL_CALLS: "1",
-      CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: "1",
-      CLAUDE_CODE_ATTRIBUTION_HEADER: "0",
-      CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION: "false",
-      CLAUDE_CODE_DISABLE_TERMINAL_TITLE: "true",
-      CLAUDE_CODE_ENABLE_AWAY_SUMMARY: "0",
-      CLAUDE_CODE_TOTAL_TOKENS_REMINDER: "off",
-      CLAUDE_CODE_EFFORT_LEVEL: "max",
-      MCP_CONNECT_TIMEOUT_MS: "20000",
-    },
-    "claude",
-  )
-
-  try {
-    clipboard.writeSync(command)
-    consola.success("Copied Claude Code command to clipboard!")
-  } catch {
-    consola.warn(
-      "Failed to copy to clipboard. Here is the Claude Code command:",
-    )
-    consola.log(command)
-  }
-}
-
-async function setupProviderMode(
-  serverUrl: string,
-  claudeCode: boolean,
-): Promise<void> {
+async function setupProviderMode(): Promise<void> {
   const enabledProviders = listEnabledProviders()
 
   if (enabledProviders.length > 0) {
@@ -165,12 +79,18 @@ async function setupProviderMode(
     return
   }
 
+  if (!isGitHubCopilotEnabled()) {
+    throw new Error(
+      "No enabled providers found. Enable GitHub Copilot with `copilot-api provider enable github-copilot`, or enable another configured provider.",
+    )
+  }
+
   consola.info("No enabled providers found. Setting one up...")
   await runProviderSetup()
 
-  if (state.githubToken) {
+  if (state.githubToken && isGitHubCopilotEnabled()) {
     // The setup flow persisted the token with the credential store.
-    await setupCopilotMode(state.githubToken, "file", serverUrl, claudeCode)
+    await setupCopilotMode(state.githubToken, "file")
     return
   }
 
@@ -217,23 +137,25 @@ export async function runServer(options: RunServerOptions): Promise<void> {
   state.showToken = options.showToken
 
   await ensurePaths()
+  await startModelsDevCache()
 
   const serverUrl = formatServerUrl(binding.clientHostname, options.port)
 
-  const resolvedGitHubToken = await resolveGitHubToken(options.githubToken)
-  if (resolvedGitHubToken) {
+  const resolvedGitHubToken =
+    isGitHubCopilotEnabled() ?
+      await resolveGitHubToken(options.githubToken)
+    : null
+  if (resolvedGitHubToken && isGitHubCopilotEnabled()) {
     await setupCopilotMode(
       resolvedGitHubToken.token,
       resolvedGitHubToken.source,
-      serverUrl,
-      options.claudeCode,
     )
   } else {
-    await setupProviderMode(serverUrl, options.claudeCode)
+    await setupProviderMode()
   }
 
   consola.box(
-    `🌐 Usage Viewer: ${serverUrl}/usage-viewer?endpoint=${serverUrl}/usage`,
+    `🌐 Dashboard Viewer: ${serverUrl}/usage-viewer?endpoint=${serverUrl}/usage`,
   )
 
   const { createServer } = await import("./server")
@@ -278,13 +200,6 @@ export const start = defineCommand({
       description:
         "Provide GitHub token directly (must be generated using the `auth` subcommand)",
     },
-    "claude-code": {
-      alias: "c",
-      type: "boolean",
-      default: false,
-      description:
-        "Generate a command to launch Claude Code with Copilot API config",
-    },
     "show-token": {
       type: "boolean",
       default: false,
@@ -302,7 +217,6 @@ export const start = defineCommand({
       port: Number.parseInt(args.port, 10),
       verbose: args.verbose,
       githubToken: args["github-token"],
-      claudeCode: args["claude-code"],
       showToken: args["show-token"],
       proxyEnv: args["proxy-env"],
     })

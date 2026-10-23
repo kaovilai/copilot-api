@@ -1,9 +1,17 @@
 import { builtinProviderModelRegistry } from "../builtin-provider-models"
+import { getModelsDevModelPricing } from "../models-dev-cache"
+import {
+  resolveProviderModelsDevId,
+  usesModelsDevModelCatalog,
+} from "../provider-model-catalog"
+import type { TokenUsagePeakWindow } from "./peak-windows"
 import {
   normalizeToken,
   type TokenUsageSource,
   type UsageTokens,
 } from "./store"
+
+export type { TokenUsagePeakWindow } from "./peak-windows"
 
 export interface TokenUsagePricingTier {
   cachedInput?: number
@@ -15,6 +23,10 @@ export interface TokenUsagePricingTier {
 }
 
 export interface TokenUsagePricingConfig extends TokenUsagePricingTier {
+  // Prices billed outside every UTC peak window, for providers that discount
+  // off-peak traffic. Ignored unless `peakWindows` is non-empty.
+  offPeak?: TokenUsagePricingTier
+  peakWindows?: Array<TokenUsagePeakWindow>
   tiers?: Array<TokenUsagePricingTier>
 }
 
@@ -24,7 +36,11 @@ export interface CalculatedTokenUsageCost {
   total_cost_nanos: number
 }
 
-interface TokenUsageCostInput extends UsageTokens {
+export interface TokenUsageCostInput extends UsageTokens {
+  serviceTier?: string | null
+  // Timestamp used to pick peak or off-peak prices; defaults to the current
+  // time when omitted.
+  at?: Date | null
   model: string
   pricing?: TokenUsagePricingConfig | null
   pricingCurrency?: string | null
@@ -35,6 +51,7 @@ interface TokenUsageCostInput extends UsageTokens {
 interface ResolvedPricing {
   pricing: TokenUsagePricingConfig
   source: string
+  currency?: string
 }
 
 const COST_NANOS_PER_UNIT = 1_000_000_000
@@ -84,8 +101,11 @@ export function resolveTokenUsageCost(
   const pricing = resolvePricingTier(
     resolvedPricing.pricing,
     getInputTokenTotal(input),
+    resolvePricingTime(input.at),
   )
-  const currency = resolveProviderCurrency(providerName, input.pricingCurrency)
+  const currency =
+    resolvedPricing.currency
+    ?? resolveProviderCurrency(providerName, input.pricingCurrency)
   if (!currency) {
     return null
   }
@@ -95,11 +115,14 @@ export function resolveTokenUsageCost(
   const cacheReadPrice = resolveCacheReadPrice(pricing, input)
   const cacheCreationPrice = resolveCacheCreationPrice(pricing)
 
-  const totalCostNanos =
+  const baseCostNanos =
     costNanosForTokens(input.input_tokens, inputPrice)
     + costNanosForTokens(input.output_tokens, outputPrice)
     + costNanosForTokens(input.cache_read_input_tokens, cacheReadPrice)
     + costNanosForTokens(input.cache_creation_input_tokens, cacheCreationPrice)
+  const totalCostNanos = Math.round(
+    baseCostNanos * resolveCodexServiceTierMultiplier(input, providerName),
+  )
 
   if (totalCostNanos <= 0) {
     return null
@@ -109,6 +132,27 @@ export function resolveTokenUsageCost(
     currency,
     source: resolvedPricing.source,
     total_cost_nanos: totalCostNanos,
+  }
+}
+
+function resolveCodexServiceTierMultiplier(
+  input: TokenUsageCostInput,
+  providerName: string,
+): number {
+  if (providerName.toLowerCase() !== "codex") {
+    return 1
+  }
+
+  // Price-estimate multipliers, applied after selecting the context rates.
+  // https://developers.openai.com/api/docs/pricing
+  switch (input.serviceTier?.trim().toLowerCase()) {
+    case "priority":
+    case "fast":
+      return 2
+    case "ultrafast":
+      return 6
+    default:
+      return 1
   }
 }
 
@@ -170,9 +214,24 @@ function resolveProviderPricing(
     }
   }
 
+  if (usesModelsDevModelCatalog(providerName)) {
+    const pricing = getModelsDevModelPricing(
+      resolveProviderModelsDevId(providerName),
+      model,
+    )
+    if (pricing) return { pricing, source: "models.dev", currency: "USD" }
+  }
+
+  const pricingModel =
+    (
+      providerName.toLowerCase() === "codex"
+      && model.trim().toLowerCase() === "gpt-5.6"
+    ) ?
+      "gpt-5.6-sol"
+    : model
   const builtinPricing = builtinProviderModelRegistry.getModelConfig(
     providerName,
-    model,
+    pricingModel,
   )?.pricing
   if (!builtinPricing) {
     return null
@@ -187,6 +246,7 @@ function resolveProviderPricing(
 function resolvePricingTier(
   pricing: TokenUsagePricingConfig,
   inputTokenTotal: number,
+  at: Date,
 ): TokenUsagePricingTier {
   const tiers = pricing.tiers
     ?.filter((tier) => typeof tier === "object" && tier !== null)
@@ -196,10 +256,61 @@ function resolvePricingTier(
     tiers?.find((tier) => inputTokenTotal <= normalizeTierMax(tier))
     ?? tiers?.at(-1)
 
-  return {
+  const resolvedTier = {
     ...pricing,
     ...selectedTier,
   }
+
+  const offPeak = pricing.offPeak
+  const peakWindows = pricing.peakWindows
+  if (offPeak && peakWindows?.length && !isPeakPricingTime(peakWindows, at)) {
+    return { ...resolvedTier, ...offPeak }
+  }
+
+  return resolvedTier
+}
+
+function resolvePricingTime(at: Date | null | undefined): Date {
+  return at instanceof Date && Number.isFinite(at.getTime()) ? at : new Date()
+}
+
+// Peak windows are matched against UTC minutes and ISO weekdays so a catalog
+// entry bills the same no matter which timezone the host runs in.
+export function isPeakPricingTime(
+  windows: Array<TokenUsagePeakWindow>,
+  at: Date,
+): boolean {
+  const minuteOfDay = at.getUTCHours() * 60 + at.getUTCMinutes()
+  const isoWeekday = at.getUTCDay() || 7
+
+  return windows.some((window) => {
+    const startMinute = normalizeMinuteOfDay(window.startMinuteUtc)
+    const endMinute = normalizeMinuteOfDay(window.endMinuteUtc)
+    if (
+      startMinute === null
+      || endMinute === null
+      || endMinute <= startMinute
+    ) {
+      return false
+    }
+
+    if (window.weekdays?.length && !window.weekdays.includes(isoWeekday)) {
+      return false
+    }
+
+    return minuteOfDay >= startMinute && minuteOfDay < endMinute
+  })
+}
+
+function normalizeMinuteOfDay(value: number | undefined): number | null {
+  return (
+      typeof value === "number"
+        && Number.isFinite(value)
+        && value >= 0
+        && value <= 1_440
+    ) ?
+      value
+    : null
 }
 
 function normalizeTierMax(tier: TokenUsagePricingTier): number {
@@ -227,7 +338,7 @@ function normalizePrice(value: number | null | undefined): number | null {
     : null
 }
 
-function resolveProviderCurrency(
+export function resolveProviderCurrency(
   providerName: string,
   configuredCurrency: string | null | undefined,
 ): string | null {

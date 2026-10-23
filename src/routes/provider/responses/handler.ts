@@ -6,7 +6,7 @@ import { logCodexRateLimitsEvent } from "~/lib/codex-rate-limit"
 import {
   type ModelConfig,
   type ProviderType,
-  resolveEffectiveProviderType,
+  resolveProviderConfigForModel,
 } from "~/lib/config"
 import { HTTPError } from "~/lib/error"
 import { createHandlerLogger, debugJson } from "~/lib/logger"
@@ -26,7 +26,11 @@ import {
   filterReasoningForTransport,
 } from "~/routes/responses/utils"
 import { handleResponsesViaMessages } from "~/routes/responses/messages-handler"
-import { normalizeProviderResponsesReasoningEffort } from "~/routes/provider/utils"
+import { getCodexTaskTitleModel } from "~/routes/responses/task-title"
+import {
+  forwardProviderResponseHeaders,
+  normalizeProviderResponsesReasoningEffort,
+} from "~/routes/provider/utils"
 
 import type {
   ResponsesPayload,
@@ -59,14 +63,24 @@ export async function handleProviderResponsesForProvider(
   },
 ): Promise<Response> {
   const { payload, provider } = options
+  const taskTitleModel = getCodexTaskTitleModel(
+    c.req.header("user-agent"),
+    payload.input,
+    provider,
+  )
+  if (taskTitleModel) payload.model = taskTitleModel
+  const publicModel = taskTitleModel ?? options.publicModel ?? payload.model
 
   debugJson(logger, "Responses request payload:", {
     payload,
     provider,
   })
 
-  const providerConfig =
+  const configuredProvider =
     await providerResponsesHandlerDependencies.resolveProviderConfig(provider)
+  const providerConfig =
+    configuredProvider
+    && resolveProviderConfigForModel(configuredProvider, payload.model)
   if (!providerConfig) {
     return c.json(
       {
@@ -79,10 +93,7 @@ export async function handleProviderResponsesForProvider(
     )
   }
 
-  const effectiveType = resolveEffectiveProviderType(
-    providerConfig,
-    payload.model,
-  )
+  const effectiveType = providerConfig.type
   const normalizedReasoningEffort = normalizeProviderResponsesReasoningEffort(
     payload,
     providerConfig,
@@ -97,7 +108,7 @@ export async function handleProviderResponsesForProvider(
     filterReasoningForTransport(payload, true)
     return await handleResponsesViaMessages(c, {
       payload,
-      publicModel: options.publicModel ?? payload.model,
+      publicModel,
       targetModel: `${provider}/${payload.model}`,
     })
   }
@@ -146,7 +157,11 @@ export async function handleProviderResponsesForProvider(
       payload,
       c.req.raw.headers,
       providerConfig.baseUrl,
-      { clientSignal: c.req.raw.signal },
+      {
+        clientSignal: c.req.raw.signal,
+        onResponseHeaders: (headers) =>
+          forwardProviderResponseHeaders(c, headers),
+      },
     )
     const recordUsage = createProviderResponsesUsageRecorder(
       payload,
@@ -210,7 +225,11 @@ const shouldFallbackToMessages = (
   modelId: string,
   effectiveType: ProviderType,
 ): boolean => {
-  if (effectiveType === "anthropic" || effectiveType === "openai-compatible") {
+  if (
+    effectiveType === "anthropic"
+    || effectiveType === "openai-compatible"
+    || effectiveType === "google"
+  ) {
     return true
   }
 
@@ -236,6 +255,7 @@ const createProviderResponsesUsageRecorder = (
     pricing: modelConfig?.pricing,
     pricingCurrency,
     providerName: provider,
+    serviceTier: payload.service_tier,
     sessionId: sessionAffinity ?? "",
   })
 }

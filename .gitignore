@@ -3,6 +3,11 @@ node_modules/
 
 # local env
 *.local
+.env
+.env.*
+/data/
+/copilot-data/
+/coverage/
 
 # aider
 .aider*
@@ -19,3 +24,6 @@ dist/
 *.vsix
 
 .claude
+
+# mac
+.DS_Store

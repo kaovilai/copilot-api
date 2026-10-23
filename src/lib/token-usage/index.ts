@@ -19,6 +19,7 @@ export {
   closeUsageStore,
   getTokenUsageDailySummary,
   getTokenUsageEventsPage,
+  getTokenUsageSessionsPage,
   getTokenUsageSummary,
   normalizeOptionalToken,
   normalizeToken,
@@ -34,6 +35,8 @@ export type {
   TokenUsageEventsPage,
   TokenUsageModelSummary,
   TokenUsagePeriod,
+  TokenUsageSessionsPage,
+  TokenUsageSessionSummary,
   TokenUsageSource,
   TokenUsageSummary,
   TokenUsageTotals,
@@ -41,6 +44,7 @@ export type {
 } from "./store"
 
 export interface TokenUsageEventInput extends UsageTokens {
+  serviceTier?: string | null
   endpoint: TokenUsageEndpoint
   fallbackSessionId?: string | null
   model: string
@@ -53,6 +57,7 @@ export interface TokenUsageEventInput extends UsageTokens {
 }
 
 interface TokenUsageRecorderOptions {
+  serviceTier?: string | null
   endpoint: TokenUsageEndpoint
   fallbackSessionId?: string | null
   model: string
@@ -113,7 +118,7 @@ function toPersistedEvent(
   }
 
   const now = new Date()
-  const cost = resolveTokenUsageCost(input)
+  const cost = resolveTokenUsageCost({ ...input, at: now })
   return {
     cache_creation_input_tokens: normalizeToken(
       input.cache_creation_input_tokens,
@@ -245,6 +250,7 @@ export function normalizeOpenAIUsage(
 export function normalizeResponsesUsage(
   usage:
     | {
+        cost?: number
         input_tokens?: number
         input_tokens_details?: {
           cached_tokens?: number
@@ -268,6 +274,7 @@ export function normalizeResponsesUsage(
       cache_creation_input_tokens: cacheWriteTokens,
     }),
     cache_read_input_tokens: cachedTokens,
+    cost: normalizeOptionalCost(usage?.cost),
     input_tokens: Math.max(0, inputTokens - cachedTokens - cacheWriteTokens),
     output_tokens: normalizeToken(usage?.output_tokens),
     total_tokens: normalizeOptionalToken(usage?.total_tokens),

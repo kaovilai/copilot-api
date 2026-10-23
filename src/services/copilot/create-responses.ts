@@ -35,7 +35,7 @@ import {
 import {
   createResponsesSafeStream,
   encodePoolKeyPart,
-  isTerminalResponsesStreamChunk,
+  getResponsesStreamTerminalDisposition,
 } from "~/services/responses-websocket-helpers"
 import { createResponsesHttpEventStream } from "~/services/responses-http"
 import { fetchUpstreamWithLifecycle } from "~/services/upstream-http"
@@ -231,7 +231,7 @@ const getResponsesWebSocketOptions = () => {
     createChunk: createResponsesWebSocketStreamChunk,
     maxBufferedBytes: transportConfig.websocketMaxBufferedBytes,
     maxBufferedMessages: transportConfig.websocketMaxBufferedMessages,
-    isTerminalChunk: isTerminalResponsesStreamChunk,
+    getTerminalDisposition: getResponsesStreamTerminalDisposition,
     openErrorMessage: "Failed to create responses websocket",
     openTimeoutMs: transportConfig.websocketOpenTimeoutMs,
     poolIdleTimeoutMs: transportConfig.websocketPoolIdleTimeoutMs,

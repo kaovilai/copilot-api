@@ -5,7 +5,12 @@ import { createHash, randomUUID } from "node:crypto"
 
 import type { AnthropicMessagesPayload } from "~/lib/types/anthropic"
 
-import { getRootSessionId, getUUID } from "~/lib/utils"
+import {
+  getRootSessionId,
+  getRootSessionIdFromHeaders,
+  getSessionAffinityFromHeaders,
+  getUUID,
+} from "~/lib/utils"
 
 const jsonStyleUserId = JSON.stringify({
   device_id: "3f4a1b7c8d9e0f1234567890abcdef1234567890abcdef1234567890abcdef12",
@@ -57,6 +62,82 @@ test("prints randomUUID and deterministic UUID for comparison", () => {
   expect(random).not.toBe(derived)
 })
 
+const headerDerivationCases: Array<{
+  headers: Record<string, string>
+  expected?: string
+}> = [
+  {
+    headers: {
+      "session-id": " session-1 ",
+      "x-root-session-id": "root-1",
+      "x-session-id": "leaf-1",
+    },
+    expected: "session-1",
+  },
+  {
+    headers: { "session-id": " ", "x-root-session-id": " root-1 " },
+    expected: "root-1",
+  },
+  { headers: { "x-session-id": "leaf-1" }, expected: "leaf-1" },
+  { headers: {}, expected: undefined },
+]
+
+test.each(headerDerivationCases)(
+  "getRootSessionIdFromHeaders resolves $expected",
+  ({ headers, expected }) => {
+    const context = {
+      req: {
+        header: (name: string) => new Headers(headers).get(name) ?? undefined,
+      },
+    } as unknown as Context
+
+    expect(getRootSessionIdFromHeaders(context)).toBe(expected)
+  },
+)
+
+test.each([
+  {
+    headers: {
+      "x-opencode-session-id": " opencode-1 ",
+      "x-session-affinity": "affinity-1",
+      "x-client-request-id": "client-1",
+      "thread-id": "thread-1",
+    },
+    expected: "opencode-1",
+  },
+  {
+    headers: {
+      "x-opencode-session-id": " ",
+      "x-session-affinity": "affinity-1",
+      "x-client-request-id": "client-1",
+      "thread-id": "thread-1",
+    },
+    expected: "affinity-1",
+  },
+  {
+    headers: {
+      "x-session-affinity": " ",
+      "x-client-request-id": "client-1",
+      "thread-id": "thread-1",
+    },
+    expected: "client-1",
+  },
+  { headers: { "thread-id": " thread-1 " }, expected: "thread-1" },
+  { headers: { "thread-id": " " }, expected: undefined },
+  { headers: {}, expected: undefined },
+] as Array<{ headers: Record<string, string>; expected?: string }>)(
+  "getSessionAffinityFromHeaders resolves $expected",
+  ({ headers, expected }) => {
+    const context = {
+      req: {
+        header: (name: string) => new Headers(headers).get(name) ?? undefined,
+      },
+    } as unknown as Context
+
+    expect(getSessionAffinityFromHeaders(context)).toBe(expected)
+  },
+)
+
 test("getRootSessionId supports JSON-like user_id metadata", () => {
   const anthropicPayload = {
     model: "claude-3-5-sonnet",
@@ -94,5 +175,67 @@ test("getRootSessionId keeps legacy parsing before JSON fallback", () => {
 
   expect(getRootSessionId(anthropicPayload, context)).toBe(
     getUUID("7d0e2f61-4b5c-4a9d-8f11-2c3d4e5f6a7b"),
+  )
+})
+
+test.each([
+  {
+    rootSessionId: "root-session",
+    legacySessionId: "child-session",
+    expected: "root-session",
+  },
+  {
+    rootSessionId: "root-session",
+    legacySessionId: undefined,
+    expected: "root-session",
+  },
+  {
+    rootSessionId: undefined,
+    legacySessionId: "legacy-session",
+    expected: "legacy-session",
+  },
+  {
+    rootSessionId: undefined,
+    legacySessionId: undefined,
+    expected: undefined,
+  },
+])(
+  "getRootSessionId prefers the root header and falls back to the legacy header (%#)",
+  ({ rootSessionId, legacySessionId, expected }) => {
+    const payload: AnthropicMessagesPayload = {
+      model: "test-model",
+      messages: [],
+      max_tokens: 0,
+    }
+    const headers = new Headers()
+    if (rootSessionId) headers.set("x-root-session-id", rootSessionId)
+    if (legacySessionId) headers.set("x-session-id", legacySessionId)
+    const context = {
+      req: { header: (name: string) => headers.get(name) ?? undefined },
+    } as unknown as Context
+
+    expect(getRootSessionId(payload, context)).toBe(
+      expected ? getUUID(expected) : undefined,
+    )
+  },
+)
+
+test("getRootSessionId keeps user_id metadata ahead of session headers", () => {
+  const payload: AnthropicMessagesPayload = {
+    model: "test-model",
+    messages: [],
+    max_tokens: 0,
+    metadata: { user_id: jsonStyleUserId },
+  }
+  const headers = new Headers({
+    "X-Root-Session-Id": "root-session",
+    "x-session-id": "child-session",
+  })
+  const context = {
+    req: { header: (name: string) => headers.get(name) ?? undefined },
+  } as unknown as Context
+
+  expect(getRootSessionId(payload, context)).toBe(
+    getUUID("2c4e1cf0-7a67-4d2e-9a4b-1d16d3f44752"),
   )
 })

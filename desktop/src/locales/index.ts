@@ -1,12 +1,146 @@
+import type { ConfigFieldId, ConfigSection } from '../lib/config-fields'
 import en from './en'
 import zh from './zh'
 
 export interface Locale {
+  studio: {
+    title: string
+    description: string
+    generate: string
+    edit: string
+    video: string
+    provider: string
+    gateway: string
+    model: string
+    prompt: string
+    imagePrompt: string
+    editPrompt: string
+    videoPrompt: string
+    size: string
+    quality: string
+    count: string
+    auto: string
+    low: string
+    medium: string
+    high: string
+    upload: string
+    uploadHint: string
+    uploadError: string
+    remove: string
+    firstFrame: string
+    firstFrameHint: string
+    duration: string
+    ratio: string
+    resolution: string
+    audio: string
+    create: string
+    creating: string
+    cancel: string
+    cancelled: string
+    results: string
+    empty: string
+    save: string
+    saving: string
+    saved: string
+    viewOriginal: string
+    closePreview: string
+    useAsInput: string
+    failed: string
+    videoFailed: string
+    pending: string
+    paused: string
+    pause: string
+    discard: string
+    resume: string
+    requestId: string
+    stopped: string
+    gatewayHint: string
+    videoHint: string
+  }
+  updates: {
+    title: string
+    description: string
+    currentVersion: string
+    idle: string
+    checking: string
+    'not-available': string
+    available: string
+    downloading: string
+    downloaded: string
+    installing: string
+    error: string
+    disabled: string
+    check: string
+    restartInstall: string
+    openRelease: string
+    manualInstall: string
+    restartNote: string
+    progress: string
+    actionFailed: string
+  }
+  providers: {
+    title: string
+    close: string
+    description: string
+    configured: string
+    unsaved: string
+    autoDescription: string
+    selectedDescription: string
+    noneDescription: string
+    hiddenTitle: string
+    hiddenDescription: string
+    availableCount: string
+    loading: string
+    empty: string
+    enabled: string
+    disabled: string
+    selection: string
+    auto: string
+    selected: string
+    none: string
+    modelIds: string
+    searchModels: string
+    selectedCount: string
+    selectVisible: string
+    clearSelection: string
+    loadingModels: string
+    noModels: string
+    manualModels: string
+    modelSourceHint: string
+    modelsError: string
+    saved: string
+    savedRefreshed: string
+    save: string
+    saving: string
+  }
   auth: {
     subtitle: string
     githubAuth: string
     codexAuth: string
+    xaiAuth: string
+    xaiAccounts: string
+    xaiNoAccounts: string
+    waitingXaiAuth: string
+    xaiLoginInProgress: string
+    xaiAuthExpired: string
+    xaiAuthDenied: string
+    codexAccounts: string
+    codexAccountAlias: string
+    codexAccountAliasPlaceholder: string
+    codexAccountLimit: string
+    codexAccountRemoved: string
+    codexActiveAccount: string
+    codexAddAccount: string
+    codexNoAccounts: string
+    codexRemoveAccount: string
+    codexAccountRemovedRefreshed: string
+    codexAccountRefreshed: string
+    codexUseAccount: string
     customProvider: string
+    modelsDevProvider: string
+    modelsDevManual: string
+    modelsDevLoading: string
+    modelsDevUnavailable: string
     loading: string
     manualToken: string
     providerApiKey: string
@@ -23,18 +157,24 @@ export interface Locale {
     providerType: string
     deviceCode: string
     deviceCodeUrl: string
-    codexCallbackRequired: string
+    codexAuthTimeout: string
+    codexCallbackUnavailable: string
+    codexLoginInProgress: string
+    codexFinishingAuth: string
     copy: string
     copied: string
     openAuthPage: string
     waitingAuth: string
     back: string
     backToHome: string
+    backToProviders: string
     verifying: string
     confirmAdd: string
     authFailed: string
     tokenInvalid: string
     waitingCodexAuth: string
+    cancelCodexAuth: string
+    cancelling: string
     loginConsent: string
   }
   dashboard: {
@@ -53,12 +193,18 @@ export interface Locale {
     overviewPort: string
     overviewModels: string
     overviewLastRefresh: string
-    premiumUsed: string
-    quotaReset: string
     serviceAddress: string
     authHeader: string
     copy: string
     quotaUsage: string
+    quotaResetsOn: string
+    quotaUnavailable: string
+    quotaUsedPercent: string
+    quotaRemainingPercent: string
+    providerOverview: string
+    providerOverviewSummary: string
+    providerOverviewManage: string
+    providerOverviewModels: string
     refreshing: string
     refresh: string
     tokenUsage: string
@@ -66,6 +212,7 @@ export interface Locale {
     tokenUsageCache: string
     tokenUsageCacheRead: string
     tokenUsageCacheWrite: string
+    tokenUsageCacheHitRate: string
     tokenUsageCost: string
     tokenUsageEndpoint: string
     tokenUsageEvents: string
@@ -83,6 +230,9 @@ export interface Locale {
     tokenUsageProvider: string
     tokenUsageRequests: string
     tokenUsageSession: string
+    tokenUsageSessionBreakdown: string
+    tokenUsageSessionsCount: string
+    tokenUsageSessionsLoadFailed: string
     tokenUsageSource: string
     tokenUsageTime: string
     tokenUsageTotal: string
@@ -121,6 +271,7 @@ export interface Locale {
   menu: {
     file: string
     fileSettings: string
+    fileAuthConfig: string
     fileQuit: string
     view: string
     viewReload: string
@@ -133,6 +284,9 @@ export interface Locale {
     helpDocs: string
   }
   server: {
+    bunFallback: string
+    runtime: string
+    spawnFailed: string
     tokenNotFound: string
     authRequired: string
     portInUse: string
@@ -140,6 +294,7 @@ export interface Locale {
     startTimeout: string
     processExit: string
     invalidHost: string
+    restartFailed: string
   }
   settings: {
     title: string
@@ -152,8 +307,12 @@ export interface Locale {
     autoStartServerDesc: string
     minimizeToTray: string
     minimizeToTrayDesc: string
+    showCreate: string
+    showCreateDesc: string
     sectionSecurity: string
     serverKeysNote: string
+    serverKeysSaveFailed: string
+    desktopSettingsSaveFailed: string
     apiKeysLabel: string
     apiKeysDesc: string
     adminKeyLabel: string
@@ -173,11 +332,22 @@ export interface Locale {
     noProxy: string
     noProxyDesc: string
     sectionStartup: string
+    serverRuntime: string
+    serverRuntimeDesc: string
+    runtimeBun: string
+    runtimeNode: string
+    bunDetecting: string
+    bunAvailable: string
+    bunUnsupported: string
+    bunUnavailable: string
+    bunProxyNote: string
     oauthApp: string
     oauthAppDefault: string
     oauthAppDesc: string
     apiHome: string
     apiHomeDesc: string
+    sqliteDbPath: string
+    sqliteDbPathDesc: string
     enterpriseUrl: string
     enterpriseUrlDesc: string
     verbose: string
@@ -195,6 +365,60 @@ export interface Locale {
     cancel: string
     save: string
     saving: string
+  }
+  configEditor: {
+    title: string
+    editMode: string
+    form: string
+    json: string
+    groupsLabel: string
+    resetGroup: string
+    useDefault: string
+    inherited: string
+    explicit: string
+    defaultValue: string
+    explicitValue: string
+    reload: string
+    reloadDiscard: string
+    mergeLatest: string
+    mergeConflicts: string
+    keepMine: string
+    keepDisk: string
+    merged: string
+    legacyWarning: string
+    errors: {
+      conflict: string
+      validation: string
+      readFailed: string
+      saveFailed: string
+      applyFailed: string
+    }
+    discard: string
+    review: string
+    close: string
+    saveApply: string
+    save: string
+    synced: string
+    unsaved: string
+    unsavedOther: string
+    offline: string
+    invalid: string
+    savedApplied: string
+    savedOffline: string
+    savedNotApplied: string
+    retryApply: string
+    showSecrets: string
+    format: string
+    jsonContent: string
+    sharedDraft: string
+    maskedReadOnly: string
+    maskedUnavailable: string
+    mappingDefaults: string
+    autoModelDefault: string
+    autoModelOff: string
+    autoModelCustom: string
+    groups: Record<ConfigSection, string>
+    fields: Record<ConfigFieldId, { label: string; description: string }>
   }
   advancedConfig: {
     title: string
@@ -264,7 +488,8 @@ function interpolate(template: string, vars?: LocaleVars): string {
 
   let result = template
   for (const [key, value] of Object.entries(vars)) {
-    result = result.replace(`{{${key}}}`, String(value))
+    // A function replacer keeps $&, $$, $` and $' literal in the value.
+    result = result.replace(`{{${key}}}`, () => String(value))
   }
   return result
 }

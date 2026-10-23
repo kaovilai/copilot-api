@@ -1,11 +1,159 @@
 import type { Locale } from './index'
 
 const en: Locale = {
+  studio: {
+    title: 'Create',
+    description: 'Turn a prompt or an image into something new.',
+    generate: 'Generate image',
+    edit: 'Edit image',
+    video: 'Generate video',
+    provider: 'Provider',
+    gateway: 'Gateway default',
+    model: 'Model',
+    prompt: 'Prompt',
+    imagePrompt: 'Describe the image, style, lighting and composition…',
+    editPrompt: 'Describe what you want to change in the uploaded images…',
+    videoPrompt: 'Describe the scene, movement and camera…',
+    size: 'Image size',
+    quality: 'Quality',
+    count: 'Images',
+    auto: 'Auto',
+    low: 'Low',
+    medium: 'Medium',
+    high: 'High',
+    upload: 'Add images',
+    uploadHint:
+      'PNG, JPEG or WebP · up to 5 images · 20 MiB each, 40 MiB total',
+    uploadError:
+      'Choose PNG, JPEG or WebP images. Maximum 20 MiB per image, 40 MiB total; 5 images for editing or 1 first frame.',
+    remove: 'Remove',
+    firstFrame: 'First frame (optional)',
+    firstFrameHint: 'Add one image to animate. The prompt is optional.',
+    duration: 'Duration (seconds)',
+    ratio: 'Aspect ratio',
+    resolution: 'Resolution',
+    audio: 'Generate audio',
+    create: 'Create',
+    creating: 'Creating…',
+    cancel: 'Stop waiting',
+    cancelled: 'Stopped waiting for this request.',
+    results: 'Results',
+    empty: 'Your images and videos will appear here.',
+    save: 'Save',
+    saving: 'Saving…',
+    saved: 'Saved',
+    viewOriginal: 'View original',
+    closePreview: 'Close preview',
+    useAsInput: 'Edit this image',
+    failed: 'Request failed. Try again.',
+    videoFailed: 'Video generation failed or expired.',
+    pending: 'Generating video. Checking every 5 seconds…',
+    paused: 'Progress checks paused. You can resume without submitting again.',
+    pause: 'Pause checks',
+    discard: 'Stop tracking',
+    resume: 'Resume checks',
+    requestId: 'Task ID',
+    stopped: 'Start the server to create media or check progress.',
+    gatewayHint:
+      'Uses image route settings and model mappings. An explicit provider must be enabled.',
+    videoHint:
+      'Requires an enabled xAI provider. Use a prompt, a first-frame image, or both. Video links are temporary; save completed videos promptly.',
+  },
+  updates: {
+    title: 'Updates',
+    description:
+      'Check for updates on launch and every 6 hours. Windows and Linux AppImage updates download automatically. Unsigned macOS builds use manual DMG installation.',
+    currentVersion: 'Current version: {{version}}',
+    idle: 'Ready to check for updates',
+    checking: 'Checking for updates…',
+    'not-available': 'No newer release is available for this platform',
+    available: 'Version {{version}} is available',
+    downloading: 'Downloading {{version}} — {{percent}}%',
+    downloaded: 'Version {{version}} is ready to install',
+    installing: 'Stopping the server and installing…',
+    error: 'Update failed. Check your connection and try again.',
+    disabled: 'Updates are available in packaged builds only',
+    check: 'Check for updates',
+    restartInstall: 'Restart and install',
+    openRelease: 'Download installer',
+    manualInstall: 'Download and install the package from GitHub Releases.',
+    restartNote:
+      'Restarting stops the local API server and interrupts active requests.',
+    progress: 'Update download progress',
+    actionFailed: 'Could not complete the update action. Please try again.',
+  },
+  providers: {
+    title: 'Providers',
+    close: 'Close',
+    description:
+      'Enable providers for all clients and choose which models appear in coding agents.',
+    configured: 'Your providers',
+    unsaved: 'Unsaved changes',
+    autoDescription: 'Use discovered models',
+    selectedDescription: 'Choose your models',
+    noneDescription: 'Hide from coding agents',
+    hiddenTitle: 'No models shown in Coding Agent',
+    hiddenDescription:
+      'This visibility setting applies to Codex and Claude Code.',
+    availableCount: '{count} discovered',
+    loading: 'Loading providers…',
+    empty: 'No providers configured. Add one from the authorization page.',
+    enabled: 'Enabled',
+    disabled: 'Disabled',
+    selection: 'Models shown in Coding Agent',
+    auto: 'Automatic',
+    selected: 'Selected models',
+    none: 'Hide all models',
+    modelIds:
+      'One upstream model ID per line, without the gateway provider prefix.',
+    searchModels: 'Search models',
+    selectedCount: '{count} selected',
+    selectVisible: 'Select search results',
+    clearSelection: 'Clear selection',
+    loadingModels: 'Loading models…',
+    noModels: 'No matching models.',
+    manualModels: 'Edit model IDs manually',
+    modelSourceHint:
+      'The list combines the local catalog and the running server. You can add other model IDs manually.',
+    modelsError:
+      'Could not load the model list. You can still enter model IDs manually.',
+    saved: 'Configuration saved.',
+    savedRefreshed: 'Saved. The running server refreshed its configuration.',
+    save: 'Save',
+    saving: 'Saving…',
+  },
   auth: {
     subtitle: 'Choose a provider to authorize or configure',
     githubAuth: 'Sign in with GitHub',
     codexAuth: 'Sign in with OpenAI Codex',
+    xaiAuth: 'Sign in with xAI (SuperGrok)',
+    xaiAccounts: 'xAI accounts',
+    xaiNoAccounts: 'No xAI accounts added yet',
+    waitingXaiAuth:
+      'Open the authorization page and enter the code to sign in with your SuperGrok subscription.',
+    xaiLoginInProgress: 'xAI sign-in is already in progress.',
+    xaiAuthExpired: 'xAI authorization expired. Please sign in again.',
+    xaiAuthDenied: 'xAI authorization was denied. Please sign in again.',
+    codexAccounts: 'Codex accounts',
+    codexAccountAlias: 'Account alias (optional)',
+    codexAccountAliasPlaceholder: 'For example: Work',
+    codexAccountLimit: 'Store up to 3 accounts',
+    codexAccountRemoved: 'Account removed.',
+    codexActiveAccount: 'Active',
+    codexAddAccount: 'Add or sign in again',
+    codexNoAccounts: 'No Codex accounts added yet',
+    codexRemoveAccount: 'Remove',
+    codexAccountRemovedRefreshed:
+      'Account removed. The running server refreshed its configuration.',
+    codexAccountRefreshed:
+      'Account selected. Configuration refreshed; new requests use this account.',
+    codexUseAccount: 'Use',
     customProvider: 'Custom provider',
+    modelsDevProvider: 'models.dev provider',
+    modelsDevManual: 'Enter manually',
+    modelsDevLoading: 'Loading models.dev providers…',
+    modelsDevUnavailable:
+      'Could not load models.dev. You can enter a provider manually.',
     loading: 'Please wait…',
     manualToken: 'Enter Copilot token manually',
     providerApiKey: 'API key',
@@ -22,19 +170,28 @@ const en: Locale = {
     providerType: 'Provider type',
     deviceCode: 'Authorization code',
     deviceCodeUrl: 'Authorization URL',
-    codexCallbackRequired:
-      'Authorization did not finish. Retry or go back to start over',
+    codexAuthTimeout:
+      'Codex authorization timed out after 2 minutes. Choose “Add or sign in again” to retry.',
+    codexCallbackUnavailable:
+      'Could not start the local authorization listener on port 1455. Close other Codex sign-ins and choose “Add or sign in again” to retry.',
+    codexLoginInProgress: 'Codex sign-in is already in progress.',
+    codexFinishingAuth:
+      'Finishing sign-in… Authorization can no longer be cancelled.',
     copy: 'Copy',
     copied: '✓ Copied',
     openAuthPage: 'Open authorization page',
     waitingAuth: 'Waiting for GitHub authorization…',
     back: '← Back',
     backToHome: '← Home',
+    backToProviders: '← Providers',
     verifying: 'Verifying…',
     confirmAdd: 'Confirm',
     authFailed: 'Authorization failed, please try again',
     tokenInvalid: 'Invalid token, please try again',
-    waitingCodexAuth: 'Waiting for Codex authorization…',
+    waitingCodexAuth:
+      'Open the authorization page in your browser and finish within 2 minutes.',
+    cancelCodexAuth: 'Cancel authorization',
+    cancelling: 'Cancelling…',
     loginConsent: 'By signing in you authorize access to Copilot API',
   },
   dashboard: {
@@ -53,12 +210,18 @@ const en: Locale = {
     overviewPort: 'Port',
     overviewModels: 'Models',
     overviewLastRefresh: 'Last refresh',
-    premiumUsed: 'Premium used',
-    quotaReset: 'Quota reset',
     serviceAddress: 'Service address',
     authHeader: 'Auth header',
     copy: 'Copy',
-    quotaUsage: 'Quota usage',
+    quotaUsage: 'GitHub Copilot Quota',
+    quotaResetsOn: 'resets {{date}}',
+    quotaUnavailable: 'No quota details reported.',
+    quotaUsedPercent: '{{percent}}% used',
+    quotaRemainingPercent: '{{percent}}% remaining',
+    providerOverview: 'Providers',
+    providerOverviewSummary: '{{enabled}} / {{total}} enabled',
+    providerOverviewManage: 'Manage',
+    providerOverviewModels: '{{n}} models',
     refreshing: 'Refreshing…',
     refresh: 'Refresh',
     tokenUsage: 'Token usage',
@@ -66,6 +229,7 @@ const en: Locale = {
     tokenUsageCache: 'Cache',
     tokenUsageCacheRead: 'Cache read',
     tokenUsageCacheWrite: 'Cache write',
+    tokenUsageCacheHitRate: 'Cache hit rate',
     tokenUsageCost: 'Cost',
     tokenUsageEndpoint: 'Endpoint',
     tokenUsageEvents: 'Event details',
@@ -83,6 +247,10 @@ const en: Locale = {
     tokenUsageProvider: 'Provider',
     tokenUsageRequests: 'Requests',
     tokenUsageSession: 'Session',
+    tokenUsageSessionBreakdown: 'Session breakdown',
+    tokenUsageSessionsCount: '{{n}} sessions',
+    tokenUsageSessionsLoadFailed:
+      'Failed to load session usage. Click Refresh to retry.',
     tokenUsageSource: 'Source',
     tokenUsageTime: 'Time',
     tokenUsageTotal: 'Total',
@@ -109,7 +277,7 @@ const en: Locale = {
     logout: 'Log out',
     settings: 'Settings',
     appSettings: 'App settings',
-    advancedConfig: 'Model mappings',
+    advancedConfig: 'Advanced config',
     changeAuth: 'Auth config',
     restart: 'Restart',
     restarting: 'Restarting…',
@@ -121,6 +289,7 @@ const en: Locale = {
   menu: {
     file: 'File',
     fileSettings: 'Settings',
+    fileAuthConfig: 'Auth config',
     fileQuit: 'Quit',
     view: 'View',
     viewReload: 'Reload',
@@ -133,6 +302,10 @@ const en: Locale = {
     helpDocs: 'Documentation',
   },
   server: {
+    bunFallback:
+      'Bun >= 1.4.0 was not found; using the bundled Node.js runtime. Install or upgrade Bun to enable it.',
+    runtime: 'Server runtime: {{runtime}}',
+    spawnFailed: 'Failed to launch the server process: {{message}}',
     tokenNotFound: 'Token not found',
     authRequired:
       'No usable authorization found. Configure a GitHub token or at least one provider first',
@@ -145,13 +318,15 @@ const en: Locale = {
     processExit: 'Process exited with code {{code}}',
     invalidHost:
       'Invalid listening host; use an address such as 127.0.0.1 or 0.0.0.0',
+    restartFailed:
+      'Failed to restart the running service after saving these settings',
   },
   settings: {
     title: 'Settings',
     restartAppNote:
-      'Changes to OAuth App, API Home, and Enterprise URL take effect only after restarting the app.',
+      'Changes to OAuth App, API Home, SQLite DB Path, and Enterprise URL take effect only after restarting the app.',
     restartAppPrompt:
-      'Saved. Restart the app for OAuth App, API Home, and Enterprise URL changes to take effect.',
+      'Saved. Restart the app for OAuth App, API Home, SQLite DB Path, and Enterprise URL changes to take effect.',
     sectionGeneral: 'General',
     launchAtLogin: 'Launch at login',
     launchAtLoginDesc:
@@ -161,23 +336,28 @@ const en: Locale = {
       'Automatically start the API server on the last used port after authorization loads',
     minimizeToTray: 'Minimize to tray',
     minimizeToTrayDesc: "Hide to system tray when closing, don't quit",
+    showCreate: 'Show create',
+    showCreateDesc: 'Show the Create tab for image and video generation',
     sectionSecurity: 'Security',
     serverKeysNote:
-      'API Keys and Admin Key are stored in config.json. Restart the running service to apply changes.',
+      'API Keys and Admin Key are stored in config.json. Saving automatically refreshes the running service.',
+    serverKeysSaveFailed: 'Server key saving or refresh failed',
+    desktopSettingsSaveFailed:
+      'Desktop settings saving or service refresh failed',
     apiKeysLabel: 'API Keys',
     apiKeysDesc:
       'One API key per line. Clients authenticate with one of these keys via x-api-key or Authorization: Bearer.',
     adminKeyLabel: 'Admin Key',
     adminKeyPlaceholder: 'Enter a new Admin Key (optional)',
     adminKeyDesc:
-      'Used for /admin/* endpoints. Leave empty to remove it; the next server start generates a new one automatically.',
+      'Used for /admin/* endpoints. Leave empty to remove it; refreshing or starting the service generates a new one automatically.',
     sectionNetwork: 'Network',
     host: 'Listening host',
     hostDesc:
-      'Address the API server binds to; leave empty for 127.0.0.1. Takes effect the next time the server starts',
+      'Address the API server binds to; leave empty for 127.0.0.1. Saving automatically restarts the running service',
     hostInvalid: 'Invalid listening host, for example 127.0.0.1 or 0.0.0.0',
     proxySystemNote:
-      'System proxy is used by default. When custom proxy is selected, Electron and newly started local services use the settings below; when no proxy is selected, network requests connect directly. Restart any running service to apply changes.',
+      'Electron uses the system proxy by default. Bun services require a custom proxy when needed. Custom proxy settings apply to both runtimes; No proxy connects directly. Saving restarts the running service.',
     proxyMode: 'Proxy mode',
     proxyModeSystem: 'System proxy',
     proxyModeCustom: 'Custom proxy',
@@ -188,12 +368,28 @@ const en: Locale = {
     noProxyDesc:
       'Separate multiple rules with commas, for example localhost,127.0.0.1.',
     sectionStartup: 'Startup',
+    serverRuntime: 'Server runtime',
+    serverRuntimeDesc:
+      'Prefer Bun >= 1.4.0 when installed; otherwise use bundled Node.js. Saving restarts the running server.',
+    runtimeBun: 'Bun (recommended)',
+    runtimeNode: 'Node.js (bundled)',
+    bunDetecting: 'Checking for local Bun…',
+    bunAvailable: 'Bun {{version}} detected.',
+    bunUnsupported:
+      'Bun {{version}} is unsupported. Install Bun >= 1.4.0; bundled Node.js will be used until then.',
+    bunUnavailable:
+      'Bun >= 1.4.0 was not found. Bundled Node.js will be used until Bun is installed.',
+    bunProxyNote:
+      'Bun does not use Electron’s system proxy. Select a custom proxy in Network if needed, or use Node.js for the system proxy.',
     oauthApp: 'OAuth App',
     oauthAppDefault: 'Default GitHub',
     oauthAppDesc:
       'When set to opencode, Electron will use the opencode OAuth flow on startup.',
     apiHome: 'API Home',
     apiHomeDesc: 'Optional custom directory for tokens and config.json.',
+    sqliteDbPath: 'SQLite DB Path',
+    sqliteDbPathDesc:
+      'Optional SQLite database file path for usage data (COPILOT_API_SQLITE_DB_PATH).',
     enterpriseUrl: 'Enterprise URL',
     enterpriseUrlDesc:
       'Optional value such as company.ghe.com for GitHub Enterprise.',
@@ -212,6 +408,171 @@ const en: Locale = {
     cancel: 'Cancel',
     save: 'Save',
     saving: 'Saving…',
+  },
+  configEditor: {
+    title: 'Advanced configuration',
+    editMode: 'Configuration editor mode',
+    form: 'Visual',
+    json: 'JSON',
+    groupsLabel: 'Configuration groups',
+    resetGroup: 'Reset group to defaults',
+    useDefault: 'Reset to default',
+    inherited: 'Inherit default',
+    explicit: 'Explicit value',
+    defaultValue: 'Default value',
+    explicitValue: 'Explicit value: {{value}}',
+    reload: 'Reload',
+    reloadDiscard: 'Reload and discard changes',
+    mergeLatest: 'Reload and keep changes',
+    mergeConflicts:
+      'Both the draft and file changed these fields: {{fields}}. Choose which values to keep for these fields; other edits will be preserved.',
+    keepMine: 'Use my values for conflicts',
+    keepDisk: 'Use file values for conflicts',
+    merged: 'Merged with the latest file. Review the draft before saving.',
+    legacyWarning:
+      'Unchanged legacy values are preserved: {{fields}}. The service will use its existing normalization rules.',
+    errors: {
+      conflict:
+        'Configuration changed on disk. Reload and keep your changes, or discard them.',
+      validation: 'Check the configuration values and try again.',
+      readFailed:
+        'Could not read the configuration. Check file access and try again.',
+      saveFailed:
+        'Could not save the configuration. Check file access and try again.',
+      applyFailed: 'Could not apply the configuration. Try again.',
+    },
+    discard: 'Discard changes',
+    review: 'Review changes',
+    close: 'Close',
+    saveApply: 'Save and apply',
+    save: 'Save configuration',
+    synced: 'Configuration synchronized',
+    unsaved: '{{count}} unsaved changes',
+    unsavedOther: 'Unsaved changes',
+    offline:
+      'The service is stopped. You can edit and save configuration for the next start.',
+    invalid: 'Invalid configuration',
+    savedApplied: 'Configuration saved and applied to subsequent requests.',
+    savedOffline:
+      'Configuration saved; it will apply on the next service start.',
+    savedNotApplied: 'Configuration saved, but applying it failed',
+    retryApply: 'Retry apply',
+    showSecrets: 'Show sensitive values and edit',
+    format: 'Format',
+    jsonContent: 'Full config.json content',
+    sharedDraft: 'Shares the visual editor draft; validated before saving.',
+    maskedReadOnly: 'Sensitive values are hidden; the preview is read-only.',
+    maskedUnavailable:
+      'Invalid JSON. Enable “Show sensitive values and edit” to repair it.',
+    mappingDefaults:
+      'Built-in mappings are restored automatically; map a model to itself to disable its default rewrite.',
+    autoModelDefault: 'Inherit default (automatic)',
+    autoModelOff: 'Disable model replacement',
+    autoModelCustom: 'Specify a model',
+    groups: {
+      general: 'Request settings',
+      mappings: 'Model mappings',
+      models: 'Model rules',
+      search: 'Search and images',
+      transport: 'Upstream transport',
+    },
+    fields: {
+      useMessagesApi: {
+        label: 'Messages API',
+        description:
+          'Prefer the native Messages endpoint declared by the model.',
+      },
+      useResponsesApiWebSocket: {
+        label: 'Responses WebSocket',
+        description:
+          'Use WebSocket for supported streaming Responses requests.',
+      },
+      opencodeModelContextWindow: {
+        label: 'OpenCode context limit',
+        description:
+          'Limit context tokens shown in the OpenCode model catalog.',
+      },
+      claudeTokenMultiplier: {
+        label: 'Claude token multiplier',
+        description: 'Used only for local Claude count_tokens estimation.',
+      },
+      anthropicApiKey: {
+        label: 'Anthropic token-counting key',
+        description:
+          'Enable exact counting; the default can use ANTHROPIC_API_KEY from the environment.',
+      },
+      smallModels: {
+        label: 'Title and warm-up models',
+        description:
+          'Set a model per provider; an empty string disables switching.',
+      },
+      claudeAutoModel: {
+        label: 'Claude Code review model',
+        description:
+          'Inherit the dynamic default, disable replacement, or specify a model.',
+      },
+      modelReasoningEfforts: {
+        label: 'Default reasoning effort',
+        description:
+          'Override effort per model; an explicit request value takes precedence.',
+      },
+      extraPrompts: {
+        label: 'Extra model prompts',
+        description: 'Append system prompts per model using a JSON object.',
+      },
+      useResponsesApiWebSearch: {
+        label: 'Responses web search',
+        description: 'Keep and forward web_search tools.',
+      },
+      alphaSearchCodexPriority: {
+        label: 'Prefer Codex search',
+        description: 'Control the routing priority for alpha-search.',
+      },
+      alphaSearchModel: {
+        label: 'Alpha Search fallback model',
+        description: 'An empty string disables the fallback search model.',
+      },
+      messageApiWebSearchModel: {
+        label: 'Messages web-search model',
+        description:
+          'Used for search-only Messages requests; an empty string disables it.',
+      },
+      imageGenerationModel: {
+        label: 'Image generation model',
+        description: 'Leave empty for the default route, or use xai/model.',
+      },
+      imageEditModel: {
+        label: 'Image edit model',
+        description: 'Leave empty for the default route, or use xai/model.',
+      },
+      headersTimeoutMs: {
+        label: 'Response headers timeout',
+        description:
+          'Time from connection establishment to response headers, in milliseconds.',
+      },
+      streamInactivityTimeoutMs: {
+        label: 'Stream inactivity timeout',
+        description: 'Reset whenever data arrives, in milliseconds.',
+      },
+      websocketOpenTimeoutMs: {
+        label: 'WebSocket handshake timeout',
+        description: 'Wait for the upstream handshake, in milliseconds.',
+      },
+      websocketPoolIdleTimeoutMs: {
+        label: 'WebSocket idle timeout',
+        description:
+          'Recycle completed, idle reusable connections, in milliseconds.',
+      },
+      websocketMaxBufferedBytes: {
+        label: 'WebSocket buffered bytes',
+        description:
+          'Applied together with the message limit; exceeding it terminates the stream.',
+      },
+      websocketMaxBufferedMessages: {
+        label: 'WebSocket buffered messages',
+        description: 'Applied together with the byte limit.',
+      },
+    },
   },
   advancedConfig: {
     title: 'Model mappings',

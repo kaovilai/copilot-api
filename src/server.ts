@@ -23,6 +23,8 @@ import { providerResponsesRoutes } from "./routes/provider/responses/route"
 import { responsesRoutes } from "./routes/responses/route"
 import { tokenUsageRoute } from "./routes/token-usage/route"
 import { usageRoute } from "./routes/usage/route"
+import { videoRoutes } from "./routes/videos/route"
+
 const usageViewerHtml = readFileSync(
   new URL("../pages/index.html", import.meta.url),
   "utf8",
@@ -88,6 +90,7 @@ export function createServer(options: CreateServerOptions = {}): Hono {
   server.route("/responses", responsesRoutes)
   server.route("/alpha/search", alphaSearchRoutes)
   server.route("/images", imageRoutes)
+  server.route("/videos", videoRoutes)
 
   // Compatibility with tools that expect v1/ prefix
   server.route("/v1/chat/completions", completionRoutes)
@@ -96,6 +99,7 @@ export function createServer(options: CreateServerOptions = {}): Hono {
   server.route("/v1/responses", responsesRoutes)
   server.route("/v1/alpha/search", alphaSearchRoutes)
   server.route("/v1/images", imageRoutes)
+  server.route("/v1/videos", videoRoutes)
 
   // Anthropic compatible endpoints
   server.route("/v1/messages", messageRoutes)

@@ -22,14 +22,12 @@ import type {
 
 import {
   type ModelConfig,
-  type ProviderAuthType,
   type ResolvedProviderConfig,
-  type ProviderType,
   getClaudeAutoModel,
-  resolveEffectiveProviderType,
-  resolveProviderAuthType,
+  resolveProviderConfigForModel,
 } from "~/lib/config"
-import { builtinProviderModelRegistry } from "~/lib/builtin-provider-models"
+import { getProviderModelConfig } from "~/lib/provider-model-catalog"
+import { fromClaudeDiscoveryModelId } from "~/lib/claude-models"
 import { logCodexRateLimitsEvent } from "~/lib/codex-rate-limit"
 import {
   applyDashScopePreserveThinkingDefault,
@@ -38,6 +36,7 @@ import {
 } from "~/lib/dashscope"
 import { HTTPError } from "~/lib/error"
 import { createHandlerLogger, debugJson, debugLazy } from "~/lib/logger"
+import { getProviderModelPdfSupport } from "~/lib/model-pdf-support"
 import { resolveProviderConfig } from "~/lib/provider-resolver"
 import { writeSSEIfConnected } from "~/lib/sse"
 import { resolveBridgeToolSearchName } from "~/lib/tool-search"
@@ -54,12 +53,12 @@ import { isResponsesStream, parseUserIdMetadata } from "~/lib/utils"
 import {
   translateToAnthropic,
   translateToOpenAI,
-} from "~/routes/messages/non-stream-translation"
+} from "~/routes/messages/completions-translation"
 import {
   flushPendingAnthropicStreamEvents,
   translateChunkToAnthropicEvents,
   translateErrorToAnthropicErrorEvent,
-} from "~/routes/messages/stream-translation"
+} from "~/routes/messages/completions-stream-translation"
 import {
   buildErrorEvent,
   createResponsesStreamState,
@@ -79,6 +78,8 @@ import {
   stripWebSearchServerTool,
 } from "~/routes/messages/web-search/fulfill"
 import {
+  appendClaudeContinuationMessage,
+  applyClaudeNoToolsEffort,
   isClaudeAutoModelRequest,
   normalizeSystemMessages,
 } from "~/routes/messages/preprocess"
@@ -101,6 +102,7 @@ import {
   normalizeProviderResponsesReasoningEffort,
 } from "~/routes/provider/utils"
 import consola from "consola"
+import { handleGoogleProviderMessages } from "./google-handler"
 
 const logger = createHandlerLogger("provider-messages-handler")
 
@@ -108,27 +110,13 @@ export const providerMessagesHandlerDependencies = {
   resolveProviderConfig,
 }
 
-const resolveOverrideProviderAuthType = (
-  providerConfig: ResolvedProviderConfig,
-  effectiveType: ProviderType,
-): ProviderAuthType => {
-  // azure-entra and oauth2 are explicit credentials, never protocol defaults:
-  // recomputing the auth type for the override would drop them and send the
-  // token with the wrong scheme (e.g. an Entra token as x-api-key).
-  if (
-    providerConfig.authType === "azure-entra"
-    || providerConfig.authType === "oauth2"
-  ) {
-    return providerConfig.authType
-  }
-  return resolveProviderAuthType(providerConfig.name, undefined, effectiveType)
-}
-
 export async function handleProviderMessages(
   c: Context<Env, "/:provider">,
 ): Promise<Response> {
   const provider = c.req.param("provider")
   const payload = await c.req.json<AnthropicMessagesPayload>()
+  payload.model = fromClaudeDiscoveryModelId(payload.model)
+  applyClaudeNoToolsEffort(payload, c.req.header("user-agent"))
 
   const claudeAutoModel = getClaudeAutoModel()
   if (claudeAutoModel && isClaudeAutoModelRequest(payload)) {
@@ -153,9 +141,9 @@ export async function handleProviderMessagesForProvider(
   },
 ): Promise<Response> {
   const { payload, provider, usageEndpoint } = options
-  const providerConfig =
+  const configuredProvider =
     await providerMessagesHandlerDependencies.resolveProviderConfig(provider)
-  if (!providerConfig) {
+  if (!configuredProvider) {
     return c.json(
       {
         error: {
@@ -168,16 +156,28 @@ export async function handleProviderMessagesForProvider(
   }
 
   try {
-    const modelConfig = providerConfig.models?.[payload.model]
-    const effectiveType = resolveEffectiveProviderType(
-      providerConfig,
+    const providerConfig = resolveProviderConfigForModel(
+      configuredProvider,
       payload.model,
     )
+    const modelConfig = providerConfig.models?.[payload.model]
+    const effectiveType = providerConfig.type
     debugJson(logger, "provider.messages.request", { payload, provider })
 
     normalizeSystemMessages(payload)
 
     applyModelDefaults(payload, modelConfig)
+    appendClaudeContinuationMessage(payload)
+
+    if (effectiveType === "google") {
+      stripWebSearchServerTool(payload)
+      return await handleGoogleProviderMessages(
+        c,
+        payload,
+        providerConfig,
+        usageEndpoint,
+      )
+    }
 
     if (effectiveType === "openai-responses") {
       if (hasWebSearchServerTool(payload)) {
@@ -224,16 +224,7 @@ export async function handleProviderMessagesForProvider(
       provider,
     })
     const upstreamResponse = await forwardProviderMessages(
-      effectiveType === providerConfig.type ?
-        providerConfig
-      : {
-          ...providerConfig,
-          type: effectiveType,
-          authType: resolveOverrideProviderAuthType(
-            providerConfig,
-            effectiveType,
-          ),
-        },
+      providerConfig,
       payload,
       c.req.raw.headers,
       { clientSignal: c.req.raw.signal },
@@ -637,7 +628,7 @@ const createOpenAICompatiblePayload = (
   providerConfig: ResolvedProviderConfig,
 ): ChatCompletionsPayload => {
   const openAIPayload = translateToOpenAI(payload, {
-    supportPdf: modelConfig?.supportPdf,
+    supportPdf: getProviderModelPdfSupport(payload.model, providerConfig),
     toolContentSupportType: modelConfig?.toolContentSupportType ?? [],
   })
 
@@ -677,6 +668,8 @@ const createOpenAICompatiblePayload = (
     extraBody: modelConfig?.extraBody,
   })
 
+  applyMiMoThinking(openAIPayload, payload)
+
   applyDashScopePreserveThinkingDefault(
     openAIPayload as unknown as Record<string, unknown>,
     providerConfig,
@@ -694,6 +687,31 @@ const createOpenAICompatiblePayload = (
   return openAIPayload
 }
 
+const applyMiMoThinking = (
+  payload: ChatCompletionsPayload,
+  source: AnthropicMessagesPayload,
+): void => {
+  if (!/(?:^|\/)mimo(?:[-_.]|$)/i.test(payload.model)) {
+    return
+  }
+
+  const sourceThinkingType = source.thinking?.type
+  const shouldEnableThinking = Boolean(
+    payload.reasoning_effort || sourceThinkingType,
+  )
+  delete payload.reasoning_effort
+
+  if (sourceThinkingType === "disabled") {
+    payload.thinking = { type: "disabled" }
+    delete payload.thinking_budget
+    return
+  }
+
+  if (shouldEnableThinking) {
+    payload.thinking = { type: "enabled" }
+  }
+}
+
 const normalizeOpenAICompatibleReasoningContent = (
   payload: ChatCompletionsPayload,
   options: {
@@ -706,9 +724,10 @@ const normalizeOpenAICompatibleReasoningContent = (
   // history messages instead of the default "reasoning_content" field
   const reasoningField =
     options.modelConfig?.reasoningField
-    ?? builtinProviderModelRegistry.getModelConfig(
+    ?? getProviderModelConfig(
       options.providerConfig.name,
       payload.model,
+      options.providerConfig,
     )?.reasoningField
     ?? "reasoning_content"
 

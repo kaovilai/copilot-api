@@ -38,6 +38,9 @@ export const applyOpenAICompatibleContextCache = (payload: {
   if (payload.model.includes("/")) {
     return
   }
+  if (!payload.model.toLowerCase().includes("qwen")) {
+    return
+  }
   const messageIndexes = selectContextCacheMessageIndexes(payload.messages)
   for (const messageIndex of messageIndexes) {
     applyContextCacheControl(payload.messages[messageIndex])

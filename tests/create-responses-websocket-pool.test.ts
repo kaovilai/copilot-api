@@ -167,6 +167,7 @@ class MockProxyAgent extends MockAgent {
 
 const setGlobalDispatcherMock = mock((_dispatcher: unknown) => {})
 const actualUndici = await import("undici")
+const originalWebSocket = globalThis.WebSocket
 
 await mock.module("undici", () => ({
   ...actualUndici,
@@ -184,9 +185,8 @@ const {
   ResponsesWebSocketOpenTimeoutError,
   WebSocketMessageBuffer,
 } = await import("~/services/responses-websocket")
-const { createResponsesSafeStream } = await import(
-  "~/services/responses-websocket-helpers"
-)
+const { createResponsesSafeStream, getResponsesStreamTerminalDisposition } =
+  await import("~/services/responses-websocket-helpers")
 
 const originalState = {
   accountType: state.accountType,
@@ -220,6 +220,7 @@ const createResponsesResult = (
 })
 
 beforeEach(() => {
+  globalThis.WebSocket = MockWebSocket as unknown as typeof globalThis.WebSocket
   MockWebSocket.autoComplete = true
   MockWebSocket.closeAfterComplete = false
   MockWebSocket.failOpen = false
@@ -235,6 +236,7 @@ beforeEach(() => {
 })
 
 afterEach(() => {
+  globalThis.WebSocket = originalWebSocket
   MockWebSocket.autoComplete = true
   MockWebSocket.closeAfterComplete = false
   MockWebSocket.failOpen = false
@@ -263,6 +265,115 @@ test("Responses websocket pool reuses the same connection for matching pool keys
 
   expect(MockWebSocket.instances).toHaveLength(1)
   expect(MockWebSocket.instances[0]?.sent).toHaveLength(2)
+})
+
+test("Responses websocket discards a connection after a server error event", async () => {
+  MockWebSocket.autoComplete = false
+  const chunksPromise = collectStreamChunks(
+    await startResponsesStream("request-error"),
+  )
+  await waitFor(() => MockWebSocket.instances[0]?.sent.length === 1)
+
+  MockWebSocket.instances[0]?.emitMessage(
+    JSON.stringify({
+      error: {
+        code: "invalid_request_body",
+        message:
+          "Encrypted function output content could not be decrypted or decoded.",
+      },
+      type: "error",
+    }),
+  )
+
+  const chunks = await chunksPromise
+  expect(chunks.map((chunk) => chunk.event)).toEqual(["error"])
+  expect(MockWebSocket.instances[0]?.readyState).toBe(MockWebSocket.CLOSED)
+
+  await expectNextRequestUsesNewConnection("request-error")
+})
+
+test("Responses websocket discards a connection after a response.failed event", async () => {
+  MockWebSocket.autoComplete = false
+  const chunksPromise = collectStreamChunks(
+    await startResponsesStream("request-failed"),
+  )
+  await waitFor(() => MockWebSocket.instances[0]?.sent.length === 1)
+
+  const failedResponse = {
+    ...createResponsesResult("gpt-test", "resp-failed"),
+    status: "failed",
+  }
+  MockWebSocket.instances[0]?.emitMessage(
+    JSON.stringify({
+      response: { ...failedResponse, status: "in_progress" },
+      sequence_number: 0,
+      type: "response.created",
+    }),
+  )
+  MockWebSocket.instances[0]?.emitMessage(
+    JSON.stringify({
+      response: failedResponse,
+      sequence_number: 1,
+      type: "response.failed",
+    }),
+  )
+
+  const chunks = await chunksPromise
+  expect(chunks.map((chunk) => chunk.event)).toEqual([
+    "response.created",
+    "response.failed",
+  ])
+  expect(MockWebSocket.instances[0]?.readyState).toBe(MockWebSocket.CLOSED)
+
+  await expectNextRequestUsesNewConnection("request-failed")
+})
+
+test("Responses websocket keeps a connection pooled after response.incomplete", async () => {
+  MockWebSocket.autoComplete = false
+  const chunksPromise = collectStreamChunks(
+    await startResponsesStream("request-incomplete"),
+  )
+  await waitFor(() => MockWebSocket.instances[0]?.sent.length === 1)
+
+  MockWebSocket.instances[0]?.emitMessage(
+    JSON.stringify({
+      response: {
+        ...createResponsesResult("gpt-test", "resp-incomplete"),
+        incomplete_details: { reason: "max_output_tokens" },
+        status: "incomplete",
+      },
+      sequence_number: 1,
+      type: "response.incomplete",
+    }),
+  )
+
+  const chunks = await chunksPromise
+  expect(chunks.map((chunk) => chunk.event)).toEqual(["response.incomplete"])
+  expect(MockWebSocket.instances[0]?.readyState).toBe(MockWebSocket.OPEN)
+
+  const nextRequest = collectResponsesStream("request-incomplete")
+  await waitFor(() => MockWebSocket.instances[0]?.sent.length === 2)
+  MockWebSocket.instances[0]?.completeLatestResponse()
+  await nextRequest
+
+  expect(MockWebSocket.instances).toHaveLength(1)
+})
+
+test("Responses stream terminal disposition only reuses successful terminal events", () => {
+  const dispositionOf = (data?: string) =>
+    getResponsesStreamTerminalDisposition({ data })
+
+  expect(dispositionOf()).toBe("continue")
+  expect(dispositionOf("[DONE]")).toBe("continue")
+  expect(dispositionOf("not json")).toBe("continue")
+  expect(dispositionOf('{"type":"response.created"}')).toBe("continue")
+  expect(dispositionOf('{"type":"response.output_text.delta"}')).toBe(
+    "continue",
+  )
+  expect(dispositionOf('{"type":"response.completed"}')).toBe("reuse")
+  expect(dispositionOf('{"type":"response.incomplete"}')).toBe("reuse")
+  expect(dispositionOf('{"type":"response.failed"}')).toBe("discard")
+  expect(dispositionOf('{"type":"error"}')).toBe("discard")
 })
 
 test("Responses websocket remains reusable when the consumer stops after the terminal chunk", async () => {
@@ -934,7 +1045,8 @@ const createTestPooledStream = (
         const parsed = JSON.parse(data) as { type?: string }
         return { data, event: parsed.type }
       },
-      isTerminalChunk: (chunk) => chunk.event === "response.completed",
+      getTerminalDisposition: (chunk) =>
+        chunk.event === "response.completed" ? "reuse" : "continue",
       maxBufferedBytes: overrides.maxBufferedBytes ?? 1024,
       maxBufferedMessages: overrides.maxBufferedMessages ?? 32,
       openErrorMessage: "open failed",
@@ -960,8 +1072,10 @@ const getRejectedError = async (promise: Promise<unknown>): Promise<Error> => {
   throw new Error("Expected promise to reject")
 }
 
-const collectResponsesStream = async (requestId: string): Promise<void> => {
-  const response = await createResponses(
+const startResponsesStream = async (
+  requestId: string,
+): Promise<AsyncIterable<unknown>> =>
+  (await createResponses(
     {
       input: "hello",
       model: "gpt-test",
@@ -973,11 +1087,24 @@ const collectResponsesStream = async (requestId: string): Promise<void> => {
       transport: "websocket",
       vision: false,
     },
-  )
+  )) as AsyncIterable<unknown>
 
-  for await (const _chunk of response as AsyncIterable<unknown>) {
+const collectResponsesStream = async (requestId: string): Promise<void> => {
+  for await (const _chunk of await startResponsesStream(requestId)) {
     // consume stream
   }
+}
+
+const expectNextRequestUsesNewConnection = async (
+  requestId: string,
+): Promise<void> => {
+  const nextRequest = collectResponsesStream(requestId)
+  await waitFor(() => MockWebSocket.instances[1]?.sent.length === 1)
+  MockWebSocket.instances[1]?.completeLatestResponse()
+  await nextRequest
+
+  expect(MockWebSocket.instances).toHaveLength(2)
+  expect(MockWebSocket.instances[0]?.sent).toHaveLength(1)
 }
 
 const collectStreamChunks = async (
@@ -1021,7 +1148,9 @@ const useAcceleratedStallTimer = (): void => {
     ...args: Array<unknown>
   ) => {
     if (timeout === 20_000 || timeout === 180_000) {
-      return originalSetTimeout(handler, 0, ...args)
+      // Not 0: the stall timer is armed before the request is sent, so a 0ms
+      // timer would fire ahead of the mock's reply on a healthy connection too.
+      return originalSetTimeout(handler, 20, ...args)
     }
 
     return originalSetTimeout(handler, timeout, ...args)

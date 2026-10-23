@@ -10,6 +10,7 @@ import {
   resolveMappedModel,
 } from "~/lib/config"
 import { createHandlerLogger, debugJson } from "~/lib/logger"
+import { fromClaudeDiscoveryModelId } from "~/lib/claude-models"
 import { findEndpointModel } from "~/lib/models"
 import { resolveConfiguredProviderModelAlias } from "~/lib/provider-resolver"
 import { state } from "~/lib/state"
@@ -33,6 +34,8 @@ import {
   handleWithResponsesApi,
 } from "./api-flows"
 import {
+  appendClaudeContinuationMessage,
+  applyClaudeNoToolsEffort,
   applyLastMessageCacheControl,
   getCompactType,
   getLastMessageContentCacheControl,
@@ -56,6 +59,8 @@ export const messagesFlowHandlers = {
 
 export async function handleCompletion(c: Context) {
   const anthropicPayload = await c.req.json<AnthropicMessagesPayload>()
+  anthropicPayload.model = fromClaudeDiscoveryModelId(anthropicPayload.model)
+  applyClaudeNoToolsEffort(anthropicPayload, c.req.header("user-agent"))
 
   return await handleCompletionPayload(c, anthropicPayload)
 }
@@ -95,17 +100,21 @@ export async function handleCompletionPayload(
     if (webSearchResult) return webSearchResult
   }
 
-  const claudeAutoModel = getClaudeAutoModel()
+  const claudeAutoModel = getClaudeAutoModel(true)
   const shouldUseClaudeAutoModel = Boolean(
     !dispatchOptions.skipClaudeAutoModel
       && claudeAutoModel
       && isClaudeAutoModelRequest(anthropicPayload),
   )
   if (claudeAutoModel && shouldUseClaudeAutoModel) {
+    const resolvedClaudeAutoModel =
+      dispatchOptions.skipModelMapping ? claudeAutoModel : (
+        resolveMappedModel(claudeAutoModel)
+      )
     consola.debug(
-      `Claude auto model override: ${anthropicPayload.model} -> ${claudeAutoModel}`,
+      `Claude auto model override: ${anthropicPayload.model} -> ${resolvedClaudeAutoModel}`,
     )
-    anthropicPayload.model = claudeAutoModel
+    anthropicPayload.model = resolvedClaudeAutoModel
   }
 
   const providerModelAlias = await resolveConfiguredProviderModelAlias(
@@ -149,7 +158,11 @@ export async function handleCompletionPayload(
     const tools = anthropicPayload.tools
     const noTools = !tools || tools.length === 0
     if (anthropicBeta && noTools && compactType === 0) {
-      anthropicPayload.model = getSmallModel()
+      const smallModel = getSmallModel()
+      consola.debug(
+        `Claude Code warmup small model: ${anthropicPayload.model} -> ${smallModel}`,
+      )
+      anthropicPayload.model = smallModel
     }
   }
 
@@ -188,6 +201,7 @@ export async function handleCompletionPayload(
 
   const selectedModel = findEndpointModel(anthropicPayload.model)
   anthropicPayload.model = selectedModel?.id ?? anthropicPayload.model
+  appendClaudeContinuationMessage(anthropicPayload)
 
   if (shouldUseMessagesApi(selectedModel)) {
     return await messagesFlowHandlers.handleWithMessagesApi(

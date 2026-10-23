@@ -1,10 +1,10 @@
 import {
-  afterAll,
   afterEach,
   beforeEach,
   describe,
   expect,
   mock,
+  spyOn,
   test,
 } from "bun:test"
 import { Hono } from "hono"
@@ -16,6 +16,8 @@ import type {
 } from "~/lib/types/anthropic"
 import type { ResponsesResult } from "~/lib/types/responses"
 
+import { createFallbackModel } from "~/lib/provider-model"
+
 const actualConfigModule = await import("~/lib/config")
 const actualModelsModule = await import("~/lib/models")
 const actualStateModule = await import("~/lib/state")
@@ -24,30 +26,20 @@ const actualTokenUsageModule = await import("~/lib/token-usage")
 
 let providerConfigs: Record<string, ResolvedProviderConfig> = {}
 let messageApiWebSearchModel: string | undefined
+let restoreModelLookup = () => {}
 
 const noopTokenUsageRecorder = () => {}
 const findEndpointModel = mock((model: string) => ({
-  // mock.module replaces the shared ~/lib/models module for the whole test
-  // run (see the afterAll restore below), so keep this shape realistic --
-  // consumers that pick it up before the restore takes effect still expect
-  // a Model-shaped object (e.g. chat-completions handler reads capabilities.limits).
-  capabilities: { limits: {} },
-  id: model,
+  ...createFallbackModel(model),
   supported_endpoints: ["/v1/messages"],
 }))
 
 await mock.module("~/lib/config", () => ({
   ...actualConfigModule,
-  getMessageApiWebSearchModel: () => messageApiWebSearchModel,
   getProviderConfig: (name: string) => providerConfigs[name] ?? null,
   isResponsesApiWebSearchEnabled: () => true,
   isResponsesApiWebSocketEnabled: () => false,
   resolveMappedModel: (model: string) => model,
-}))
-
-await mock.module("~/lib/models", () => ({
-  ...actualModelsModule,
-  findEndpointModel,
 }))
 
 await mock.module("~/lib/state", () => ({
@@ -73,12 +65,17 @@ const { providerMessageRoutes } = await import(
   "~/routes/provider/messages/route"
 )
 const { messageRoutes } = await import("~/routes/messages/route")
+const { webSearchFlowDependencies } = await import(
+  "~/routes/messages/web-search/fulfill"
+)
 const { state } = await import("~/lib/state")
 const { responsesUtilsDependencies } = await import("~/routes/responses/utils")
 
 const originalCodexAccessToken = state.codexAccessToken
 const originalCodexAccountId = state.codexAccountId
 const defaultResponsesUtilsDependencies = { ...responsesUtilsDependencies }
+const originalGetMessageApiWebSearchModel =
+  webSearchFlowDependencies.getMessageApiWebSearchModel
 
 const makeResponsesResult = (
   overrides: Partial<ResponsesResult> = {},
@@ -349,6 +346,12 @@ const createCodexMessagesPayload = (
 })
 
 beforeEach(() => {
+  const modelLookup = spyOn(
+    actualModelsModule,
+    "findEndpointModel",
+  ).mockImplementation(findEndpointModel)
+  restoreModelLookup = () => modelLookup.mockRestore()
+
   providerConfigs = {
     search: {
       name: "search",
@@ -366,6 +369,8 @@ beforeEach(() => {
   state.codexAccessToken = "codex-token"
   state.codexAccountId = "codex-account"
   messageApiWebSearchModel = undefined
+  webSearchFlowDependencies.getMessageApiWebSearchModel = () =>
+    messageApiWebSearchModel
   responsesResultOverride = undefined
   responsesStreamFactory = undefined
   findEndpointModel.mockClear()
@@ -380,26 +385,17 @@ beforeEach(() => {
 })
 
 afterEach(() => {
+  restoreModelLookup()
   ;(globalThis as unknown as { fetch: typeof fetch }).fetch = originalFetch
   state.codexAccessToken = originalCodexAccessToken
   state.codexAccountId = originalCodexAccountId
   Object.assign(responsesUtilsDependencies, defaultResponsesUtilsDependencies)
+  webSearchFlowDependencies.getMessageApiWebSearchModel =
+    originalGetMessageApiWebSearchModel
   providerConfigs = {}
   messageApiWebSearchModel = undefined
   responsesResultOverride = undefined
   responsesStreamFactory = undefined
-})
-
-// mock.module replaces these modules in Bun's shared module registry for the
-// whole test run, not just this file -- restore the real implementations so
-// later-running test files that import ~/lib/models et al. don't silently
-// receive this file's fakes (e.g. a findEndpointModel with no capabilities).
-afterAll(async () => {
-  await mock.module("~/lib/config", () => actualConfigModule)
-  await mock.module("~/lib/models", () => actualModelsModule)
-  await mock.module("~/lib/state", () => actualStateModule)
-  await mock.module("~/lib/token", () => actualTokenModule)
-  await mock.module("~/lib/token-usage", () => actualTokenUsageModule)
 })
 
 describe("provider messages web_search", () => {

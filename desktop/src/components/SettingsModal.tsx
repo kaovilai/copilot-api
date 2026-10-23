@@ -1,5 +1,6 @@
 import { useState, useEffect, type ReactNode } from 'react'
 import type {
+  BunRuntimeStatus,
   DesktopProxyMode,
   DesktopSettings,
   ServerKeysConfig,
@@ -10,12 +11,15 @@ import { useLanguage } from '../contexts/LanguageContext'
 import { useTheme } from '../contexts/ThemeContext'
 import { translate, type LangPreference } from '../locales'
 import { isValidServerHost } from '../lib/server-url'
+import AppUpdatePanel from './AppUpdatePanel'
 
 interface SettingsModalProps {
   onClose: () => void
+  initialSection?: Section
+  checkForUpdatesOnOpen?: boolean
 }
 
-type Section = 'general' | 'security' | 'network' | 'startup'
+type Section = 'general' | 'security' | 'network' | 'startup' | 'updates'
 
 // Matches the normalization applied by the main process before persisting,
 // so cosmetic edits (e.g. a trailing newline) do not count as changes.
@@ -36,6 +40,7 @@ function requiresAppRestart(
 ): boolean {
   return (
     previous.apiHome !== next.apiHome
+    || previous.sqliteDbPath !== next.sqliteDbPath
     || previous.oauthApp !== next.oauthApp
     || previous.enterpriseUrl !== next.enterpriseUrl
   )
@@ -230,12 +235,18 @@ const IconSecurity = () => (
   </svg>
 )
 
-export default function SettingsModal({ onClose }: SettingsModalProps) {
+export default function SettingsModal({
+  onClose,
+  initialSection = 'general',
+  checkForUpdatesOnOpen = false,
+}: SettingsModalProps) {
   const { t, setLangPref } = useLanguage()
   const { setThemePref } = useTheme()
-  const [section, setSection] = useState<Section>('general')
+  const [section, setSection] = useState<Section>(initialSection)
   const [settings, setSettings] = useState<DesktopSettings>({
+    serverRuntime: 'bun',
     apiHome: '',
+    sqliteDbPath: '',
     oauthApp: 'default',
     enterpriseUrl: '',
     host: '',
@@ -246,6 +257,7 @@ export default function SettingsModal({ onClose }: SettingsModalProps) {
     accountType: 'individual',
     verbose: false,
     showToken: false,
+    showCreate: false,
     language: 'auto',
     theme: 'auto',
     proxy: {
@@ -258,17 +270,28 @@ export default function SettingsModal({ onClose }: SettingsModalProps) {
   const [initialSettings, setInitialSettings] =
     useState<DesktopSettings | null>(null)
   const [saving, setSaving] = useState(false)
+  const [bunRuntime, setBunRuntime] = useState<BunRuntimeStatus | null>(null)
   const [apiKeysText, setApiKeysText] = useState('')
   const [adminApiKey, setAdminApiKey] = useState('')
   const [loadedServerKeys, setLoadedServerKeys] =
     useState<ServerKeysConfig | null>(null)
 
   useEffect(() => {
+    let active = true
+    void window.electronAPI
+      .getBunRuntime()
+      .then((runtime) => {
+        if (active) setBunRuntime(runtime)
+      })
+      .catch(() => {
+        if (active) setBunRuntime({ available: false })
+      })
     void Promise.all([
       window.electronAPI.getSettings(),
       window.electronAPI.getServerKeys(),
     ])
       .then(([loadedSettings, serverKeys]) => {
+        if (!active) return
         setSettings(loadedSettings)
         setInitialSettings(loadedSettings)
         setApiKeysText(serverKeys.apiKeys.join('\n'))
@@ -276,6 +299,9 @@ export default function SettingsModal({ onClose }: SettingsModalProps) {
         setLoadedServerKeys(serverKeys)
       })
       .catch(() => {})
+    return () => {
+      active = false
+    }
   }, [])
 
   const handleSave = async () => {
@@ -292,6 +318,7 @@ export default function SettingsModal({ onClose }: SettingsModalProps) {
       const nextApiKeys = normalizeServerKeysText(apiKeysText)
       const nextAdminApiKey = adminApiKey.trim()
       const serverKeysUpdate: ServerKeysConfigUpdate = {}
+      const saveErrors: string[] = []
       if (
         loadedServerKeys !== null
         && nextApiKeys.join('\n') !== loadedServerKeys.apiKeys.join('\n')
@@ -309,14 +336,29 @@ export default function SettingsModal({ onClose }: SettingsModalProps) {
         loadedServerKeys !== null
         && Object.keys(serverKeysUpdate).length > 0
       ) {
-        const savedKeys =
-          await window.electronAPI.saveServerKeys(serverKeysUpdate)
-        setApiKeysText(savedKeys.apiKeys.join('\n'))
-        setAdminApiKey(savedKeys.adminApiKey)
-        setLoadedServerKeys(savedKeys)
+        try {
+          const savedKeys =
+            await window.electronAPI.saveServerKeys(serverKeysUpdate)
+          setApiKeysText(savedKeys.apiKeys.join('\n'))
+          setAdminApiKey(savedKeys.adminApiKey)
+          setLoadedServerKeys(savedKeys)
+        } catch (error) {
+          saveErrors.push(
+            `${t('settings.serverKeysSaveFailed')}: ${error instanceof Error ? error.message : String(error)}`,
+          )
+        }
       }
 
-      await window.electronAPI.saveSettings(settings)
+      try {
+        await window.electronAPI.saveSettings(settings)
+      } catch (error) {
+        saveErrors.push(
+          `${t('settings.desktopSettingsSaveFailed')}: ${error instanceof Error ? error.message : String(error)}`,
+        )
+      }
+      if (saveErrors.length > 0) {
+        throw new Error(saveErrors.join('\n'))
+      }
       setLangPref(settings.language)
       setThemePref(settings.theme)
 
@@ -389,6 +431,11 @@ export default function SettingsModal({ onClose }: SettingsModalProps) {
       key: 'startup',
       label: t('settings.sectionStartup'),
       icon: <IconStartup />,
+    },
+    {
+      key: 'updates',
+      label: t('updates.title'),
+      icon: <IconMonitor />,
     },
   ]
 
@@ -468,6 +515,9 @@ export default function SettingsModal({ onClose }: SettingsModalProps) {
 
           {/* Right panel */}
           <div className="flex-1 overflow-y-auto px-6 py-5 dark:bg-[#141419]">
+            {section === 'updates' && (
+              <AppUpdatePanel checkOnMount={checkForUpdatesOnOpen} />
+            )}
             {section === 'general' && (
               <div>
                 <div className="mb-1">
@@ -551,6 +601,18 @@ export default function SettingsModal({ onClose }: SettingsModalProps) {
                     checked={settings.minimizeToTray}
                     onChange={(v) =>
                       setSettings((s) => ({ ...s, minimizeToTray: v }))
+                    }
+                  />
+                </SettingRow>
+
+                <SettingRow
+                  label={t('settings.showCreate')}
+                  description={t('settings.showCreateDesc')}
+                >
+                  <Toggle
+                    checked={settings.showCreate}
+                    onChange={(v) =>
+                      setSettings((s) => ({ ...s, showCreate: v }))
                     }
                   />
                 </SettingRow>
@@ -707,6 +769,54 @@ export default function SettingsModal({ onClose }: SettingsModalProps) {
 
             {section === 'startup' && (
               <div>
+                <div className="mb-4">
+                  <label
+                    htmlFor="server-runtime"
+                    className="text-[13px] font-medium text-ink mb-1.5 block"
+                  >
+                    {t('settings.serverRuntime')}
+                  </label>
+                  <select
+                    id="server-runtime"
+                    value={settings.serverRuntime}
+                    onChange={(e) =>
+                      setSettings((s) => ({
+                        ...s,
+                        serverRuntime: e.target
+                          .value as DesktopSettings['serverRuntime'],
+                      }))
+                    }
+                    className={selectClass}
+                  >
+                    <option value="bun">{t('settings.runtimeBun')}</option>
+                    <option value="node">{t('settings.runtimeNode')}</option>
+                  </select>
+                  <p className="text-[12px] text-ink-faint mt-1.5 leading-relaxed">
+                    {t('settings.serverRuntimeDesc')}
+                  </p>
+                  <p
+                    role="status"
+                    title={bunRuntime?.path}
+                    className="text-[12px] text-ink-faint mt-1.5 leading-relaxed"
+                  >
+                    {bunRuntime === null ?
+                      t('settings.bunDetecting')
+                    : bunRuntime.available ?
+                      t('settings.bunAvailable', {
+                        version: bunRuntime.version ?? '',
+                      })
+                    : bunRuntime.version ?
+                      t('settings.bunUnsupported', {
+                        version: bunRuntime.version,
+                      })
+                    : t('settings.bunUnavailable')}
+                  </p>
+                  {settings.serverRuntime === 'bun' && (
+                    <p className="text-[12px] text-ink-faint mt-1.5 leading-relaxed">
+                      {t('settings.bunProxyNote')}
+                    </p>
+                  )}
+                </div>
                 <div className="mb-4 rounded-lg border border-amber-200 bg-amber-50 px-3 py-2 text-[12px] leading-relaxed text-amber-800 dark:border-amber-500/30 dark:bg-amber-500/15 dark:text-amber-400">
                   {t('settings.restartAppNote')}
                 </div>
@@ -748,6 +858,26 @@ export default function SettingsModal({ onClose }: SettingsModalProps) {
                   />
                   <p className="text-[12px] text-ink-faint mt-1.5 leading-relaxed">
                     {t('settings.apiHomeDesc')}
+                  </p>
+                </div>
+                <div className="mb-4">
+                  <div className="text-[13px] font-medium text-ink mb-1.5">
+                    {t('settings.sqliteDbPath')}
+                  </div>
+                  <input
+                    type="text"
+                    placeholder="C:/copilot-api/copilot-api.sqlite"
+                    value={settings.sqliteDbPath}
+                    onChange={(e) =>
+                      setSettings((s) => ({
+                        ...s,
+                        sqliteDbPath: e.target.value,
+                      }))
+                    }
+                    className={inputClass}
+                  />
+                  <p className="text-[12px] text-ink-faint mt-1.5 leading-relaxed">
+                    {t('settings.sqliteDbPathDesc')}
                   </p>
                 </div>
                 <div className="mb-4">
