@@ -5,8 +5,11 @@ import {
   Menu,
   nativeImage,
   nativeTheme,
+  ipcMain,
+  net,
 } from 'electron'
 import path from 'node:path'
+import electronUpdater from 'electron-updater'
 
 import { bindElectronFetch } from '../../src/lib/electron-fetch'
 import type {
@@ -34,6 +37,9 @@ import {
   readSettingsSync,
   setLaunchAtLoginFallback,
 } from './settings-store'
+import { applySettingsEnvOverrides } from './settings-env'
+import { createUpdateManager } from './update-manager'
+import { checkReleaseUpdate } from './release-update'
 
 const CLI_ENV_FLAGS = {
   '--api-home': 'COPILOT_API_HOME',
@@ -69,6 +75,9 @@ const noProxyServerOverride = hasNoProxyServerSwitch(process.argv)
 const initialSettings = readSettingsSync()
 applySettingsEnvOverrides(initialSettings)
 applyElectronProxyCommandLine(getEffectiveProxySettings(initialSettings))
+// QUIC runs over UDP, which proxies and some networks cannot carry. Keep the
+// Chromium network stack (used through bindElectronFetch) on TCP.
+app.commandLine.appendSwitch('disable-quic')
 bindElectronFetch()
 
 function resolveNativeBackgroundColor(theme: ThemePreference): string {
@@ -100,22 +109,6 @@ function getEffectiveProxySettings(
 }
 
 let runtimeDependenciesPromise: Promise<RuntimeDependencies> | null = null
-
-function applySettingsEnvOverrides(settings: DesktopSettings): void {
-  const apiHome = settings.apiHome.trim()
-  if (!process.env.COPILOT_API_HOME && apiHome) {
-    process.env.COPILOT_API_HOME = apiHome
-  }
-
-  if (!process.env.COPILOT_API_OAUTH_APP && settings.oauthApp === 'opencode') {
-    process.env.COPILOT_API_OAUTH_APP = 'opencode'
-  }
-
-  const enterpriseUrl = settings.enterpriseUrl.trim()
-  if (!process.env.COPILOT_API_ENTERPRISE_URL && enterpriseUrl) {
-    process.env.COPILOT_API_ENTERPRISE_URL = enterpriseUrl
-  }
-}
 
 function warmOpencodeVersion(): void {
   void import('../../src/lib/opencode')
@@ -338,6 +331,50 @@ async function initializeApplication(): Promise<void> {
     await getRuntimeDependencies()
   const settings = await readSettings()
   await applyElectronProxy(getEffectiveProxySettings(settings))
+
+  const { autoUpdater } = electronUpdater
+  const updateManager = createUpdateManager(autoUpdater, {
+    currentVersion: app.getVersion(),
+    enabled: app.isPackaged,
+    // Unsigned macOS builds need manual DMG installation. Squirrel.Mac
+    // requires a signed app and a ZIP target for automatic installation.
+    nativeUpdates:
+      process.platform === 'win32'
+      || (process.platform === 'linux' && Boolean(process.env.APPIMAGE)),
+    checkRelease: () =>
+      checkReleaseUpdate(
+        (url, options) => net.fetch(url, options),
+        app.getVersion(),
+        process.platform,
+        process.arch,
+      ),
+    beforeInstall: async () => {
+      const { stopServer } = await getRuntimeDependencies()
+      await stopServer()
+      isQuitting = true
+    },
+    onStatus: (status) => {
+      if (status.phase === 'downloaded' && status.error) isQuitting = false
+      for (const window of BrowserWindow.getAllWindows()) {
+        if (!window.isDestroyed())
+          window.webContents.send('update:status', status)
+      }
+    },
+  })
+  ipcMain.handle('update:get-status', () => updateManager.getStatus())
+  ipcMain.handle('update:check', () => updateManager.check())
+  ipcMain.handle('update:install', () => updateManager.install())
+  if (app.isPackaged) {
+    const startupCheck = setTimeout(() => void updateManager.check(), 15_000)
+    const periodicCheck = setInterval(
+      () => void updateManager.check(),
+      6 * 60 * 60 * 1000,
+    )
+    app.once('before-quit', () => {
+      clearTimeout(startupCheck)
+      clearInterval(periodicCheck)
+    })
+  }
 
   const launchedAtLogin = wasLaunchedAtLogin(app)
 

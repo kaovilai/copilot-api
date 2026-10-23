@@ -24,7 +24,7 @@ export interface ChatCompletionChunk {
       accepted_prediction_tokens: number
       rejected_prediction_tokens: number
     }
-  }
+  } | null
 }
 
 export interface Delta {

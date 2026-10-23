@@ -1,6 +1,14 @@
 import { createHash } from "node:crypto"
 
+import {
+  getProviderModelConfig,
+  resolveProviderModelsDevId,
+} from "~/lib/provider-model-catalog"
 import { compactTextOnlyGuard } from "~/lib/compact"
+import { findEndpointModel } from "~/lib/models"
+import { getModelsDevModelMaxOutputTokens } from "~/lib/models-dev-cache"
+import { getRawProviderConfig } from "~/lib/provider-config"
+import { parseProviderModelAlias } from "~/lib/provider-model"
 import { requestContext } from "~/lib/request-context"
 import type {
   AnthropicAssistantContentBlock,
@@ -30,6 +38,7 @@ import type {
   Reasoning,
   ResponsesPayload,
   ResponsesResult,
+  ResponsesTextFormat,
   ResponseUsage,
 } from "~/lib/types/responses"
 
@@ -59,14 +68,47 @@ export const MESSAGES_COMPACTION_PROMPT = [
 
 export const MESSAGES_TOOL_CALL_TIPS = [
   "# Tool Call Tips",
-  "- Do NOT call `exec_command` directly; that tool does not exist. Use `functions__exec` to run commands instead.",
-  '- The functions__exec tool accepts parameters only as {"input":"..."}; put the complete executable code inside input, including properly constructed tools.exec_command(...) calls and text(...) output handling.',
+  "- Do NOT call `exec_command` directly; that tool does not exist. Use `functions.exec` (tool name: `exec`) to run commands instead.",
+  '- The functions.exec tool accepts parameters only as {"input":"..."}; put the complete executable code inside input, including properly constructed tools.exec_command(...) calls and text(...) output handling.',
   "- Construct all tools.exec_command(...) arguments strictly according to its tool definition, and use OS/shell-compatible commands for Windows, Linux, and macOS.",
   "- Always assign the awaited tools.exec_command(...) call to a variable and forward the full result with text(JSON.stringify(r)); unforwarded output is silently dropped and makes results look empty.",
-  "- Yielded execution is not truncated output. Resume a running `cell_id` with `functions.wait`, and a live `session_id` with `tools.write_stdin`, until the command reaches a terminal result.",
+  "- Yielded execution is not truncated output. Resume a running `cell_id` with `functions.wait` (tool name: `wait`), and a live `session_id` with `tools.write_stdin`, until the command reaches a terminal result.",
   "- Read files with the OS-native command (Get-Content/Test-Path on Windows PowerShell, cat/ls on POSIX), quote paths containing spaces, and verify the forwarded output is non-empty before concluding a file was read.",
   "- For long-running commands, keep the returned `session_id` and poll it with `tools.write_stdin` until the command finishes; do not redirect output to a temp file and read it back in a second call.",
+  "- If `functions.exec` returns `aborted`, retry at most 3 times. After 3 failures, terminate immediately and inform the user that `functions.exec` is unavailable.",
 ].join("\n")
+
+const MESSAGES_BATCH_TOOL_CALL_TIPS = [
+  "- Parallel tool calls are disabled for this request. Batch independent commands in one functions.exec call; keep dependent operations sequential.",
+  'const results = await Promise.allSettled([tools.exec_command({cmd: "git status --short"})]); for (const result of results) text(JSON.stringify(result.status === "fulfilled" ? result.value : {error: String(result.reason)}))',
+].join("\n")
+
+const JSON_OUTPUT_CONSTRAINT =
+  "Do not wrap the JSON in markdown code fences and do not add any text outside the JSON object."
+
+export const buildOutputFormatInstruction = (
+  format: ResponsesTextFormat | null | undefined,
+): string | null => {
+  if (!format) return null
+
+  if (format.type === "json_schema") {
+    return [
+      `Respond with a single JSON object that strictly matches the "${format.name}" JSON schema below.`,
+      JSON_OUTPUT_CONSTRAINT,
+      "",
+      "JSON schema:",
+      JSON.stringify(format.schema, null, 2),
+    ].join("\n")
+  }
+
+  if (format.type === "json_object") {
+    return ["Respond with a single JSON object.", JSON_OUTPUT_CONSTRAINT].join(
+      "\n",
+    )
+  }
+
+  return null
+}
 
 const COMPACTION_REPLAY_PROMPT =
   "The previous conversation was compacted. Continue from this handoff summary:\n\n"
@@ -132,15 +174,27 @@ export function translateResponsesToMessages(
   payload: ResponsesPayload,
   options: { model: string; publicModel?: string; toolCallTips?: boolean },
 ): ResponsesToMessagesTranslation {
-  const registry = createToolRegistry(payload)
+  removeWebSearchTool(payload)
+  const registry = createToolRegistry(payload, options.model)
   const normalized = normalizeResponsesInput(payload.input)
+  const outputFormatInstruction = buildOutputFormatInstruction(
+    payload.text?.format,
+  )
+  // The tips describe the code-mode `functions.exec` wrapper, so they are
+  // wrong for clients that expose `exec_command` as a real tool.
+  const toolCallTips =
+    (options.toolCallTips ?? false) && !hasExecCommandTool(payload)
   const { messages, system } = translateInputToAnthropic(
     normalized.input,
     registry,
     payload.instructions,
     payload.input,
-    options.toolCallTips ?? false,
+    toolCallTips,
   )
+
+  if (toolCallTips && payload.parallel_tool_calls === false) {
+    appendToolCallTips(system, MESSAGES_BATCH_TOOL_CALL_TIPS)
+  }
 
   if (normalized.compaction) {
     messages.push({ role: "user", content: MESSAGES_COMPACTION_PROMPT })
@@ -152,6 +206,10 @@ export function translateResponsesToMessages(
     )
   }
 
+  if (outputFormatInstruction) {
+    messages.push({ role: "user", content: outputFormatInstruction })
+  }
+
   applyEphemeralCacheControl(messages, system)
 
   const reasoningEffort = translateReasoningEffort(payload.reasoning?.effort)
@@ -159,7 +217,12 @@ export function translateResponsesToMessages(
   const messagesPayload: AnthropicMessagesPayload = {
     model: options.model,
     messages,
-    max_tokens: Math.max(1, payload.max_output_tokens ?? 32_000),
+    // Codex does not send the catalog's max_output_tokens; Messages requires
+    // an explicit max_tokens value, so resolve the default in the adapter.
+    max_tokens: Math.max(
+      1,
+      payload.max_output_tokens ?? resolveDefaultMaxOutputTokens(options.model),
+    ),
     stream: payload.stream ?? false,
     temperature: payload.temperature ?? undefined,
     top_p: payload.top_p ?? undefined,
@@ -179,6 +242,17 @@ export function translateResponsesToMessages(
     ...(metadataUserId ? { metadata: { user_id: metadataUserId } } : {}),
   }
 
+  if (
+    payload.parallel_tool_calls != null
+    && registry.tools.length > 0
+    && messagesPayload.tool_choice?.type !== "none"
+  ) {
+    messagesPayload.tool_choice = {
+      ...(messagesPayload.tool_choice ?? { type: "auto" }),
+      disable_parallel_tool_use: !payload.parallel_tool_calls,
+    }
+  }
+
   return {
     compaction: normalized.compaction,
     messagesPayload,
@@ -186,6 +260,37 @@ export function translateResponsesToMessages(
     publicModel: options.publicModel ?? payload.model,
     registry,
   }
+}
+
+function resolveDefaultMaxOutputTokens(model: string): number {
+  const alias = parseProviderModelAlias(model)
+  const providerConfig = alias ? getRawProviderConfig(alias.provider) : null
+  const catalogMaxOutputTokens =
+    alias ?
+      getModelsDevModelMaxOutputTokens(
+        resolveProviderModelsDevId(alias.provider, providerConfig),
+        alias.model,
+      )
+    : undefined
+  const builtinModelConfig =
+    alias ?
+      getProviderModelConfig(alias.provider, alias.model, providerConfig)
+    : undefined
+  const tokenLimits =
+    alias && (providerConfig || builtinModelConfig || catalogMaxOutputTokens) ?
+      [
+        providerConfig?.models?.[alias.model]?.maxOutputTokens,
+        catalogMaxOutputTokens,
+        builtinModelConfig?.maxOutputTokens,
+      ]
+    : [findEndpointModel(model)?.capabilities.limits.max_output_tokens]
+
+  return (
+    tokenLimits.find(
+      (limit): limit is number =>
+        typeof limit === "number" && Number.isInteger(limit) && limit > 0,
+    ) ?? 32_000
+  )
 }
 
 export function translateAnthropicToResponses(
@@ -371,7 +476,20 @@ function normalizeResponsesInput(
   }
 }
 
-function createToolRegistry(payload: ResponsesPayload): MessagesToolRegistry {
+function removeWebSearchTool(payload: ResponsesPayload): void {
+  if (!Array.isArray(payload.tools) || payload.tools.length === 0) return
+
+  payload.tools = payload.tools.filter((tool) => tool.type !== "web_search")
+}
+
+function createToolRegistry(
+  payload: ResponsesPayload,
+  model: string,
+): MessagesToolRegistry {
+  // Claude-family upstream models skip strict custom tools. Match the upstream
+  // model id only, so a provider prefix such as "claude-relay/" does not count.
+  const upstreamModel = parseProviderModelAlias(model)?.model ?? model
+  const strictCustomTools = !upstreamModel.toLowerCase().includes("claude")
   const registry: MessagesToolRegistry = {
     byAlias: new Map(),
     byOriginal: new Map(),
@@ -379,7 +497,7 @@ function createToolRegistry(payload: ResponsesPayload): MessagesToolRegistry {
   }
 
   for (const tool of payload.tools ?? []) {
-    registerTool(tool, registry)
+    registerTool(tool, registry, strictCustomTools)
   }
 
   if (Array.isArray(payload.input)) {
@@ -387,17 +505,48 @@ function createToolRegistry(payload: ResponsesPayload): MessagesToolRegistry {
       const type = getItemType(item)
       if (type !== "additional_tools") continue
       for (const tool of getArrayField(item, "tools")) {
-        registerTool(tool, registry)
+        registerTool(tool, registry, strictCustomTools)
       }
+      break
     }
   }
 
   return registry
 }
 
+const EXEC_COMMAND_TOOL_NAME = "exec_command"
+
+/**
+ * Reports whether the request exposes a direct `exec_command` tool, at the top
+ * level, inside a namespace, or through `input.additional_tools`. The
+ * additional_tools items are scanned in place, so no tool list is copied.
+ */
+function hasExecCommandTool(payload: ResponsesPayload): boolean {
+  if ((payload.tools ?? []).some(isExecCommandTool)) return true
+  if (!Array.isArray(payload.input)) return false
+
+  for (const item of payload.input) {
+    if (getItemType(item) !== "additional_tools") continue
+    if (getArrayField(item, "tools").some(isExecCommandTool)) return true
+    break
+  }
+  return false
+}
+
+function isExecCommandTool(tool: unknown): boolean {
+  if (getStringField(tool, "name") === EXEC_COMMAND_TOOL_NAME) return true
+  if (!isNamespaceTool(tool)) return false
+  return tool.tools.some(isExecCommandTool)
+}
+
+function isNamespaceTool(tool: unknown): tool is NamespaceTool {
+  return getStringField(tool, "type") === "namespace"
+}
+
 function registerTool(
   tool: unknown,
   registry: MessagesToolRegistry,
+  strictCustomTools: boolean,
   namespaces: Array<string> = [],
 ): void {
   if (!isRecord(tool)) {
@@ -416,7 +565,10 @@ function registerTool(
       )
     }
     for (const child of namespaceTool.tools) {
-      registerTool(child, registry, [...namespaces, namespace])
+      registerTool(child, registry, strictCustomTools, [
+        ...namespaces,
+        namespace,
+      ])
     }
     return
   }
@@ -447,12 +599,14 @@ function registerTool(
         : null,
     },
     registry,
+    strictCustomTools,
   )
 }
 
 function registerMessagesTool(
   registration: ToolRegistration,
   registry: MessagesToolRegistry,
+  strictCustomTools: boolean,
 ): MessagesToolDescriptor {
   const originalKey = createOriginalToolKey(registration)
   const existing = registry.byOriginal.get(originalKey)
@@ -470,7 +624,9 @@ function registerMessagesTool(
       registration.kind === "custom" ?
         CUSTOM_TOOL_INPUT_SCHEMA
       : (registration.parameters ?? { type: "object", properties: {} }),
-    ...(registration.kind === "custom" ? { strict: true } : {}),
+    ...(registration.kind === "custom" && strictCustomTools ?
+      { strict: true }
+    : {}),
   })
   return descriptor
 }
@@ -481,7 +637,7 @@ function createMessagesToolDescriptor(
 ): MessagesToolDescriptor {
   const originalKey = createOriginalToolKey(registration)
   const preferredName =
-    registration.namespace ?
+    registration.namespace && registration.namespace !== "functions" ?
       `${registration.namespace.replaceAll(".", "_")}__${registration.name}`
     : registration.name
   const alias = createToolAlias(preferredName, originalKey, registry)
@@ -521,13 +677,16 @@ function translateInputToAnthropic(
   return { messages, system }
 }
 
-function appendToolCallTips(system: Array<AnthropicTextBlock>): void {
+function appendToolCallTips(
+  system: Array<AnthropicTextBlock>,
+  tips = MESSAGES_TOOL_CALL_TIPS,
+): void {
   const lastSystemBlock = system.at(-1)
   if (!lastSystemBlock) {
-    system.push({ type: "text", text: MESSAGES_TOOL_CALL_TIPS })
+    system.push({ type: "text", text: tips })
     return
   }
-  lastSystemBlock.text = `${lastSystemBlock.text}\n\n${MESSAGES_TOOL_CALL_TIPS}`
+  lastSystemBlock.text = `${lastSystemBlock.text}\n\n${tips}`
 }
 
 function translateInputItems(
@@ -706,7 +865,7 @@ function translateInputToolCall(
   const toolIdentity = { kind, name, namespace }
   // Historical calls preserve conversation state; they do not define tools.
   const descriptor =
-    registry.byOriginal.get(createOriginalToolKey(toolIdentity))
+    findOriginalDescriptor(registry, kind, name, namespace)
     ?? createMessagesToolDescriptor(toolIdentity, registry)
   const input =
     kind === "custom" ?
@@ -918,7 +1077,7 @@ function translateToolChoice(
   toolChoice: ResponsesPayload["tool_choice"],
   registry: MessagesToolRegistry,
 ): AnthropicMessagesPayload["tool_choice"] {
-  if (!toolChoice) return undefined
+  if (!toolChoice || registry.tools.length === 0) return undefined
   if (typeof toolChoice === "string") {
     if (toolChoice === "required") return { type: "any" }
     return { type: toolChoice }
@@ -1176,18 +1335,13 @@ function findOriginalDescriptor(
   name: string,
   namespace?: string,
 ): MessagesToolDescriptor | undefined {
-  const matches: Array<MessagesToolDescriptor> = []
-  for (const descriptor of registry.byOriginal.values()) {
-    if (descriptor.kind !== kind || descriptor.name !== name) continue
-    if (namespace !== undefined) {
-      if (descriptor.namespace === namespace) return descriptor
-      continue
-    }
-    matches.push(descriptor)
-  }
   return (
-    matches.find((descriptor) => descriptor.namespace === undefined)
-    ?? (matches.length === 1 ? matches[0] : undefined)
+    registry.byOriginal.get(createOriginalToolKey({ kind, name, namespace }))
+    ?? (!namespace ?
+      registry.byOriginal.get(
+        createOriginalToolKey({ kind, name, namespace: "functions" }),
+      )
+    : undefined)
   )
 }
 

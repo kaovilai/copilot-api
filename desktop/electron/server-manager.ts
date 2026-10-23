@@ -1,10 +1,15 @@
 import { utilityProcess, app } from 'electron'
-import type { UtilityProcess } from 'electron'
+import childProcess from 'node:child_process'
+import type { EventEmitter } from 'node:events'
 import net from 'node:net'
 import path from 'node:path'
 import { StringDecoder } from 'node:string_decoder'
 
-import type { DesktopProxySettings, ServerStatus } from '../src/types/ipc'
+import type {
+  DesktopProxySettings,
+  ServerRuntime,
+  ServerStatus,
+} from '../src/types/ipc'
 import {
   DEFAULT_SERVER_HOST,
   formatServerUrl,
@@ -13,10 +18,17 @@ import {
   resolveClientHostnameOrDefault,
 } from '../../src/lib/server-host'
 import { applyDesktopProxySettingsToEnv } from './electron-proxy-config'
+import { detectBunRuntime } from './bun-runtime'
 import { tMain } from './i18n'
-import { buildServerStartArgs } from './server-start-args'
+import { buildServerStartArgs, buildServerStartEnv } from './server-start-args'
 
-let serverProcess: UtilityProcess | null = null
+interface ServerProcess extends EventEmitter {
+  stdout: NodeJS.ReadableStream | null
+  stderr: NodeJS.ReadableStream | null
+  kill: (signal?: NodeJS.Signals) => boolean
+}
+
+let serverProcess: ServerProcess | null = null
 let currentPort = 4141
 let currentHost = ''
 let statusCallback: ((status: ServerStatus) => void) | null = null
@@ -181,15 +193,17 @@ function getServerPath(): string {
   return path.join(app.getAppPath(), '..', 'dist', 'main.js')
 }
 
+interface ServerStartOptions {
+  runtime?: ServerRuntime
+  verbose?: boolean
+  showToken?: boolean
+  host?: string
+  proxy?: DesktopProxySettings
+}
+
 export async function startServer(
   port: number,
-  githubToken: string | null,
-  serverOptions?: {
-    verbose?: boolean
-    showToken?: boolean
-    host?: string
-    proxy?: DesktopProxySettings
-  },
+  serverOptions?: ServerStartOptions,
 ): Promise<ServerStatus> {
   const host = serverOptions?.host?.trim() ?? ''
   let bindHostname: string
@@ -201,6 +215,9 @@ export async function startServer(
       error: await tMain('server.invalidHost'),
     }
   }
+  // Resolve the runtime before stopping a healthy server. Never use an old Bun.
+  const bun =
+    serverOptions?.runtime !== 'node' ? await detectBunRuntime() : null
   // Validate the host before touching a running server, so an invalid host
   // never stops a healthy instance.
   // When the port changes, a conflicting listener cannot be our own
@@ -224,12 +241,41 @@ export async function startServer(
     }
   }
 
-  // Stop the previous instance first, so its own listener is never reported as
-  // a conflicting process holding the port.
-  if (serverProcess) {
-    await stopServer()
+  const restarting = serverProcess !== null
+  if (restarting) {
+    statusCallback?.({ running: false, restarting: true })
   }
 
+  try {
+    // A planned restart must not emit an unexpected-stop event.
+    await stopServerProcess(false)
+    const status = await launchServer(
+      port,
+      host,
+      bindHostname,
+      serverOptions,
+      bun,
+    )
+    if (status.running || restarting) statusCallback?.(status)
+    return status
+  } catch (error) {
+    if (restarting) {
+      statusCallback?.({
+        running: false,
+        error: error instanceof Error ? error.message : String(error),
+      })
+    }
+    throw error
+  }
+}
+
+async function launchServer(
+  port: number,
+  host: string,
+  bindHostname: string,
+  serverOptions?: ServerStartOptions,
+  bun?: Awaited<ReturnType<typeof detectBunRuntime>> | null,
+): Promise<ServerStatus> {
   const probe = await checkPortAvailable(port, bindHostname)
   if (!probe.available) {
     if (isInvalidBindErrorCode(probe.code)) {
@@ -247,21 +293,7 @@ export async function startServer(
   // Clear the previous log buffer before each new server start.
   logBuffer.length = 0
 
-  const env: NodeJS.ProcessEnv = {
-    ...process.env,
-    NODE_ENV: 'production',
-  }
-  const normalizedGithubToken = githubToken?.trim()
-  if (normalizedGithubToken) {
-    // Never pass the token as an argument: process arguments are readable by
-    // every local user through the process list.
-    env.COPILOT_API_GITHUB_TOKEN = normalizedGithubToken
-  } else {
-    // Drop any inherited value, otherwise a token exported in the shell that
-    // launched the app would silently switch the server to Copilot mode and
-    // ignore the configured providers.
-    delete env.COPILOT_API_GITHUB_TOKEN
-  }
+  const env = buildServerStartEnv(process.env)
   const proxyEnabled =
     serverOptions?.proxy ?
       applyDesktopProxySettingsToEnv(env, serverOptions.proxy)
@@ -273,13 +305,31 @@ export async function startServer(
   if (serverOptions?.verbose) args.push('--verbose')
   if (serverOptions?.showToken) args.push('--show-token')
 
-  // utilityProcess.fork is an official Electron API and does not start another
-  // Electron instance, so packaged macOS builds do not show a second Dock icon.
-  const proc = utilityProcess.fork(serverPath, args, {
-    env,
-    stdio: 'pipe',
-    serviceName: 'copilot-api-server',
-  })
+  if (bun && !bun.available) emitLog(await tMain('server.bunFallback'))
+  emitLog(
+    await tMain('server.runtime', {
+      runtime: bun?.available ? `Bun ${bun.version}` : 'Node.js (Electron)',
+    }),
+  )
+
+  // Launch the bundled server directly; bunx would install an unrelated npm build.
+  // The Node option keeps Electron's utility process and its bundled runtime.
+  const proc: ServerProcess =
+    bun?.available && bun.path ?
+      childProcess.spawn(
+        bun.path,
+        ['--no-orphans', '--no-install', serverPath, ...args],
+        {
+          env,
+          stdio: ['ignore', 'pipe', 'pipe'],
+          windowsHide: true,
+        },
+      )
+    : utilityProcess.fork(serverPath, args, {
+        env,
+        stdio: 'pipe',
+        serviceName: 'copilot-api-server',
+      })
   serverProcess = proc
 
   // Decode streamed UTF-8 safely so chunk boundaries do not corrupt Chinese or box-drawing characters.
@@ -296,19 +346,25 @@ export async function startServer(
   // Wait for the server to become ready while also detecting early process exit.
   const startResult = await waitForServer(host, port, proc)
   if (!startResult.ok) {
-    proc.kill()
+    await waitForProcessExit(proc)
+    stdoutLogStream.flush()
+    stderrLogStream.flush()
     if (serverProcess === proc) {
       serverProcess = null
     }
     const msg =
-      startResult.exitCode !== undefined ?
+      startResult.error ?
+        await tMain('server.spawnFailed', {
+          message: startResult.error.message,
+        })
+      : startResult.exitCode !== undefined ?
         await tMain('server.startFailed', { code: startResult.exitCode })
       : await tMain('server.startTimeout', { port })
     return { running: false, error: msg }
   }
 
   // Register the runtime exit handler only after startup succeeds.
-  proc.on('exit', (code) => {
+  proc.on('exit', (code: number | null) => {
     stdoutLogStream.flush()
     stderrLogStream.flush()
     if (serverProcess !== proc) return
@@ -329,34 +385,43 @@ export async function startServer(
       },
     )
   })
+  proc.on('error', (error: Error) => emitLog(error.message))
 
   currentPort = port
   currentHost = host
 
-  return { running: true, port, host }
+  const status: ServerStatus = { running: true, port, host }
+  return status
 }
 
 // Wait for server readiness or process exit, whichever happens first.
 async function waitForServer(
   host: string,
   port: number,
-  proc: UtilityProcess,
-): Promise<{ ok: boolean; exitCode?: number }> {
+  proc: ServerProcess,
+): Promise<{ ok: boolean; exitCode?: number; error?: Error }> {
   return new Promise((resolve) => {
     let settled = false
 
-    const finish = (result: { ok: boolean; exitCode?: number }) => {
+    const finish = (result: {
+      ok: boolean
+      exitCode?: number
+      error?: Error
+    }) => {
       if (settled) return
       settled = true
       proc.removeListener('exit', onExit)
+      proc.removeListener('error', onError)
       resolve(result)
     }
 
-    const onExit = (code: number) => {
+    const onExit = (code: number | null) => {
       finish({ ok: false, exitCode: code ?? undefined })
     }
+    const onError = (error: Error) => finish({ ok: false, error })
 
     proc.once('exit', onExit)
+    proc.once('error', onError)
 
     ;(async () => {
       const url = `${formatServerUrl(resolveClientHostnameOrDefault(host), port)}/`
@@ -378,35 +443,51 @@ async function waitForServer(
   })
 }
 
-function waitForProcessExit(proc: UtilityProcess): Promise<void> {
+function waitForProcessExit(proc: ServerProcess): Promise<void> {
   return new Promise((resolve) => {
     let settled = false
+    let forceTimeout: ReturnType<typeof setTimeout> | undefined
 
     const finish = () => {
       if (settled) return
       settled = true
       clearTimeout(timeout)
+      clearTimeout(forceTimeout)
       proc.removeListener('exit', onExit)
       resolve()
     }
 
     const onExit = () => finish()
-    const timeout = setTimeout(finish, STOP_TIMEOUT_MS)
+    const timeout = setTimeout(() => {
+      // External Bun processes can ignore SIGTERM; do not leave a server behind.
+      if ('exitCode' in proc) {
+        forceTimeout = setTimeout(finish, 1000)
+        if (!proc.kill('SIGKILL')) finish()
+      } else {
+        finish()
+      }
+    }, STOP_TIMEOUT_MS)
 
     proc.once('exit', onExit)
     if (!proc.kill()) finish()
   })
 }
 
-export async function stopServer(): Promise<void> {
+async function stopServerProcess(notifyStatus: boolean): Promise<void> {
   if (!serverProcess) return
   const proc = serverProcess
+  // Ignore the runtime exit handler for a process we deliberately stop,
+  // including nonzero exit codes produced by termination on Windows.
+  serverProcess = null
   await waitForProcessExit(proc)
 
-  if (serverProcess === proc) {
-    serverProcess = null
-    statusCallback?.({ running: false })
+  if (notifyStatus && !serverProcess) {
+    statusCallback?.({ running: false, intentional: true })
   }
+}
+
+export async function stopServer(): Promise<void> {
+  await stopServerProcess(true)
 }
 
 export function isRunning(): boolean {

@@ -80,8 +80,6 @@ const emptySessionUserId = JSON.stringify({
   session_id: "",
 })
 
-const subagentAgentId = "agent-123"
-
 const translateThinking = (thinking: string): ResponseInputReasoning => {
   const result = translateAnthropicMessagesToResponsesPayload({
     ...samplePayload,
@@ -159,6 +157,302 @@ describe("translateAnthropicMessagesToResponsesPayload", () => {
     ])
   })
 
+  it.each([1024, 32768])(
+    "uses concise reasoning and omits the output token limit for Grok with max_tokens %i",
+    (maxTokens) => {
+      const result = translateAnthropicMessagesToResponsesPayload({
+        model: "grok-4",
+        max_tokens: maxTokens,
+        output_config: { effort: "high" },
+        messages: [{ role: "user", content: "Hello" }],
+      })
+
+      expect(result.reasoning).toMatchObject({
+        effort: "high",
+        summary: "concise",
+      })
+      expect(result).not.toHaveProperty("max_output_tokens")
+    },
+  )
+
+  it("preserves Grok text arrays, message phase and tool status", () => {
+    const result = translateAnthropicMessagesToResponsesPayload({
+      model: "grok-4",
+      max_tokens: 1024,
+      top_p: 0.8,
+      messages: [
+        {
+          role: "user",
+          content: [{ type: "text", text: "Review the commit." }],
+        },
+        {
+          role: "assistant",
+          content: [
+            {
+              type: "text",
+              text: "I am Codex. I will review the latest commit.",
+            },
+            {
+              type: "tool_use",
+              id: "call_review",
+              name: "read_commit",
+              input: {},
+            },
+          ],
+        },
+        { role: "assistant", content: [{ type: "text", text: "" }] },
+      ],
+    })
+
+    expect(result).not.toHaveProperty("temperature")
+    expect(result).not.toHaveProperty("top_p")
+    expect(result.include).toEqual(["reasoning.encrypted_content"])
+    expect(result.input).toEqual([
+      {
+        type: "message",
+        role: "user",
+        content: [{ type: "input_text", text: "Review the commit." }],
+      },
+      {
+        type: "message",
+        role: "assistant",
+        content: [
+          {
+            type: "output_text",
+            text: "I am Codex. I will review the latest commit.",
+          },
+        ],
+        phase: "commentary",
+      },
+      {
+        type: "function_call",
+        call_id: "call_review",
+        name: "read_commit",
+        arguments: "{}",
+        status: "completed",
+      },
+      {
+        type: "message",
+        role: "assistant",
+        content: [{ type: "output_text", text: "" }],
+        phase: "final_answer",
+      },
+    ])
+  })
+
+  it.each([
+    { system: "Review carefully." },
+    {
+      system: [
+        { type: "text" as const, text: "Review carefully." },
+        { type: "text" as const, text: "Preserve details." },
+      ],
+    },
+  ])(
+    "moves Grok instructions to the first system message for %j",
+    ({ system }) => {
+      const result = translateAnthropicMessagesToResponsesPayload({
+        model: "grok-4",
+        max_tokens: 1024,
+        system,
+        messages: [{ role: "user", content: "First request" }],
+      })
+
+      expect(result).not.toHaveProperty("instructions")
+      const input = result.input as Array<ResponseInputMessage>
+      expect(input).toHaveLength(2)
+      expect(input[0]).toMatchObject({
+        type: "message",
+        role: "system",
+      })
+      expect(typeof input[0].content).toBe("string")
+      expect(input[0].content).toContain("Review carefully.")
+      expect(input[1]).toEqual({
+        type: "message",
+        role: "user",
+        content: "First request",
+      })
+      if (Array.isArray(system)) {
+        expect(input[0].content).toContain("Preserve details.")
+      }
+    },
+  )
+
+  it("preserves multiple text blocks, image blocks and strings for Grok", () => {
+    const result = translateAnthropicMessagesToResponsesPayload({
+      model: "grok-4",
+      max_tokens: 1024,
+      messages: [
+        {
+          role: "assistant",
+          content: [
+            { type: "text", text: "First block" },
+            { type: "text", text: "Second block" },
+          ],
+        },
+        {
+          role: "user",
+          content: [
+            {
+              type: "image",
+              source: {
+                type: "base64",
+                media_type: "image/png",
+                data: "image-data",
+              },
+            },
+          ],
+        },
+        { role: "user", content: "Already a string" },
+        { role: "assistant", content: [] },
+      ],
+    })
+
+    expect(result).not.toHaveProperty("instructions")
+    expect(result.input).toEqual([
+      {
+        type: "message",
+        role: "assistant",
+        content: [
+          { type: "output_text", text: "First block" },
+          { type: "output_text", text: "Second block" },
+        ],
+        phase: "final_answer",
+      },
+      {
+        type: "message",
+        role: "user",
+        content: [
+          {
+            type: "input_image",
+            image_url: "data:image/png;base64,image-data",
+            detail: "auto",
+          },
+        ],
+      },
+      { type: "message", role: "user", content: "Already a string" },
+    ])
+  })
+
+  it.each([
+    { texts: ["exit  "] },
+    { texts: [""] },
+    { texts: ["First line", "Second line  "] },
+    { texts: [] },
+  ])("preserves Grok tool output text arrays for %j", ({ texts }) => {
+    const result = translateAnthropicMessagesToResponsesPayload({
+      model: "grok-4",
+      max_tokens: 1024,
+      messages: [
+        {
+          role: "user",
+          content: [
+            {
+              type: "tool_result",
+              tool_use_id: "call_review",
+              content: texts.map((text) => ({ type: "text", text })),
+              is_error: true,
+            },
+          ],
+        },
+      ],
+    })
+
+    expect(result.input).toEqual([
+      {
+        type: "function_call_output",
+        call_id: "call_review",
+        output: texts.map((text) => ({ type: "input_text", text })),
+        status: "incomplete",
+      },
+    ])
+  })
+
+  it.each([false, true])(
+    "preserves Grok tool output images with text included: %j",
+    (includeText) => {
+      const result = translateAnthropicMessagesToResponsesPayload({
+        model: "grok-4",
+        max_tokens: 1024,
+        messages: [
+          {
+            role: "user",
+            content: [
+              {
+                type: "tool_result",
+                tool_use_id: "call_image",
+                content: [
+                  ...(includeText ?
+                    [{ type: "text" as const, text: "Image result" }]
+                  : []),
+                  {
+                    type: "image",
+                    source: {
+                      type: "base64",
+                      media_type: "image/png",
+                      data: "image-data",
+                    },
+                  },
+                ],
+              },
+            ],
+          },
+        ],
+      })
+
+      expect(result.input).toEqual([
+        {
+          type: "function_call_output",
+          call_id: "call_image",
+          output: [
+            ...(includeText ?
+              [{ type: "input_text", text: "Image result" }]
+            : []),
+            {
+              type: "input_image",
+              image_url: "data:image/png;base64,image-data",
+              detail: "auto",
+            },
+          ],
+          status: "completed",
+        },
+      ])
+    },
+  )
+
+  it.each(["gpt-5.4", "claude-3-5-sonnet"])(
+    "preserves single text content arrays for %s",
+    (model) => {
+      const result = translateAnthropicMessagesToResponsesPayload({
+        model,
+        max_tokens: 1024,
+        messages: [
+          { role: "user", content: [{ type: "text", text: "Hello" }] },
+          { role: "assistant", content: [{ type: "text", text: "Hi" }] },
+        ],
+      })
+
+      expect(result.temperature).toBe(1)
+      expect(result.top_p).toBeNull()
+      expect(result.max_output_tokens).toBe(12800)
+      expect(result.reasoning?.summary).toBe("auto")
+      expect(result.include).toEqual(["reasoning.encrypted_content"])
+      expect(result.input).toEqual([
+        {
+          type: "message",
+          role: "user",
+          content: [{ type: "input_text", text: "Hello" }],
+        },
+        {
+          type: "message",
+          role: "assistant",
+          content: [{ type: "output_text", text: "Hi" }],
+          phase: "final_answer",
+        },
+      ])
+    },
+  )
+
   it("extracts identifiers from JSON-like user_id metadata", () => {
     const result = translateAnthropicMessagesToResponsesPayload({
       ...samplePayload,
@@ -171,22 +465,34 @@ describe("translateAnthropicMessagesToResponsesPayload", () => {
     expect(result.prompt_cache_key).toBe("2c4e1cf0-7a67-4d2e-9a4b-1d16d3f44752")
   })
 
-  it("appends subagent agent_id to metadata prompt cache key", () => {
-    const result = translateAnthropicMessagesToResponsesPayload(
-      {
+  it.each([undefined, "agent-a", "agent-b"])(
+    "shares the metadata cache key between main and subagents (%s)",
+    (agentId) => {
+      const result = translateAnthropicMessagesToResponsesPayload({
         ...samplePayload,
-        metadata: {
-          user_id: jsonStyleUserId,
-        },
+        metadata: { user_id: jsonStyleUserId },
         tools: sampleTools,
-      },
-      ` ${subagentAgentId} `,
-    )
+        messages: [
+          {
+            role: "user",
+            content: [
+              {
+                type: "text",
+                text:
+                  agentId ?
+                    `<system-reminder>__SUBAGENT_MARKER__${JSON.stringify({ session_id: "child", agent_id: agentId, agent_type: "Explore" })}</system-reminder>`
+                  : "hello",
+              },
+            ],
+          },
+        ],
+      })
 
-    expect(result.prompt_cache_key).toBe(
-      "2c4e1cf0-7a67-4d2e-9a4b-1d16d3f44752:agent:agent-123",
-    )
-  })
+      expect(result.prompt_cache_key).toBe(
+        "2c4e1cf0-7a67-4d2e-9a4b-1d16d3f44752",
+      )
+    },
+  )
 
   it("keeps legacy user_id parsing before JSON fallback", () => {
     const result = translateAnthropicMessagesToResponsesPayload({
@@ -220,31 +526,6 @@ describe("translateAnthropicMessagesToResponsesPayload", () => {
     )
 
     expect(result.prompt_cache_key).toBe("opencode-session")
-  })
-
-  it("appends subagent agent_id to session affinity fallback", () => {
-    const result = requestContext.run(
-      {
-        parentSessionId: undefined,
-        sessionAffinity: "opencode-session",
-        startTime: Date.now(),
-        traceId: "trace-123",
-        userAgent: "test",
-      },
-      () =>
-        translateAnthropicMessagesToResponsesPayload(
-          {
-            ...samplePayload,
-            metadata: {
-              user_id: emptySessionUserId,
-            },
-            tools: sampleTools,
-          },
-          ` ${subagentAgentId} `,
-        ),
-    )
-
-    expect(result.prompt_cache_key).toBe("opencode-session:agent:agent-123")
   })
 
   it("keeps unrelated system prompt text unchanged", () => {
@@ -310,60 +591,111 @@ describe("translateAnthropicMessagesToResponsesPayload", () => {
     ])
   })
 
-  it("ignores blank subagent agent_id", () => {
-    const result = translateAnthropicMessagesToResponsesPayload(
-      {
-        ...samplePayload,
-        metadata: {
-          user_id: jsonStyleUserId,
-        },
-        tools: sampleTools,
-      },
-      "   ",
-    )
-
-    expect(result.prompt_cache_key).toBe("2c4e1cf0-7a67-4d2e-9a4b-1d16d3f44752")
-  })
-
-  it("keeps prompt_cache_key null when only subagent agent_id is provided", () => {
-    const result = translateAnthropicMessagesToResponsesPayload(
-      {
-        ...samplePayload,
-        tools: sampleTools,
-      },
-      subagentAgentId,
-    )
+  it("keeps prompt_cache_key null when no session id is provided", () => {
+    const result = translateAnthropicMessagesToResponsesPayload({
+      ...samplePayload,
+      tools: sampleTools,
+    })
 
     expect(result.prompt_cache_key).toBeNull()
   })
 
-  it("omits prompt_cache_key when tools are missing", () => {
-    const result = translateAnthropicMessagesToResponsesPayload(
-      {
+  it.each([{ tools: undefined }, { tools: [] }])(
+    "omits prompt_cache_key when tools are %j",
+    ({ tools }) => {
+      const result = translateAnthropicMessagesToResponsesPayload({
         ...samplePayload,
         metadata: {
           user_id: jsonStyleUserId,
         },
-      },
-      subagentAgentId,
-    )
+        tools,
+      })
 
-    expect(result).not.toHaveProperty("prompt_cache_key")
+      expect(result).not.toHaveProperty("prompt_cache_key")
+    },
+  )
+
+  it("omits tool_choice when the request has no tools", () => {
+    const missingTools =
+      translateAnthropicMessagesToResponsesPayload(samplePayload)
+    const emptyTools = translateAnthropicMessagesToResponsesPayload({
+      ...samplePayload,
+      tools: [],
+      tool_choice: { type: "any" },
+    })
+
+    expect(missingTools.tools).toBeNull()
+    expect(missingTools).not.toHaveProperty("tool_choice")
+    expect(emptyTools.tools).toBeNull()
+    expect(emptyTools).not.toHaveProperty("tool_choice")
   })
 
-  it("omits prompt_cache_key when tools are empty", () => {
-    const result = translateAnthropicMessagesToResponsesPayload(
-      {
-        ...samplePayload,
-        metadata: {
-          user_id: jsonStyleUserId,
+  it("omits tool_choice when every tool is dropped in translation", () => {
+    const result = translateAnthropicMessagesToResponsesPayload({
+      model: "gpt-5.4",
+      max_tokens: 1024,
+      messages: [{ role: "user", content: "search tools" }],
+      tools: [
+        {
+          name: "mcp__tool_search__search",
+          description: "Search deferred tools",
+          input_schema: {
+            type: "object",
+            properties: {
+              names: { type: "string" },
+            },
+            required: ["names"],
+          },
         },
-        tools: [],
-      },
-      subagentAgentId,
-    )
+      ],
+    })
 
-    expect(result).not.toHaveProperty("prompt_cache_key")
+    expect(result.tools).toEqual([])
+    expect(result).not.toHaveProperty("tool_choice")
+  })
+
+  it.each(["grok-4", "gpt-5.4"])(
+    "respects Anthropic parallel tool settings for %s",
+    (model) => {
+      for (const disableParallelToolUse of [true, false, undefined]) {
+        const result = translateAnthropicMessagesToResponsesPayload({
+          ...samplePayload,
+          model,
+          tools: sampleTools,
+          tool_choice: {
+            type: "auto",
+            disable_parallel_tool_use: disableParallelToolUse,
+          },
+        })
+
+        expect(result.parallel_tool_calls).toBe(!disableParallelToolUse)
+      }
+    },
+  )
+
+  it("keeps a translated tool_choice when the request has tools", () => {
+    const defaultChoice = translateAnthropicMessagesToResponsesPayload({
+      ...samplePayload,
+      tools: sampleTools,
+    })
+    const namedChoice = translateAnthropicMessagesToResponsesPayload({
+      ...samplePayload,
+      tools: sampleTools,
+      tool_choice: { type: "tool", name: "getWeather" },
+    })
+    const requiredChoice = translateAnthropicMessagesToResponsesPayload({
+      ...samplePayload,
+      tools: sampleTools,
+      tool_choice: { type: "any" },
+    })
+
+    expect(defaultChoice.tools).not.toBeNull()
+    expect(defaultChoice.tool_choice).toBe("auto")
+    expect(namedChoice.tool_choice).toEqual({
+      type: "function",
+      name: "getWeather",
+    })
+    expect(requiredChoice.tool_choice).toBe("required")
   })
 
   it("maps tool_reference tool results into function_call_output text", () => {
@@ -644,46 +976,49 @@ describe("translateAnthropicMessagesToResponsesPayload", () => {
     ])
   })
 
-  it("maps bridge tool_use history into tool_search_call input items", () => {
-    const result = translateAnthropicMessagesToResponsesPayload({
-      model: "gpt-5.4",
-      max_tokens: 1024,
-      messages: [
-        {
-          role: "assistant",
-          content: [
-            {
-              type: "tool_use",
-              id: "call_search",
-              name: "mcp__tool_search__search",
-              input: { names: "mcp__fetch__fetch" },
-            },
-          ],
-        },
-      ],
-      tools: [
-        {
-          name: "mcp__tool_search__search",
-          input_schema: { type: "object" },
-        },
-        {
-          name: "mcp__fetch__fetch",
-          input_schema: { type: "object" },
-        },
-      ],
-    })
+  it.each(["mcp__tool_search__search", "tool_search_search"])(
+    "maps %s tool_use history into tool_search_call input items",
+    (bridgeName) => {
+      const result = translateAnthropicMessagesToResponsesPayload({
+        model: "gpt-5.4",
+        max_tokens: 1024,
+        messages: [
+          {
+            role: "assistant",
+            content: [
+              {
+                type: "tool_use",
+                id: "call_search",
+                name: bridgeName,
+                input: { names: "mcp__fetch__fetch" },
+              },
+            ],
+          },
+        ],
+        tools: [
+          {
+            name: bridgeName,
+            input_schema: { type: "object" },
+          },
+          {
+            name: "mcp__fetch__fetch",
+            input_schema: { type: "object" },
+          },
+        ],
+      })
 
-    const input = result.input as Array<ResponseToolSearchCallItem>
-    expect(input).toEqual([
-      {
-        type: "tool_search_call",
-        call_id: "call_search",
-        arguments: { names: ["mcp__fetch__fetch"] },
-        execution: "client",
-        status: "completed",
-      },
-    ])
-  })
+      const input = result.input as Array<ResponseToolSearchCallItem>
+      expect(input).toEqual([
+        {
+          type: "tool_search_call",
+          call_id: "call_search",
+          arguments: { names: ["mcp__fetch__fetch"] },
+          execution: "client",
+          status: "completed",
+        },
+      ])
+    },
+  )
 
   it("preserves namespace on deferred tool_use history", () => {
     const result = translateAnthropicMessagesToResponsesPayload({
@@ -721,47 +1056,6 @@ describe("translateAnthropicMessagesToResponsesPayload", () => {
         name: "get_shipping_eta",
         namespace: "get_shipping_eta",
         arguments: '{"order_id":"order_42"}',
-        status: "completed",
-      },
-    ])
-  })
-
-  it("accepts tool_search bridge aliases in tool_use history", () => {
-    const result = translateAnthropicMessagesToResponsesPayload({
-      model: "gpt-5.4",
-      max_tokens: 1024,
-      messages: [
-        {
-          role: "assistant",
-          content: [
-            {
-              type: "tool_use",
-              id: "call_search",
-              name: "tool_search_search",
-              input: { names: "mcp__fetch__fetch" },
-            },
-          ],
-        },
-      ],
-      tools: [
-        {
-          name: "tool_search_search",
-          input_schema: { type: "object" },
-        },
-        {
-          name: "mcp__fetch__fetch",
-          input_schema: { type: "object" },
-        },
-      ],
-    })
-
-    const input = result.input as Array<ResponseToolSearchCallItem>
-    expect(input).toEqual([
-      {
-        type: "tool_search_call",
-        call_id: "call_search",
-        arguments: { names: ["mcp__fetch__fetch"] },
-        execution: "client",
         status: "completed",
       },
     ])

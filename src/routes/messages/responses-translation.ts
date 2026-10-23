@@ -17,8 +17,7 @@ import {
   getReasoningEffortForModel,
   isGpt56OrAbove,
 } from "~/lib/config"
-import { requestContext } from "~/lib/request-context"
-import { parseUserIdMetadata } from "~/lib/utils"
+import { getPromptCacheKey } from "~/lib/utils"
 import {
   type ResponsesPayload,
   type ResponseInputCompaction,
@@ -66,7 +65,7 @@ import {
   type AnthropicUserContentBlock,
   type AnthropicUserMessage,
 } from "~/lib/types/anthropic"
-import { normalizeToolSchema, THINKING_TEXT } from "./non-stream-translation"
+import { normalizeToolSchema, THINKING_TEXT } from "./completions-translation"
 
 const MESSAGE_TYPE = "message"
 const COMPACTION_SIGNATURE_PREFIX = "cm1#"
@@ -79,25 +78,8 @@ const REASONING_SUMMARY_SEPARATOR_PATTERN = /\u00a0\n\n|\u2063\n\n/
 const resolveReasoningEffort = (payload: AnthropicMessagesPayload) =>
   payload.output_config?.effort ?? getReasoningEffortForModel(payload.model)
 
-const buildPromptCacheKey = (
-  basePromptCacheKey: string | null,
-  subagentAgentId?: string | null,
-): string | null => {
-  if (!basePromptCacheKey) {
-    return null
-  }
-
-  const normalizedSubagentAgentId = subagentAgentId?.trim() || null
-  if (!normalizedSubagentAgentId) {
-    return basePromptCacheKey
-  }
-
-  return `${basePromptCacheKey}:agent:${normalizedSubagentAgentId}`
-}
-
 export const translateAnthropicMessagesToResponsesPayload = (
   payload: AnthropicMessagesPayload,
-  subagentAgentId?: string | null,
 ): ResponsesPayload => {
   const input: Array<ResponseInputItem> = []
   const applyPhase = shouldApplyPhase(payload.model)
@@ -129,17 +111,7 @@ export const translateAnthropicMessagesToResponsesPayload = (
   )
 
   // Remove safetyIdentifier to align with vscode copilot
-  const { sessionId: metadataPromptCacheKey } = parseUserIdMetadata(
-    payload.metadata?.user_id,
-  )
-
-  const requestStore = requestContext.getStore()
-  const sessionAffinity = requestStore?.sessionAffinity?.trim() || null
-  const basePromptCacheKey = metadataPromptCacheKey ?? sessionAffinity
-  const promptCacheKey = buildPromptCacheKey(
-    basePromptCacheKey,
-    subagentAgentId,
-  )
+  const promptCacheKey = getPromptCacheKey(payload)
 
   const responsesPayload: ResponsesPayload = {
     model: payload.model,
@@ -149,22 +121,39 @@ export const translateAnthropicMessagesToResponsesPayload = (
     top_p: payload.top_p ?? null,
     max_output_tokens: Math.max(payload.max_tokens, 12800),
     tools: translatedTools,
-    tool_choice: toolChoice,
     metadata: payload.metadata ? { ...payload.metadata } : null,
     //prompt_cache_retention: "24h",  not work in gpt-5.4
     stream: payload.stream ?? null,
     store: false,
-    parallel_tool_calls: true,
+    parallel_tool_calls: !payload.tool_choice?.disable_parallel_tool_use,
     reasoning: {
       effort: resolveReasoningEffort(payload),
-      summary: "auto",
+      summary: payload.model.includes("grok") ? "concise" : "auto",
       context: isSupportAllTurns(payload) ? "all_turns" : "auto",
     },
     include: ["reasoning.encrypted_content"],
   }
 
+  // Copilot /responses rejects tool_choice when no tools were translated.
+  if (translatedTools && translatedTools.length > 0) {
+    responsesPayload.tool_choice = toolChoice
+  }
+
   if (hasOriginalTools) {
     responsesPayload.prompt_cache_key = promptCacheKey
+  }
+
+  // grok meatadata is not supported
+  if (responsesPayload.model.includes("grok")) {
+    delete responsesPayload.metadata
+    delete responsesPayload.temperature
+    delete responsesPayload.top_p
+    // Match Grok Build: omit the output limit and use upstream defaults.
+    delete responsesPayload.max_output_tokens
+    if (responsesPayload.instructions) {
+      input.unshift(createMessage("system", responsesPayload.instructions))
+    }
+    delete responsesPayload.instructions
   }
 
   return responsesPayload

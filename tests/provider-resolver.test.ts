@@ -58,6 +58,17 @@ function writeCodexCredentials(
   )
 }
 
+function writeCodexAccountStore(
+  tempDir: string,
+  accounts: Array<CodexCredentialsShape & { alias?: string }>,
+): void {
+  fs.writeFileSync(
+    path.join(tempDir, "codex_credentials.json"),
+    `${JSON.stringify({ version: 1, accounts }, null, 2)}\n`,
+    "utf8",
+  )
+}
+
 function runScript(tempDir: string, script: string): string {
   const result = Bun.spawnSync({
     cmd: [process.execPath, "--eval", script],
@@ -87,6 +98,40 @@ afterEach(() => {
 })
 
 describe("provider resolver", () => {
+  test("provider enablement controls all routing independently of Codex catalog visibility", () => {
+    const tempDir = createTempDir()
+    writeConfigFile(tempDir, {
+      providers: {
+        dashscope: {
+          type: "openai-compatible",
+          baseUrl: "https://provider.example/v1",
+          apiKey: "provider-key",
+        },
+      },
+    })
+    const output = runScript(
+      tempDir,
+      `
+      const { getProviderConfig, listEnabledProviders } = await import("./src/lib/provider-config");
+      const { saveProviderManagementConfig, isProviderAgentModelVisible } = await import("./src/lib/provider-management");
+      const { getConfig } = await import("./src/lib/config-store");
+      const before = getProviderConfig("dashscope") !== null;
+      saveProviderManagementConfig({ providers: { dashscope: { enabled: false } } });
+      const disabled = getProviderConfig("dashscope") === null && !listEnabledProviders().includes("dashscope");
+      saveProviderManagementConfig({ providers: { dashscope: { enabled: true, agentsModels: [] } } });
+      console.log(JSON.stringify({ before, disabled, reenabled: getProviderConfig("dashscope") !== null,
+        credentialsPreserved: getProviderConfig("dashscope")?.apiKey === "provider-key",
+        codexVisible: isProviderAgentModelVisible(getConfig().providers?.dashscope, "model") }));
+    `,
+    )
+    expect(JSON.parse(output)).toEqual({
+      before: true,
+      disabled: true,
+      reenabled: true,
+      credentialsPreserved: true,
+      codexVisible: false,
+    })
+  })
   test("resolves codex from config.providers to the ChatGPT Codex backend", () => {
     const tempDir = createTempDir()
     writeConfigFile(tempDir, {
@@ -159,10 +204,87 @@ describe("provider resolver", () => {
       type: "openai-responses",
     })
     expect(readConfigFile(tempDir).providers?.codex).toMatchObject({
+      accountId: "acct_test",
       type: "openai-responses",
       authType: "oauth2",
       baseUrl: "https://chatgpt.com/backend-api",
     })
+  })
+
+  test("loads the Codex account selected in provider config", () => {
+    const tempDir = createTempDir()
+    writeConfigFile(tempDir, {
+      providers: {
+        codex: {
+          accountId: "acct_two",
+          type: "openai-responses",
+          enabled: true,
+          authType: "oauth2",
+          baseUrl: "https://chatgpt.com/backend-api",
+        },
+      },
+    })
+    writeCodexAccountStore(tempDir, [
+      {
+        accessToken: "first-access-token",
+        accountId: "acct_one",
+        expiresAt: Date.now() + 60 * 60 * 1000,
+        refreshToken: "first-refresh-token",
+      },
+      {
+        accessToken: "second-access-token",
+        accountId: "acct_two",
+        expiresAt: Date.now() + 60 * 60 * 1000,
+        refreshToken: "second-refresh-token",
+      },
+    ])
+
+    const output = runScript(
+      tempDir,
+      'const { resolveProviderConfig } = await import("./src/lib/provider-resolver"); const { state } = await import("./src/lib/state"); const { stopCodexRefreshLoop } = await import("./src/lib/token"); const config = await resolveProviderConfig("codex"); console.log(JSON.stringify({ apiKey: config?.apiKey, accountId: state.codexAccountId })); stopCodexRefreshLoop();',
+    )
+
+    expect(JSON.parse(output)).toEqual({
+      apiKey: "second-access-token",
+      accountId: "acct_two",
+    })
+  })
+
+  test("requires an explicit selection when multiple Codex accounts exist", () => {
+    const tempDir = createTempDir()
+    writeConfigFile(tempDir, {
+      providers: {
+        codex: {
+          type: "openai-responses",
+          enabled: true,
+          authType: "oauth2",
+          baseUrl: "https://chatgpt.com/backend-api",
+        },
+      },
+    })
+    writeCodexAccountStore(tempDir, [
+      {
+        accessToken: "first-access-token",
+        accountId: "acct_one",
+        expiresAt: Date.now() + 60 * 60 * 1000,
+        refreshToken: "first-refresh-token",
+      },
+      {
+        accessToken: "second-access-token",
+        accountId: "acct_two",
+        expiresAt: Date.now() + 60 * 60 * 1000,
+        refreshToken: "second-refresh-token",
+      },
+    ])
+
+    const output = runScript(
+      tempDir,
+      'const { resolveProviderConfig } = await import("./src/lib/provider-resolver"); try { await resolveProviderConfig("codex"); } catch (error) { console.log(error instanceof Error ? error.message : String(error)); }',
+    )
+
+    expect(output).toContain(
+      "Multiple Codex accounts found but no account is selected",
+    )
   })
 
   test("preserves a disabled codex provider when credentials are persisted", () => {

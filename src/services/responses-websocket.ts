@@ -5,6 +5,8 @@ import { WebSocket } from "undici"
 export interface PooledWebSocketRequest<TPayload> {
   headers: Record<string, string>
   payload: TPayload
+  // Refresh request metadata after the socket is ready, immediately before send.
+  preparePayload?: (payload: TPayload) => TPayload
   poolKey: string
   // Optional cancellation for a single pooled request. The Responses and Codex
   // request paths deliberately leave it unset: a client disconnect now drains
@@ -16,11 +18,18 @@ export interface PooledWebSocketRequest<TPayload> {
   url: string
 }
 
+// "continue": not a terminal chunk. "reuse": terminal, the socket may return to
+// the pool. "discard": terminal, the socket must be closed instead of pooled.
+export type PooledWebSocketTerminalDisposition =
+  | "continue"
+  | "discard"
+  | "reuse"
+
 export interface PooledWebSocketStreamOptions<TChunk> {
   createChunk: (data: string) => TChunk
   firstChunkTimeoutMs?: number
+  getTerminalDisposition: (chunk: TChunk) => PooledWebSocketTerminalDisposition
   interChunkTimeoutMs?: number
-  isTerminalChunk: (chunk: TChunk) => boolean
   maxBufferedBytes: number
   maxBufferedMessages: number
   openErrorMessage: string
@@ -211,16 +220,22 @@ const runPooledWebSocketRequest = async function* <TPayload, TChunk>(
         request.signal,
         options,
       )
-      websocket.send(JSON.stringify(request.payload))
       messageStream.start()
+      const payload =
+        request.preparePayload?.(request.payload) ?? request.payload
+      websocket.send(JSON.stringify(payload))
 
       for await (const data of messageStream.iterable) {
         const chunk = options.createChunk(data)
         yieldedAny = true
-        const isTerminal = options.isTerminalChunk(chunk)
+        const disposition = options.getTerminalDisposition(chunk)
+        const isTerminal = disposition !== "continue"
         if (isTerminal) {
           messageStream.complete()
-          reusable = true
+          reusable = disposition === "reuse"
+          // Drop the socket from the pool before yielding so no later request
+          // can pick it up while the consumer is still handling this chunk.
+          if (!reusable) removePooledWebSocketEntry(request.poolKey, entry)
         }
 
         yield chunk
@@ -312,8 +327,11 @@ const createPooledWebSocketEntry = <TPayload, TChunk>(
         removePooledWebSocketEntry(request.poolKey, entry)
       })
     })
-    .catch(() => {
+    .catch((error: unknown) => {
       removePooledWebSocketEntry(request.poolKey, entry)
+      if (!request.signal?.aborted) {
+        consola.warn("", error)
+      }
     })
 
   return entry
@@ -470,7 +488,13 @@ const openWebSocket = async ({
 
     const proxy = typeof Bun === "undefined" ? undefined : getProxyUrl(url)
     const init = { headers, ...(proxy ? { proxy } : {}) }
-    const websocket = new WebSocket(url, init)
+    // Desktop bundles inline undici, bypassing Bun's native module replacement.
+    // Select Bun's native client explicitly so compression and proxy work there.
+    const WebSocketClient =
+      typeof Bun === "undefined" ? WebSocket : (
+        (globalThis.WebSocket as unknown as typeof WebSocket)
+      )
+    const websocket = new WebSocketClient(url, init)
     let settled = false
     const timer = setTimeout(() => {
       fail(new ResponsesWebSocketOpenTimeoutError(openTimeoutMs))

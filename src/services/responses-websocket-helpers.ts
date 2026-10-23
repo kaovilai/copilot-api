@@ -1,4 +1,5 @@
 import type { ResponseErrorEvent } from "~/lib/types/responses"
+import type { PooledWebSocketTerminalDisposition } from "~/services/responses-websocket"
 
 export interface ResponsesStreamErrorChunk {
   data?: string
@@ -33,36 +34,51 @@ export const createResponsesErrorServerSentEventChunk = (
   }
 }
 
-export const isTerminalResponsesStreamChunk = (chunk: {
+// A failed response (`error` or `response.failed`) can leave the upstream
+// connection in a state where the next request sent on it fails as well, so
+// the socket is discarded instead of being returned to the pool.
+export const getResponsesStreamTerminalDisposition = (chunk: {
   data?: string
   event?: string
-}): boolean => {
+}): PooledWebSocketTerminalDisposition => {
   if (!chunk.data || chunk.data === "[DONE]") {
-    return false
+    return "continue"
   }
 
   // Callers that already derive `event` from the same parse used to build
   // the chunk (createResponsesWebSocketStreamChunk et al.) can skip a
   // redundant JSON.parse here.
   if (chunk.event !== undefined) {
-    return (
+    if (chunk.event === "error" || chunk.event === "response.failed") {
+      return "discard"
+    }
+
+    if (
       chunk.event === "response.completed"
-      || chunk.event === "response.failed"
       || chunk.event === "response.incomplete"
-      || chunk.event === "error"
-    )
+    ) {
+      return "reuse"
+    }
+
+    return "continue"
   }
 
   try {
     const parsed = JSON.parse(chunk.data) as { type?: unknown }
-    return (
+    if (parsed.type === "error" || parsed.type === "response.failed") {
+      return "discard"
+    }
+
+    if (
       parsed.type === "response.completed"
-      || parsed.type === "response.failed"
       || parsed.type === "response.incomplete"
-      || parsed.type === "error"
-    )
+    ) {
+      return "reuse"
+    }
+
+    return "continue"
   } catch {
-    return false
+    return "continue"
   }
 }
 

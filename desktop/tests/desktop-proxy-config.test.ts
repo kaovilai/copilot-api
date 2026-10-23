@@ -166,7 +166,9 @@ describe('desktop proxy config', () => {
 
   test('normalizes desktop settings with proxy mode defaults', () => {
     expect(normalizeSettings(null)).toEqual({
+      serverRuntime: 'bun',
       apiHome: '',
+      sqliteDbPath: '',
       oauthApp: 'default',
       enterpriseUrl: '',
       host: '',
@@ -177,6 +179,7 @@ describe('desktop proxy config', () => {
       accountType: 'individual',
       verbose: false,
       showToken: false,
+      showCreate: false,
       language: 'auto',
       theme: 'auto',
       proxy: {
@@ -190,6 +193,7 @@ describe('desktop proxy config', () => {
     expect(
       normalizeSettings({
         apiHome: 'C:/copilot-api',
+        sqliteDbPath: 'D:/copilot-data/usage.sqlite',
         oauthApp: 'opencode',
         enterpriseUrl: 'ghe.example.com',
         host: '',
@@ -204,7 +208,9 @@ describe('desktop proxy config', () => {
         proxy: createProxySettings({ mode: 'direct' }),
       }),
     ).toEqual({
+      serverRuntime: 'node',
       apiHome: 'C:/copilot-api',
+      sqliteDbPath: 'D:/copilot-data/usage.sqlite',
       oauthApp: 'opencode',
       enterpriseUrl: 'ghe.example.com',
       host: '',
@@ -215,10 +221,12 @@ describe('desktop proxy config', () => {
       accountType: 'enterprise',
       verbose: true,
       showToken: true,
+      showCreate: false,
       language: 'zh',
       theme: 'auto',
       proxy: createProxySettings({ mode: 'direct' }),
     })
+    expect(normalizeSettings({ showCreate: true }).showCreate).toBe(true)
   })
 
   test('normalizes theme preference with fallback to auto', () => {

@@ -1,4 +1,5 @@
 import consola from "consola"
+import { randomUUID } from "node:crypto"
 import {
   fetch as undiciFetch,
   type RequestInit as UndiciRequestInit,
@@ -6,17 +7,24 @@ import {
 
 import {
   getUpstreamTransportConfig,
+  normalizeProviderBaseUrl,
   type ResolvedProviderConfig,
 } from "~/lib/config"
 import { retryPreResponseFailures } from "~/lib/fetch-timeout"
+import { getGrokBuildVersion } from "~/lib/grok-build"
+import { XAI_API_BASE_URL } from "~/lib/oauth/xai"
 import { requestContext } from "~/lib/request-context"
 import { createTimeoutDispatcher } from "~/lib/timeout-dispatcher"
 import type { AnthropicMessagesPayload } from "~/lib/types/anthropic"
 import type { ChatCompletionsPayload } from "~/lib/types/chat-completions"
 import type { ResponsesPayload } from "~/lib/types/responses"
 import { UpstreamHeadersTimeoutError } from "~/lib/error"
+import type { GoogleModelsResponse } from "~/lib/types/google"
 import { parseUserIdMetadata } from "~/lib/utils"
 import { fetchUpstreamWithLifecycle } from "~/services/upstream-http"
+
+const OPENCODE_GO_PROVIDER_NAME = "opencode-go"
+const OPENCODE_SESSION_HEADER = "x-opencode-session"
 
 const SHARED_FORWARDABLE_HEADERS = ["accept", "user-agent"] as const
 
@@ -38,13 +46,38 @@ const STRIPPED_RESPONSE_HEADERS = [
   "upgrade",
 ] as const
 
+export function resolveProviderEndpointUrl(
+  providerConfig: ResolvedProviderConfig,
+  endpoint: string,
+): string {
+  if (providerConfig.name === OPENCODE_GO_PROVIDER_NAME) {
+    const base = normalizeProviderBaseUrl(providerConfig.baseUrl)
+    const apiBase = /\/v\d+(?:alpha|beta)?$/u.test(base) ? base : `${base}/v1`
+    return `${apiBase}/${endpoint}`
+  }
+  if (providerConfig.type === "google") {
+    const base = providerConfig.baseUrl.replace(/\/+$/u, "")
+    const apiBase =
+      /\/v\d+(?:alpha|beta)?$/u.test(base) ? base : `${base}/v1beta`
+    return `${apiBase}/${endpoint}`
+  }
+  const apiBaseUrl =
+    providerConfig.modelsDevProviderId ?
+      providerConfig.baseUrl.replace(/\/(?:chat\/completions|responses)$/u, "")
+    : `${providerConfig.baseUrl}/v1`
+  return `${apiBaseUrl}/${endpoint}`
+}
+
 export function buildProviderUpstreamHeaders(
   providerConfig: ResolvedProviderConfig,
   requestHeaders: Headers,
 ): Record<string, string> {
   const authHeaders: Record<string, string> = {}
-  if (providerConfig.authType === "x-api-key") {
-    authHeaders["x-api-key"] = providerConfig.apiKey
+  if (
+    providerConfig.authType === "x-api-key"
+    || providerConfig.authType === "x-goog-api-key"
+  ) {
+    authHeaders[providerConfig.authType] = providerConfig.apiKey
   } else {
     authHeaders.authorization = `Bearer ${providerConfig.apiKey}`
   }
@@ -66,6 +99,10 @@ export function buildProviderUpstreamHeaders(
     return headers
   }
 
+  if (providerConfig.modelsDevProviderId) {
+    headers["anthropic-version"] = "2023-06-01"
+  }
+
   for (const headerName of ANTHROPIC_FORWARDABLE_HEADERS) {
     const headerValue = requestHeaders.get(headerName)
     if (headerValue) {
@@ -76,13 +113,18 @@ export function buildProviderUpstreamHeaders(
   return headers
 }
 
-const OPENCODE_GO_PROVIDER_NAME = "opencode-go"
-const OPENCODE_SESSION_HEADER = "x-opencode-session"
-
-const resolveOpencodeMessagesSession = (
+export const resolveOpencodeMessagesSession = (
   payload: AnthropicMessagesPayload,
 ): string | undefined => {
-  const sessionAffinity = requestContext.getStore()?.sessionAffinity?.trim()
+  const store = requestContext.getStore()
+  // Keep sibling subagents on the root session so opencode-go routes them to the
+  // same prompt cache group, matching the chat completions/responses flows.
+  const rootSessionId = store?.rootSessionId?.trim()
+  if (rootSessionId) {
+    return rootSessionId
+  }
+
+  const sessionAffinity = store?.sessionAffinity?.trim()
   if (sessionAffinity) {
     return sessionAffinity
   }
@@ -96,7 +138,7 @@ const resolveOpencodeMessagesSession = (
   return sessionId ?? userId
 }
 
-const applyOpencodeSessionHeader = (
+export const applyOpencodeSessionHeader = (
   providerConfig: ResolvedProviderConfig,
   headers: Record<string, string>,
   session: string | undefined,
@@ -107,21 +149,61 @@ const applyOpencodeSessionHeader = (
   headers[OPENCODE_SESSION_HEADER] = session
 }
 
+async function applyXaiGrokBuildHeaders(
+  providerConfig: ResolvedProviderConfig,
+  headers: Record<string, string>,
+  payload: ResponsesPayload,
+): Promise<void> {
+  if (
+    providerConfig.name !== "xai"
+    || providerConfig.authType !== "oauth2"
+    || new URL(providerConfig.baseUrl).origin !== XAI_API_BASE_URL
+  ) {
+    return
+  }
+
+  const cacheKey = payload.prompt_cache_key
+  const sessionId =
+    cacheKey?.trim() ?
+      cacheKey
+    : requestContext.getStore()?.sessionAffinity?.trim()
+  if (!sessionId) {
+    throw new Error(
+      "xAI OAuth Responses requests require prompt_cache_key or session affinity",
+    )
+  }
+  headers["x-xai-token-auth"] = "xai-grok-cli"
+  headers["x-authenticateresponse"] = "authenticate-response"
+  headers["x-grok-client-version"] = await getGrokBuildVersion()
+  headers["x-grok-client-identifier"] = "grok-shell"
+  headers["x-grok-client-mode"] = "headless"
+  headers["x-grok-model-override"] = payload.model
+  headers["x-grok-conv-id"] = sessionId
+  headers["x-grok-session-id"] = sessionId
+  headers["x-grok-req-id"] = randomUUID()
+}
+
 export function createProviderProxyResponse(
   upstreamResponse: Response,
   body?: ReadableStream<Uint8Array> | null,
 ): Response {
-  const headers = new Headers(upstreamResponse.headers)
+  return new Response(body ?? upstreamResponse.body, {
+    headers: createProviderProxyResponseHeaders(upstreamResponse.headers),
+    status: upstreamResponse.status,
+    statusText: upstreamResponse.statusText,
+  })
+}
+
+export function createProviderProxyResponseHeaders(
+  upstreamHeaders: Headers,
+): Headers {
+  const headers = new Headers(upstreamHeaders)
 
   for (const headerName of STRIPPED_RESPONSE_HEADERS) {
     headers.delete(headerName)
   }
 
-  return new Response(body ?? upstreamResponse.body, {
-    headers,
-    status: upstreamResponse.status,
-    statusText: upstreamResponse.statusText,
-  })
+  return headers
 }
 
 // Forces Bun to open a fresh TCP connection per request instead of reusing a
@@ -149,7 +231,7 @@ export async function forwardProviderMessages(
   return await retryPreResponseFailures(
     () =>
       fetchUpstreamWithLifecycle(
-        `${providerConfig.baseUrl}/v1/messages`,
+        resolveProviderEndpointUrl(providerConfig, "messages"),
         {
           method: "POST",
           headers: { ...headers, ...CLOSE_CONNECTION_HEADERS },
@@ -183,7 +265,7 @@ export async function forwardProviderChatCompletions(
   return await retryPreResponseFailures(
     () =>
       fetchUpstreamWithLifecycle(
-        `${providerConfig.baseUrl}/v1/chat/completions`,
+        resolveProviderEndpointUrl(providerConfig, "chat/completions"),
         {
           method: "POST",
           headers: { ...headers, ...CLOSE_CONNECTION_HEADERS },
@@ -214,10 +296,11 @@ export async function forwardProviderResponses(
     headers,
     payload.prompt_cache_key?.trim() || undefined,
   )
+  await applyXaiGrokBuildHeaders(providerConfig, headers, payload)
   return await retryPreResponseFailures(
     () =>
       fetchUpstreamWithLifecycle(
-        `${providerConfig.baseUrl}/v1/responses`,
+        resolveProviderEndpointUrl(providerConfig, "responses"),
         {
           method: "POST",
           headers: { ...headers, ...CLOSE_CONNECTION_HEADERS },
@@ -242,11 +325,54 @@ export async function forwardProviderModels(
   providerConfig: ResolvedProviderConfig,
   requestHeaders: Headers,
 ): Promise<Response> {
-  return await fetch(`${providerConfig.baseUrl}/v1/models`, {
+  if (providerConfig.type === "google") {
+    return await forwardGoogleModels(providerConfig, requestHeaders)
+  }
+  return await fetch(resolveProviderEndpointUrl(providerConfig, "models"), {
     method: "GET",
     headers: buildProviderUpstreamHeaders(providerConfig, requestHeaders),
     signal: AbortSignal.timeout(PROVIDER_MODELS_TIMEOUT_MS),
   })
+}
+
+async function forwardGoogleModels(
+  provider: ResolvedProviderConfig,
+  requestHeaders: Headers,
+): Promise<Response> {
+  const data: Array<Record<string, unknown>> = []
+  const pageTokens = new Set<string>()
+  let pageToken: string | undefined
+  const signal = AbortSignal.timeout(PROVIDER_MODELS_TIMEOUT_MS)
+  do {
+    const url = new URL(resolveProviderEndpointUrl(provider, "models"))
+    url.searchParams.set("pageSize", "1000")
+    if (pageToken) url.searchParams.set("pageToken", pageToken)
+    const upstream = await fetch(url, {
+      headers: buildProviderUpstreamHeaders(provider, requestHeaders),
+      signal,
+    })
+    if (!upstream.ok) return upstream
+    const body = (await upstream.json()) as GoogleModelsResponse
+    for (const model of body.models ?? []) {
+      if (!model.supportedGenerationMethods?.includes("generateContent"))
+        continue
+      data.push({
+        id: model.name.replace(/^models\//u, ""),
+        object: "model",
+        owned_by: provider.name,
+        name: model.displayName,
+        display_name: model.displayName,
+        description: model.description,
+        context_window: model.inputTokenLimit,
+        max_output_tokens: model.outputTokenLimit,
+      })
+    }
+    pageToken = body.nextPageToken
+    if (pageToken && pageTokens.has(pageToken))
+      throw new Error("Google models returned a repeated page token")
+    if (pageToken) pageTokens.add(pageToken)
+  } while (pageToken)
+  return Response.json({ object: "list", data, has_more: false })
 }
 
 /** Align with Codex images: long-running generation/edits need a generous cap. */
@@ -261,7 +387,9 @@ function resolveProviderRequestUrl(
   requestUrl: string,
   path: string,
 ): string {
-  const upstreamUrl = new URL(`${providerConfig.baseUrl}${path}`)
+  const upstreamUrl = new URL(
+    resolveProviderEndpointUrl(providerConfig, path.replace(/^\/v1\//u, "")),
+  )
   upstreamUrl.search = new URL(requestUrl, "http://localhost").search
   return upstreamUrl.toString()
 }
@@ -309,7 +437,10 @@ export async function forwardProviderImages(
     headers,
     body: request.body,
     duplex: "half",
-    signal: AbortSignal.timeout(PROVIDER_IMAGES_TIMEOUT_MS),
+    signal: AbortSignal.any([
+      request.signal,
+      AbortSignal.timeout(PROVIDER_IMAGES_TIMEOUT_MS),
+    ]),
   }
 
   const upstreamUrl = resolveProviderRequestUrl(

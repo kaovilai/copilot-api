@@ -1,16 +1,21 @@
-import { useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import type {
   AuthResult,
+  CodexAccountSummary,
   DeviceCodeInfo,
+  ModelsDevProviderOption,
   ProviderAuthInput,
   ProviderAuthTypeInput,
   ProviderType,
   QuickProviderName,
+  XaiAuthInfo,
 } from '../types/ipc'
 import { useLanguage } from '../contexts/LanguageContext'
 import Header from '../components/Header'
+import { refreshProviderAuthStatus } from '../lib/provider-management-auth'
 
 interface AuthPageProps {
+  backTarget?: 'home' | 'providers'
   onBack?: () => void
   onSuccess: (result: AuthResult) => void
 }
@@ -20,19 +25,30 @@ type AuthView =
   | 'oauth-pending'
   | 'token-input'
   | 'provider-input'
+  | 'oauth-accounts'
   | 'codex-pending'
+  | 'xai-pending'
 type ProviderChoice = QuickProviderName | 'custom'
+type OAuthProvider = 'codex' | 'xai'
+
+const cancelOAuthLogin = (provider: OAuthProvider) =>
+  provider === 'codex' ?
+    window.electronAPI.cancelCodexLogin()
+  : window.electronAPI.cancelXaiLogin()
 
 const PROVIDER_TYPES: ProviderType[] = [
   'anthropic',
   'openai-compatible',
   'openai-responses',
+  'google',
 ]
 const PROVIDER_AUTH_TYPES: ProviderAuthTypeInput[] = [
   '__default__',
   'x-api-key',
+  'x-goog-api-key',
   'authorization',
 ]
+const MAX_OAUTH_ACCOUNTS = 3
 const PROVIDER_COLORS: Record<QuickProviderName, string> = {
   'opencode-go': 'bg-sky-500',
   kimi: 'bg-cyan-500',
@@ -72,7 +88,11 @@ const QUICK_PROVIDER_DEFAULTS: Record<
   },
 }
 
-export default function AuthPage({ onBack, onSuccess }: AuthPageProps) {
+export default function AuthPage({
+  backTarget = 'home',
+  onBack,
+  onSuccess,
+}: AuthPageProps) {
   const { t } = useLanguage()
   const [view, setView] = useState<AuthView>('default')
   const [deviceCode, setDeviceCode] = useState<DeviceCodeInfo | null>(null)
@@ -88,9 +108,46 @@ export default function AuthPage({ onBack, onSuccess }: AuthPageProps) {
   const [providerApiKey, setProviderApiKey] = useState('')
   const [providerAuthType, setProviderAuthType] =
     useState<ProviderAuthTypeInput>('__default__')
+  const [modelsDevProviders, setModelsDevProviders] = useState<
+    Array<ModelsDevProviderOption>
+  >([])
+  const [selectedModelsDevProviderId, setSelectedModelsDevProviderId] =
+    useState('')
+  const [modelsDevLoading, setModelsDevLoading] = useState(false)
+  const [modelsDevError, setModelsDevError] = useState(false)
+  const [oauthAccounts, setOAuthAccounts] = useState<
+    Array<CodexAccountSummary>
+  >([])
+  const [accountProvider, setAccountProvider] = useState<OAuthProvider>('codex')
+  const [oauthAlias, setOAuthAlias] = useState('')
+  const [oauthNotice, setOAuthNotice] = useState('')
+  const [codexAuthUrl, setCodexAuthUrl] = useState('')
+  const [xaiAuthInfo, setXaiAuthInfo] = useState<XaiAuthInfo | null>(null)
+  const [oauthSaving, setOAuthSaving] = useState(false)
+  const [oauthCancelling, setOAuthCancelling] = useState(false)
+  const oauthLoginRef = useRef<{
+    provider: OAuthProvider
+    unsubscribe: () => void
+  } | null>(null)
   const [error, setError] = useState('')
   const [polling, setPolling] = useState(false)
   const [copied, setCopied] = useState(false)
+  const mountedRef = useRef(false)
+  const copyFeedbackTimer = useRef<ReturnType<typeof setTimeout>>()
+
+  useEffect(() => {
+    mountedRef.current = true
+    return () => {
+      mountedRef.current = false
+      clearTimeout(copyFeedbackTimer.current)
+      const attempt = oauthLoginRef.current
+      if (attempt) {
+        attempt.unsubscribe()
+        oauthLoginRef.current = null
+        void cancelOAuthLogin(attempt.provider).catch(() => {})
+      }
+    }
+  }, [])
 
   const completeAuth = (result: AuthResult, fallbackError: string) => {
     if (result.success) {
@@ -124,18 +181,26 @@ export default function AuthPage({ onBack, onSuccess }: AuthPageProps) {
   }
 
   const handleOpenDeviceUrl = () => {
-    if (deviceCode) void window.electronAPI.openUrl(deviceCode.verification_uri)
+    if (pendingDeviceCode)
+      void window.electronAPI
+        .openUrl(pendingDeviceCode.verification_uri)
+        .catch((err: unknown) => setError((err as Error).message))
+  }
+
+  const copyText = async (text: string) => {
+    try {
+      await navigator.clipboard.writeText(text)
+      if (!mountedRef.current) return
+      setCopied(true)
+      clearTimeout(copyFeedbackTimer.current)
+      copyFeedbackTimer.current = setTimeout(() => setCopied(false), 1500)
+    } catch (err) {
+      if (mountedRef.current) setError((err as Error).message)
+    }
   }
 
   const handleCopyCode = () => {
-    if (!deviceCode) return
-    void navigator.clipboard
-      .writeText(deviceCode.user_code)
-      .then(() => {
-        setCopied(true)
-        setTimeout(() => setCopied(false), 1500)
-      })
-      .catch(() => {})
+    if (pendingDeviceCode) void copyText(pendingDeviceCode.user_code)
   }
 
   const handleSaveToken = async () => {
@@ -153,6 +218,17 @@ export default function AuthPage({ onBack, onSuccess }: AuthPageProps) {
   }
 
   const handleBack = () => {
+    const attempt = oauthLoginRef.current
+    if (attempt) {
+      attempt.unsubscribe()
+      oauthLoginRef.current = null
+      void cancelOAuthLogin(attempt.provider).catch(() => {})
+      setLoading(false)
+    }
+    setXaiAuthInfo(null)
+    setCodexAuthUrl('')
+    setOAuthSaving(false)
+    setOAuthCancelling(false)
     setView('default')
     setDeviceCode(null)
     setError('')
@@ -160,18 +236,30 @@ export default function AuthPage({ onBack, onSuccess }: AuthPageProps) {
     setTokenInput('')
     setProviderApiKey('')
     setProviderAuthType('__default__')
+    setOAuthAlias('')
+    setOAuthNotice('')
   }
 
   const handleProviderSelect = (provider: ProviderChoice) => {
     setProviderChoice(provider)
     setProviderApiKey('')
     setProviderAuthType('__default__')
+    setSelectedModelsDevProviderId('')
+    setModelsDevError(false)
     setError('')
 
     if (provider === 'custom') {
       setProviderName('')
       setProviderType('openai-compatible')
       setProviderBaseUrl('')
+      if (modelsDevProviders.length === 0) {
+        setModelsDevLoading(true)
+        void window.electronAPI
+          .getModelsDevProviders()
+          .then(setModelsDevProviders)
+          .catch(() => setModelsDevError(true))
+          .finally(() => setModelsDevLoading(false))
+      }
     } else {
       const defaults = QUICK_PROVIDER_DEFAULTS[provider]
       setProviderName(provider)
@@ -180,6 +268,22 @@ export default function AuthPage({ onBack, onSuccess }: AuthPageProps) {
     }
 
     setView('provider-input')
+  }
+
+  const handleModelsDevProviderSelect = (providerId: string) => {
+    setSelectedModelsDevProviderId(providerId)
+    if (!providerId) {
+      setProviderName('')
+      setProviderType('openai-compatible')
+      setProviderBaseUrl('')
+      return
+    }
+    const provider = modelsDevProviders.find((item) => item.id === providerId)
+    if (!provider) return
+    setProviderName(provider.id)
+    setProviderType(provider.type)
+    setProviderBaseUrl(provider.api)
+    setProviderAuthType('__default__')
   }
 
   const handleSaveProvider = async () => {
@@ -196,6 +300,7 @@ export default function AuthPage({ onBack, onSuccess }: AuthPageProps) {
             baseUrl: providerBaseUrl.trim(),
             apiKey: providerApiKey.trim(),
             authType: providerAuthType,
+            modelsDevProviderId: selectedModelsDevProviderId || undefined,
           }
         : {
             provider: providerChoice,
@@ -212,20 +317,210 @@ export default function AuthPage({ onBack, onSuccess }: AuthPageProps) {
     }
   }
 
-  const handleCodexOAuth = async () => {
-    setView('codex-pending')
+  const loadOAuthAccounts = async (provider = accountProvider) => {
+    const accounts = await (provider === 'codex' ?
+      window.electronAPI.getCodexAccounts()
+    : window.electronAPI.getXaiAccounts())
+    setOAuthAccounts(accounts)
+    return accounts
+  }
+
+  const handleOpenOAuthAccounts = async (provider: OAuthProvider) => {
+    setAccountProvider(provider)
     setLoading(true)
     setError('')
-
+    setOAuthNotice('')
     try {
-      const result = await window.electronAPI.startCodexLogin()
-      completeAuth(result, t('auth.authFailed'))
+      await loadOAuthAccounts(provider)
+      setView('oauth-accounts')
     } catch (err) {
       setError((err as Error).message)
     } finally {
       setLoading(false)
     }
   }
+
+  const handleAccountOAuth = async () => {
+    if (oauthLoginRef.current) return
+    const provider = accountProvider
+    setView(provider === 'codex' ? 'codex-pending' : 'xai-pending')
+    setLoading(true)
+    setError('')
+    setOAuthNotice('')
+    setCodexAuthUrl('')
+    setXaiAuthInfo(null)
+    setOAuthSaving(false)
+    setOAuthCancelling(false)
+    setCopied(false)
+    const attempt = { provider, unsubscribe: () => {} }
+    oauthLoginRef.current = attempt
+    try {
+      attempt.unsubscribe =
+        provider === 'codex' ?
+          window.electronAPI.onCodexAuthUrl((url) => {
+            if (oauthLoginRef.current === attempt) setCodexAuthUrl(url)
+          })
+        : window.electronAPI.onXaiAuth((info) => {
+            if (oauthLoginRef.current === attempt) setXaiAuthInfo(info)
+          })
+      const unsubscribeAuth = attempt.unsubscribe
+      const onSaving = () => {
+        if (oauthLoginRef.current === attempt) {
+          setOAuthSaving(true)
+          setOAuthCancelling(false)
+        }
+      }
+      const unsubscribeSaving =
+        provider === 'codex' ?
+          window.electronAPI.onCodexLoginSaving(onSaving)
+        : window.electronAPI.onXaiLoginSaving(onSaving)
+      attempt.unsubscribe = () => {
+        unsubscribeAuth()
+        unsubscribeSaving()
+      }
+      const input = {
+        alias: oauthAlias.trim() || undefined,
+      }
+      const result = await (provider === 'codex' ?
+        window.electronAPI.startCodexLogin(input)
+      : window.electronAPI.startXaiLogin(input))
+      if (oauthLoginRef.current !== attempt) return
+      if (!result.success) {
+        if (!result.cancelled) setError(result.error ?? t('auth.authFailed'))
+        setView('oauth-accounts')
+        return
+      }
+      if (!onBack) {
+        onSuccess(result)
+        return
+      }
+      await loadOAuthAccounts(provider)
+      if (oauthLoginRef.current !== attempt) return
+      setOAuthAlias('')
+      setOAuthNotice(t('auth.codexAccountRefreshed'))
+      setView('oauth-accounts')
+    } catch (err) {
+      if (oauthLoginRef.current === attempt) {
+        setError((err as Error).message)
+        setView('oauth-accounts')
+      }
+    } finally {
+      attempt.unsubscribe()
+      if (oauthLoginRef.current === attempt) {
+        oauthLoginRef.current = null
+        setLoading(false)
+        setCodexAuthUrl('')
+        setXaiAuthInfo(null)
+        setOAuthSaving(false)
+        setOAuthCancelling(false)
+      }
+    }
+  }
+
+  const handleCancelAccountOAuth = async () => {
+    const attempt = oauthLoginRef.current
+    if (!attempt) return
+    setError('')
+    setOAuthCancelling(true)
+    try {
+      const cancelled = await cancelOAuthLogin(attempt.provider)
+      if (oauthLoginRef.current !== attempt) return
+      if (cancelled) {
+        attempt.unsubscribe()
+        oauthLoginRef.current = null
+        setView('oauth-accounts')
+        setLoading(false)
+        setCodexAuthUrl('')
+        setXaiAuthInfo(null)
+        setOAuthSaving(false)
+        setOAuthCancelling(false)
+      } else {
+        setOAuthSaving(true)
+        setOAuthCancelling(false)
+      }
+    } catch (err) {
+      if (oauthLoginRef.current === attempt) {
+        setError((err as Error).message)
+        setOAuthCancelling(false)
+      }
+    }
+  }
+
+  const handleCopyCodexUrl = () => copyText(codexAuthUrl)
+
+  const handleOpenCodexUrl = async () => {
+    try {
+      await window.electronAPI.openUrl(codexAuthUrl)
+    } catch (err) {
+      setError((err as Error).message)
+    }
+  }
+
+  const handleOAuthSwitch = async (accountId: string) => {
+    setLoading(true)
+    setError('')
+    setOAuthNotice('')
+    try {
+      const result = await (accountProvider === 'codex' ?
+        window.electronAPI.switchCodexAccount(accountId)
+      : window.electronAPI.switchXaiAccount(accountId))
+      if (!result.success) {
+        setError(result.error ?? t('auth.authFailed'))
+        return
+      }
+
+      if (!onBack) {
+        onSuccess(result)
+        return
+      }
+
+      await loadOAuthAccounts()
+      setOAuthNotice(t('auth.codexAccountRefreshed'))
+    } catch (err) {
+      setError((err as Error).message)
+    } finally {
+      setLoading(false)
+    }
+  }
+
+  const isServerRunning = async (): Promise<boolean> => {
+    try {
+      return (await window.electronAPI.getServerStatus()).running
+    } catch {
+      return false
+    }
+  }
+
+  const handleOAuthRemove = async (accountId: string) => {
+    setLoading(true)
+    setError('')
+    setOAuthNotice('')
+    try {
+      const result = await (accountProvider === 'codex' ?
+        window.electronAPI.removeCodexAccount(accountId)
+      : window.electronAPI.removeXaiAccount(accountId))
+      if (!result.success) {
+        setError(result.error ?? t('auth.authFailed'))
+        return
+      }
+
+      await loadOAuthAccounts()
+      setOAuthNotice(
+        (await isServerRunning()) ?
+          t('auth.codexAccountRemovedRefreshed')
+        : t('auth.codexAccountRemoved'),
+      )
+    } catch (err) {
+      setError((err as Error).message)
+    } finally {
+      setLoading(false)
+    }
+  }
+
+  const formatAccountId = (accountId: string): string =>
+    accountId.length > 18 ?
+      `${accountId.slice(0, 9)}…${accountId.slice(-6)}`
+    : accountId
 
   const getQuickProviderLabel = (provider: QuickProviderName): string => {
     switch (provider) {
@@ -249,13 +544,30 @@ export default function AuthPage({ onBack, onSuccess }: AuthPageProps) {
       t('auth.customProvider')
     : getQuickProviderLabel(providerChoice)
   const isProviderInput = view === 'provider-input'
+  const pendingDeviceCode =
+    view === 'xai-pending' ?
+      xaiAuthInfo && {
+        user_code: xaiAuthInfo.userCode,
+        verification_uri: xaiAuthInfo.url,
+      }
+    : deviceCode
+  const isExpandedInput = isProviderInput || view === 'oauth-accounts'
   const isCustomProvider = providerChoice === 'custom'
   const canEditProviderType =
     providerChoice === 'custom' || selectedQuickProvider?.editableType
 
   return (
     <div className="flex flex-col h-screen bg-canvas">
-      <Header />
+      <Header
+        onOpenAuthConfig={handleBack}
+        onProvidersClose={() => {
+          void refreshProviderAuthStatus(
+            window.electronAPI.getAuthStatus,
+            onSuccess,
+            !onBack,
+          ).catch((reason: unknown) => setError(String(reason)))
+        }}
+      />
 
       <div className="flex-1 overflow-y-auto min-h-0 flex flex-col">
         {onBack && (
@@ -264,16 +576,20 @@ export default function AuthPage({ onBack, onSuccess }: AuthPageProps) {
               onClick={onBack}
               className="inline-flex h-8 items-center rounded-md border border-line bg-surface px-2.5 text-[13px] font-medium text-ink-soft shadow-sm transition-colors hover:bg-sunken hover:text-ink"
             >
-              {t('auth.backToHome')}
+              {t(
+                backTarget === 'providers' ?
+                  'auth.backToProviders'
+                : 'auth.backToHome',
+              )}
             </button>
           </div>
         )}
 
         <div
-          className={`flex flex-col items-center justify-center flex-1 px-6 ${isProviderInput ? 'py-4 gap-3' : 'py-6 gap-5'}`}
+          className={`flex flex-col items-center justify-center flex-1 px-6 ${isExpandedInput ? 'py-4 gap-3' : 'py-6 gap-5'}`}
         >
           {/* Logo and title */}
-          {!isProviderInput && (
+          {!isExpandedInput && (
             <div className="text-center">
               <div className="w-14 h-14 bg-accent-strong rounded-2xl flex items-center justify-center mx-auto mb-3 shadow-[0_10px_26px_rgba(30,41,59,0.20)] dark:bg-[#4f94f8]">
                 <span className="text-white text-base font-extrabold">CA</span>
@@ -313,11 +629,18 @@ export default function AuthPage({ onBack, onSuccess }: AuthPageProps) {
                 {loading ? t('auth.loading') : t('auth.githubAuth')}
               </button>
               <button
-                onClick={handleCodexOAuth}
+                onClick={() => void handleOpenOAuthAccounts('codex')}
                 disabled={loading}
-                className="w-full py-2.5 bg-surface border border-line text-ink-soft text-[13px] font-semibold rounded-lg hover:bg-sunken hover:border-line disabled:opacity-50 transition-all mb-4"
+                className="w-full py-2.5 bg-surface border border-line text-ink-soft text-[13px] font-semibold rounded-lg hover:bg-sunken hover:border-line disabled:opacity-50 transition-all mb-2"
               >
                 {t('auth.codexAuth')}
+              </button>
+              <button
+                onClick={() => void handleOpenOAuthAccounts('xai')}
+                disabled={loading}
+                className="w-full py-2.5 bg-surface border border-line text-ink-soft text-[13px] font-semibold rounded-lg hover:bg-sunken disabled:opacity-50 transition-all mb-2"
+              >
+                {t('auth.xaiAuth')}
               </button>
 
               {/* Divider */}
@@ -370,50 +693,188 @@ export default function AuthPage({ onBack, onSuccess }: AuthPageProps) {
             </div>
           )}
 
-          {/* OAuth pending state */}
-          {view === 'oauth-pending' && deviceCode && (
-            <div className="w-full max-w-[320px] flex flex-col gap-3 rounded-xl border border-line-soft bg-surface p-4 shadow-[0_12px_32px_rgba(0,0,0,0.08)]">
-              <div>
-                <p className="text-[13px] text-ink-faint mb-1.5">
-                  {t('auth.deviceCode')}
-                </p>
-                <div className="flex items-center gap-2 px-3 py-2.5 border border-dashed border-line rounded-lg bg-sunken">
-                  <span className="font-mono text-[13px] font-bold text-ink tracking-widest flex-1">
-                    {deviceCode.user_code}
-                  </span>
-                  <button
-                    onClick={handleCopyCode}
-                    className="text-[13px] text-accent hover:text-accent/80 shrink-0"
-                  >
-                    {copied ? t('auth.copied') : t('auth.copy')}
-                  </button>
+          {view === 'oauth-accounts' && (
+            <div className="w-full max-w-[440px] flex flex-col gap-3 rounded-xl border border-line-soft bg-surface p-4 shadow-[0_12px_32px_rgba(0,0,0,0.08)]">
+              <div className="flex items-start justify-between gap-3">
+                <div>
+                  <p className="text-[13px] font-semibold text-ink">
+                    {t(
+                      accountProvider === 'codex' ? 'auth.codexAccounts' : (
+                        'auth.xaiAccounts'
+                      ),
+                    )}
+                  </p>
+                  <p className="mt-1 text-[12px] text-ink-faint">
+                    {t('auth.codexAccountLimit')}
+                  </p>
                 </div>
+                <span className="rounded-full bg-sunken px-2 py-1 text-[11px] font-semibold text-ink-faint">
+                  {oauthAccounts.length}/{MAX_OAUTH_ACCOUNTS}
+                </span>
               </div>
-              <div>
-                <p className="text-[13px] text-ink-faint mb-1.5">
-                  {t('auth.deviceCodeUrl')}
-                </p>
+
+              <div className="flex flex-col gap-2">
+                {oauthAccounts.length === 0 && (
+                  <p className="rounded-lg border border-dashed border-line px-3 py-4 text-center text-[13px] text-ink-faint">
+                    {t(
+                      accountProvider === 'codex' ?
+                        'auth.codexNoAccounts'
+                      : 'auth.xaiNoAccounts',
+                    )}
+                  </p>
+                )}
+                {oauthAccounts.map((account) => (
+                  <div
+                    key={account.accountId}
+                    className="flex items-center gap-3 rounded-lg border border-line px-3 py-2.5"
+                  >
+                    <div className="min-w-0 flex-1">
+                      <div className="flex items-center gap-2">
+                        <span className="truncate text-[13px] font-medium text-ink">
+                          {account.alias ?? formatAccountId(account.accountId)}
+                        </span>
+                        {account.active && (
+                          <span className="shrink-0 rounded-full bg-emerald-500/10 px-2 py-0.5 text-[10px] font-semibold text-emerald-600 dark:text-emerald-400">
+                            {t('auth.codexActiveAccount')}
+                          </span>
+                        )}
+                      </div>
+                      {account.alias && (
+                        <p
+                          className="mt-0.5 truncate font-mono text-[11px] text-ink-faint"
+                          title={account.accountId}
+                        >
+                          {formatAccountId(account.accountId)}
+                        </p>
+                      )}
+                    </div>
+                    {!account.active && (
+                      <div className="flex shrink-0 items-center gap-1.5">
+                        <button
+                          onClick={() =>
+                            void handleOAuthSwitch(account.accountId)
+                          }
+                          disabled={loading}
+                          className="rounded-md border border-line bg-surface px-2.5 py-1.5 text-[12px] font-medium text-ink-soft transition-colors hover:bg-sunken disabled:opacity-50"
+                        >
+                          {t('auth.codexUseAccount')}
+                        </button>
+                        <button
+                          onClick={() =>
+                            void handleOAuthRemove(account.accountId)
+                          }
+                          disabled={loading}
+                          className="rounded-md border border-red-200 px-2 py-1.5 text-[12px] font-medium text-red-600 transition-colors hover:bg-red-50 disabled:opacity-50 dark:border-red-500/30 dark:hover:bg-red-500/15"
+                        >
+                          {t('auth.codexRemoveAccount')}
+                        </button>
+                      </div>
+                    )}
+                  </div>
+                ))}
+              </div>
+
+              <div className="flex flex-col gap-2 border-t border-line-soft pt-3">
+                <label className="flex flex-col gap-1.5">
+                  <span className="text-[13px] text-ink-faint">
+                    {t('auth.codexAccountAlias')}
+                  </span>
+                  <input
+                    value={oauthAlias}
+                    onChange={(event) => setOAuthAlias(event.target.value)}
+                    placeholder={t('auth.codexAccountAliasPlaceholder')}
+                    className="w-full rounded-lg border border-line bg-surface px-3 py-2.5 text-[13px] text-ink placeholder-ink-faint focus:outline-none focus:ring-2 focus:ring-accent/40"
+                  />
+                </label>
                 <button
-                  onClick={handleOpenDeviceUrl}
-                  className="w-full px-3 py-2.5 border border-line rounded-lg bg-surface text-left text-[13px] text-accent hover:text-accent/80 hover:bg-sunken transition-colors break-all"
+                  onClick={() => void handleAccountOAuth()}
+                  disabled={loading}
+                  className="w-full rounded-lg bg-accent-strong py-2.5 text-[13px] font-semibold text-white transition-all hover:bg-accent-strong/90 disabled:opacity-50"
                 >
-                  {deviceCode.verification_uri}
+                  {loading ? t('auth.verifying') : t('auth.codexAddAccount')}
                 </button>
               </div>
-              <button
-                onClick={handleOpenDeviceUrl}
-                className="w-full py-2.5 bg-accent-strong text-white text-[13px] font-semibold rounded-lg hover:bg-accent-strong/90 transition-colors"
-              >
-                {t('auth.openAuthPage')}
-              </button>
-              {polling && (
-                <p className="text-center text-[13px] text-ink-faint animate-pulse">
-                  {t('auth.waitingAuth')}
+
+              {oauthNotice && (
+                <p className="rounded-lg border border-amber-300 bg-amber-50 px-3 py-2 text-[12px] text-amber-700 dark:border-amber-500/30 dark:bg-amber-500/10 dark:text-amber-300">
+                  {oauthNotice}
                 </p>
+              )}
+
+              <button
+                onClick={handleBack}
+                className="text-center text-[13px] text-ink-faint hover:text-ink-soft"
+              >
+                {t('auth.back')}
+              </button>
+            </div>
+          )}
+
+          {/* OAuth pending state */}
+          {((view === 'oauth-pending' && pendingDeviceCode)
+            || view === 'xai-pending') && (
+            <div className="w-full max-w-[320px] flex flex-col gap-3 rounded-xl border border-line-soft bg-surface p-4 shadow-[0_12px_32px_rgba(0,0,0,0.08)]">
+              {pendingDeviceCode && !oauthSaving && (
+                <>
+                  <div>
+                    <p className="text-[13px] text-ink-faint mb-1.5">
+                      {t('auth.deviceCode')}
+                    </p>
+                    <div className="flex items-center gap-2 px-3 py-2.5 border border-dashed border-line rounded-lg bg-sunken">
+                      <span className="font-mono text-[13px] font-bold text-ink tracking-widest flex-1">
+                        {pendingDeviceCode.user_code}
+                      </span>
+                      <button
+                        onClick={handleCopyCode}
+                        className="text-[13px] text-accent hover:text-accent/80 shrink-0"
+                      >
+                        {copied ? t('auth.copied') : t('auth.copy')}
+                      </button>
+                    </div>
+                  </div>
+                  <div>
+                    <p className="text-[13px] text-ink-faint mb-1.5">
+                      {t('auth.deviceCodeUrl')}
+                    </p>
+                    <button
+                      onClick={handleOpenDeviceUrl}
+                      className="w-full px-3 py-2.5 border border-line rounded-lg bg-surface text-left text-[13px] text-accent hover:text-accent/80 hover:bg-sunken transition-colors break-all"
+                    >
+                      {pendingDeviceCode.verification_uri}
+                    </button>
+                  </div>
+                  <button
+                    onClick={handleOpenDeviceUrl}
+                    className="w-full py-2.5 bg-accent-strong text-white text-[13px] font-semibold rounded-lg hover:bg-accent-strong/90 transition-colors"
+                  >
+                    {t('auth.openAuthPage')}
+                  </button>
+                </>
+              )}
+              {(polling || view === 'xai-pending') && (
+                <p className="text-center text-[13px] text-ink-faint animate-pulse">
+                  {view === 'xai-pending' ?
+                    t(oauthSaving ? 'auth.verifying' : 'auth.waitingXaiAuth')
+                  : t('auth.waitingAuth')}
+                </p>
+              )}
+              {view === 'xai-pending' && (
+                <button
+                  onClick={handleCancelAccountOAuth}
+                  disabled={oauthCancelling || oauthSaving}
+                  className="rounded-lg border border-line bg-surface py-2.5 text-[13px] font-semibold text-ink-soft hover:bg-sunken disabled:opacity-50"
+                >
+                  {t(
+                    oauthCancelling ? 'auth.cancelling' : (
+                      'auth.cancelCodexAuth'
+                    ),
+                  )}
+                </button>
               )}
               <button
                 onClick={handleBack}
-                className="text-[13px] text-ink-faint hover:text-ink-soft text-center"
+                disabled={oauthSaving || oauthCancelling}
+                className="text-[13px] text-ink-faint hover:text-ink-soft text-center disabled:opacity-50"
               >
                 {t('auth.back')}
               </button>
@@ -466,6 +927,38 @@ export default function AuthPage({ onBack, onSuccess }: AuthPageProps) {
                   : 'flex flex-col gap-3'
                 }
               >
+                {isCustomProvider && (
+                  <label className="flex flex-col gap-1.5 sm:col-span-2">
+                    <span className="text-[13px] text-ink-faint">
+                      {t('auth.modelsDevProvider')}
+                    </span>
+                    <select
+                      value={selectedModelsDevProviderId}
+                      onChange={(e) =>
+                        handleModelsDevProviderSelect(e.target.value)
+                      }
+                      disabled={modelsDevLoading}
+                      className="w-full px-3 py-2.5 border border-line rounded-lg bg-surface text-ink text-[13px] focus:outline-none focus:ring-2 focus:ring-accent/40 disabled:opacity-50"
+                    >
+                      <option value="">
+                        {modelsDevLoading ?
+                          t('auth.modelsDevLoading')
+                        : t('auth.modelsDevManual')}
+                      </option>
+                      {modelsDevProviders.map((provider) => (
+                        <option key={provider.id} value={provider.id}>
+                          {provider.name} ({provider.id}) · {provider.type}
+                        </option>
+                      ))}
+                    </select>
+                    {modelsDevError && (
+                      <span className="text-[12px] text-amber-600 dark:text-amber-400">
+                        {t('auth.modelsDevUnavailable')}
+                      </span>
+                    )}
+                  </label>
+                )}
+
                 {isCustomProvider && (
                   <label className="flex flex-col gap-1.5">
                     <span className="text-[13px] text-ink-faint">
@@ -573,18 +1066,46 @@ export default function AuthPage({ onBack, onSuccess }: AuthPageProps) {
           )}
 
           {view === 'codex-pending' && (
-            <div className="w-full max-w-[320px] flex flex-col gap-3 rounded-xl border border-line-soft bg-surface p-4 shadow-[0_12px_32px_rgba(0,0,0,0.08)]">
+            <div className="w-full max-w-[440px] flex flex-col gap-3 rounded-xl border border-line-soft bg-surface p-4 shadow-[0_12px_32px_rgba(0,0,0,0.08)]">
               <p className="text-center text-[13px] text-ink-faint animate-pulse">
-                {loading ?
-                  t('auth.waitingCodexAuth')
-                : t('auth.codexCallbackRequired')}
+                {oauthSaving ?
+                  t('auth.codexFinishingAuth')
+                : t('auth.waitingCodexAuth')}
               </p>
+              {codexAuthUrl && !oauthSaving && (
+                <>
+                  <label className="flex flex-col gap-1.5 text-[13px] text-ink-faint">
+                    {t('auth.deviceCodeUrl')}
+                    <textarea
+                      readOnly
+                      rows={3}
+                      value={codexAuthUrl}
+                      onFocus={(event) => event.currentTarget.select()}
+                      className="w-full resize-none rounded-lg border border-line bg-sunken px-3 py-2 font-mono text-[11px] text-ink-soft break-all"
+                    />
+                  </label>
+                  <button
+                    onClick={handleOpenCodexUrl}
+                    className="w-full rounded-lg bg-accent-strong py-2.5 text-[13px] font-semibold text-white hover:bg-accent-strong/90 transition-colors"
+                  >
+                    {t('auth.openAuthPage')}
+                  </button>
+                  <button
+                    onClick={handleCopyCodexUrl}
+                    className="w-full rounded-lg border border-line bg-surface py-2.5 text-[13px] font-semibold text-ink-soft hover:bg-sunken transition-colors"
+                  >
+                    {copied ? t('auth.copied') : t('auth.copy')}
+                  </button>
+                </>
+              )}
               <button
-                onClick={handleCodexOAuth}
-                disabled={loading}
-                className="w-full py-2.5 bg-accent-strong text-white text-[13px] font-semibold rounded-lg hover:bg-accent-strong/90 disabled:opacity-50 transition-colors"
+                onClick={handleCancelAccountOAuth}
+                disabled={oauthCancelling || oauthSaving}
+                className="w-full py-2.5 border border-line bg-surface text-ink-soft text-[13px] font-semibold rounded-lg hover:bg-sunken disabled:opacity-50 transition-colors"
               >
-                {loading ? t('auth.verifying') : t('auth.confirmAdd')}
+                {oauthCancelling ?
+                  t('auth.cancelling')
+                : t('auth.cancelCodexAuth')}
               </button>
               <button
                 onClick={handleBack}
@@ -597,9 +1118,9 @@ export default function AuthPage({ onBack, onSuccess }: AuthPageProps) {
 
           {/* Error message */}
           {error && (
-            <div className="w-full max-w-[240px] px-3 py-2 bg-red-50 border border-red-200 rounded-lg text-[13px] text-red-600 flex items-center gap-1.5 dark:bg-red-500/15 dark:border-red-500/30 dark:text-red-400">
-              <span>⚠️</span>
-              <span>{error}</span>
+            <div className="w-full max-w-[440px] max-h-[168px] overflow-y-auto px-3 py-2 bg-red-50 border border-red-200 rounded-lg text-[13px] text-red-600 flex items-start gap-1.5 dark:bg-red-500/15 dark:border-red-500/30 dark:text-red-400">
+              <span className="shrink-0">⚠️</span>
+              <span className="min-w-0 flex-1 break-words">{error}</span>
             </div>
           )}
 

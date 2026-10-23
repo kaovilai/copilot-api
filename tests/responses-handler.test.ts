@@ -94,6 +94,7 @@ const createMessagesResponse = (
 
 const { state } = await import("~/lib/state")
 const { closeUsageStore } = await import("~/lib/token-usage")
+const { traceIdMiddleware } = await import("~/lib/trace")
 const { tokenUsageRoute } = await import("~/routes/token-usage/route")
 const { responsesHandlerDependencies } = await import(
   "~/routes/responses/handler"
@@ -102,6 +103,7 @@ const { responsesMessagesDependencies } = await import(
   "~/routes/responses/messages-handler"
 )
 const { responsesRoutes } = await import("~/routes/responses/route")
+const { taskTitleDependencies } = await import("~/routes/responses/task-title")
 const { responsesUtilsDependencies } = await import("~/routes/responses/utils")
 const { generateRequestIdFromPayload, getUUID } = await import("~/lib/utils")
 
@@ -112,6 +114,7 @@ const defaultResponsesMessagesDependencies = {
   ...responsesMessagesDependencies,
 }
 const defaultResponsesUtilsDependencies = { ...responsesUtilsDependencies }
+const defaultTaskTitleDependencies = { ...taskTitleDependencies }
 
 const DB_PATH_ENV = "COPILOT_API_SQLITE_DB_PATH"
 
@@ -128,6 +131,7 @@ const originalState = {
 
 function createApp(): Hono {
   const app = new Hono()
+  app.use(traceIdMiddleware)
   app.route("/v1/responses", responsesRoutes)
   app.route("/token-usage", tokenUsageRoute)
   return app
@@ -203,6 +207,134 @@ afterEach(async () => {
     defaultResponsesMessagesDependencies,
   )
   Object.assign(responsesUtilsDependencies, defaultResponsesUtilsDependencies)
+  Object.assign(taskTitleDependencies, defaultTaskTitleDependencies)
+})
+
+describe("Codex task title model routing on Responses", () => {
+  const taskTitlePrompt =
+    "Generate a concise, single-line task title of at most 36 characters and under five words where possible."
+  const titleInput = [
+    { role: "user", content: [{ type: "input_text", text: taskTitlePrompt }] },
+  ]
+
+  beforeEach(() => {
+    state.models = {
+      object: "list",
+      data: [
+        {
+          capabilities: { limits: { max_prompt_tokens: 128000 } },
+          id: "gpt-test",
+          supported_endpoints: ["/responses"],
+        },
+        {
+          capabilities: { limits: { max_prompt_tokens: 128000 } },
+          id: "gpt-small",
+          supported_endpoints: ["/responses"],
+        },
+      ],
+    } as typeof state.models
+    taskTitleDependencies.getSmallModelForProvider = (provider) =>
+      provider === "copilot" ? "gpt-small" : undefined
+    createResponses.mockImplementation((payload) =>
+      Promise.resolve(createResponsesResult(payload.model)),
+    )
+  })
+
+  for (const [name, input, userAgent, expectedModel] of [
+    ["the final input item matches", titleInput, "codex/1.0", "gpt-small"],
+    [
+      "the penultimate input item matches",
+      [
+        ...titleInput,
+        { role: "user", content: [{ type: "input_text", text: "Continue" }] },
+      ],
+      "codex/1.0",
+      "gpt-small",
+    ],
+    [
+      "only an earlier input item matches",
+      [
+        ...titleInput,
+        { role: "user", content: [{ type: "input_text", text: "Continue" }] },
+        { role: "user", content: [{ type: "input_text", text: "Again" }] },
+      ],
+      "codex/1.0",
+      "gpt-test",
+    ],
+    ["the client is not Codex", titleInput, "other-client/1.0", "gpt-test"],
+  ] as const) {
+    test(`selects ${expectedModel} when ${name}`, async () => {
+      const response = await createApp().request("/v1/responses", {
+        body: JSON.stringify({ model: "gpt-test", input }),
+        headers: {
+          "content-type": "application/json",
+          "user-agent": userAgent,
+        },
+        method: "POST",
+      })
+
+      expect(response.status).toBe(200)
+      expect(createResponses).toHaveBeenCalledTimes(1)
+      expect(createResponses.mock.calls[0]?.[0].model).toBe(expectedModel)
+    })
+  }
+
+  test("keeps the requested model when the Copilot small model is disabled", async () => {
+    taskTitleDependencies.getSmallModelForProvider = () => undefined
+
+    const response = await createApp().request("/v1/responses", {
+      body: JSON.stringify({ model: "gpt-test", input: titleInput }),
+      headers: {
+        "content-type": "application/json",
+        "user-agent": "codex/1.0",
+      },
+      method: "POST",
+    })
+
+    expect(response.status).toBe(200)
+    expect(createResponses.mock.calls[0]?.[0].model).toBe("gpt-test")
+  })
+
+  test("keeps request tools without remapping the configured small model", async () => {
+    taskTitleDependencies.getSmallModelForProvider = () => "gpt-small"
+    responsesHandlerDependencies.resolveMappedModel = (model) =>
+      model === "gpt-small" ? "gpt-test" : model
+    const tools = [
+      {
+        type: "function",
+        name: "list_files",
+        parameters: { type: "object" },
+        strict: false,
+      },
+    ]
+
+    const response = await createApp().request("/v1/responses", {
+      body: JSON.stringify({
+        model: "gpt-test",
+        input: [
+          { role: "developer", type: "additional_tools", tools },
+          ...titleInput,
+        ],
+        tools,
+        tool_choice: "required",
+      }),
+      headers: {
+        "content-type": "application/json",
+        "user-agent": "codex/1.0",
+      },
+      method: "POST",
+    })
+
+    expect(response.status).toBe(200)
+    const forwarded = createResponses.mock.calls[0]?.[0]
+    expect(forwarded.model).toBe("gpt-small")
+    expect(forwarded.tools).toEqual(tools)
+    expect(forwarded.tool_choice).toBe("required")
+    expect(forwarded.input).toEqual([
+      { role: "developer", type: "additional_tools", tools },
+      ...titleInput,
+    ])
+  })
 })
 
 describe("responses reasoning transport isolation", () => {
@@ -410,6 +542,24 @@ describe("responses handler token usage", () => {
           vendor: "anthropic",
           version: "test",
         },
+        {
+          capabilities: {
+            family: "deepseek",
+            limits: { max_prompt_tokens: 128000 },
+            object: "model_capabilities",
+            supports: { tool_calls: true },
+            tokenizer: "o200k_base",
+            type: "chat",
+          },
+          id: "deepseek-v4.1-flash",
+          model_picker_enabled: true,
+          name: "DeepSeek V4.1 Flash",
+          object: "model",
+          preview: false,
+          supported_endpoints: ["/v1/messages"],
+          vendor: "deepseek",
+          version: "test",
+        },
       ],
     }
     const handleMessages = mock(
@@ -536,16 +686,11 @@ describe("responses handler token usage", () => {
     const dispatchOptions = handleMessages.mock.calls[0]?.[2]
     const expectedSessionId = getUUID("root-session")
     expect(dispatchOptions?.sessionId).toBe(expectedSessionId)
-    expect(dispatchOptions?.requestId).toBe(
-      generateRequestIdFromPayload(
-        { messages: payload.input },
-        expectedSessionId,
-      ),
-    )
+    expect(dispatchOptions?.requestId).toBe(getUUID("child-thread_"))
     expect(dispatchOptions?.subagentMarker).toEqual({
       agent_id: "child-thread",
       agent_type: "collab_spawn",
-      session_id: "child-thread",
+      session_id: "root-session",
     })
   })
 
@@ -823,6 +968,18 @@ describe("responses handler token usage", () => {
       },
       method: "POST",
     })
+    const codexDeepSeekResponse = await app.request("/v1/responses", {
+      body: JSON.stringify({
+        model: "deepseek-v4.1-flash",
+        instructions: "Base instructions",
+        input: "hello",
+      }),
+      headers: {
+        "content-type": "application/json",
+        "user-agent": "codex-cli/1.0.0",
+      },
+      method: "POST",
+    })
     const otherResponse = await app.request("/v1/responses", {
       body: JSON.stringify({
         model: "claude-tips",
@@ -834,8 +991,9 @@ describe("responses handler token usage", () => {
     })
 
     expect(codexResponse.status).toBe(200)
+    expect(codexDeepSeekResponse.status).toBe(200)
     expect(otherResponse.status).toBe(200)
-    expect(handleMessages).toHaveBeenCalledTimes(2)
+    expect(handleMessages).toHaveBeenCalledTimes(3)
     expect(handleMessages.mock.calls[0]?.[1].system).toEqual([
       {
         type: "text",
@@ -844,6 +1002,13 @@ describe("responses handler token usage", () => {
       },
     ])
     expect(handleMessages.mock.calls[1]?.[1].system).toEqual([
+      {
+        type: "text",
+        text: `Base instructions\n\n${MESSAGES_TOOL_CALL_TIPS}`,
+        cache_control: { type: "ephemeral" },
+      },
+    ])
+    expect(handleMessages.mock.calls[2]?.[1].system).toEqual([
       {
         type: "text",
         text: "Base instructions",
@@ -1000,202 +1165,131 @@ describe("responses handler token usage", () => {
     expect(createResponses.mock.calls[0][1]?.transport).toBe("http")
   })
 
-  test("normalizes unsupported max reasoning effort to the highest supported level", async () => {
-    state.models = {
-      object: "list",
-      data: [
-        {
-          capabilities: {
-            limits: { max_prompt_tokens: 128000 },
-            supports: {
-              reasoning_effort: ["low", "medium", "high", "xhigh"],
-            },
-          },
-          id: "gpt-capability-test",
-          supported_endpoints: ["/responses"],
-        },
-      ],
-    } as typeof state.models
-    createResponses.mockImplementation((payload) =>
-      Promise.resolve(createResponsesResult(payload.model)),
-    )
+  const reasoningEffortCases: Array<
+    [string, string, Array<string> | undefined, string]
+  > = [
+    ["unsupported max", "max", ["low", "medium", "high", "xhigh"], "xhigh"],
+    [
+      "supported ultra alias",
+      "ultra",
+      ["none", "low", "medium", "high", "xhigh", "max"],
+      "max",
+    ],
+    ["max without capabilities", "max", undefined, "max"],
+    ["ultra without capabilities", "ultra", undefined, "max"],
+    ["unknown effort", "turbo", undefined, "turbo"],
+    [
+      "supported max",
+      "max",
+      ["none", "low", "medium", "high", "xhigh", "max"],
+      "max",
+    ],
+  ]
+  test.each(reasoningEffortCases)(
+    "forwards %s reasoning effort to native Responses",
+    async (_scenario, effort, supportedEfforts, expectedEffort) => {
+      if (supportedEfforts) {
+        state.models!.data[0].capabilities.supports = {
+          reasoning_effort: supportedEfforts,
+        }
+      }
+      createResponses.mockImplementation((payload) =>
+        Promise.resolve(createResponsesResult(payload.model)),
+      )
 
-    const response = await createApp().request("/v1/responses", {
-      body: JSON.stringify({
-        input: "hello",
-        model: "gpt-capability-test",
-        reasoning: { effort: "max" },
-      }),
-      headers: { "content-type": "application/json" },
-      method: "POST",
-    })
+      const response = await createApp().request("/v1/responses", {
+        body: JSON.stringify({
+          input: "hello",
+          model: "gpt-test",
+          reasoning: { effort },
+        }),
+        headers: { "content-type": "application/json" },
+        method: "POST",
+      })
 
-    expect(response.status).toBe(200)
-    expect(createResponses).toHaveBeenCalledTimes(1)
-    expect(createResponses.mock.calls[0][0].reasoning).toEqual({
-      effort: "xhigh",
-    })
-  })
-
-  test("maps ultra reasoning effort to max when max is supported", async () => {
-    state.models = {
-      object: "list",
-      data: [
-        {
-          capabilities: {
-            limits: { max_prompt_tokens: 128000 },
-            supports: {
-              reasoning_effort: [
-                "none",
-                "low",
-                "medium",
-                "high",
-                "xhigh",
-                "max",
-              ],
-            },
-          },
-          id: "gpt-ultra-capability",
-          supported_endpoints: ["/responses"],
-        },
-      ],
-    } as typeof state.models
-    createResponses.mockImplementation((payload) =>
-      Promise.resolve(createResponsesResult(payload.model)),
-    )
-
-    const response = await createApp().request("/v1/responses", {
-      body: JSON.stringify({
-        input: "hello",
-        model: "gpt-ultra-capability",
-        reasoning: { effort: "ultra" },
-      }),
-      headers: { "content-type": "application/json" },
-      method: "POST",
-    })
-
-    expect(response.status).toBe(200)
-    expect(createResponses).toHaveBeenCalledTimes(1)
-    expect(createResponses.mock.calls[0][0].reasoning).toEqual({
-      effort: "max",
-    })
-  })
-
-  test("preserves max reasoning effort when capabilities are unknown", async () => {
-    createResponses.mockImplementation((payload) =>
-      Promise.resolve(createResponsesResult(payload.model)),
-    )
-
-    const response = await createApp().request("/v1/responses", {
-      body: JSON.stringify({
-        input: "hello",
-        model: "gpt-test",
-        reasoning: { effort: "max" },
-      }),
-      headers: { "content-type": "application/json" },
-      method: "POST",
-    })
-
-    expect(response.status).toBe(200)
-    expect(createResponses).toHaveBeenCalledTimes(1)
-    expect(createResponses.mock.calls[0][0].reasoning).toEqual({
-      effort: "max",
-    })
-  })
-
-  test("maps ultra reasoning effort to max when capabilities are unknown", async () => {
-    createResponses.mockImplementation((payload) =>
-      Promise.resolve(createResponsesResult(payload.model)),
-    )
-
-    const response = await createApp().request("/v1/responses", {
-      body: JSON.stringify({
-        input: "hello",
-        model: "gpt-test",
-        reasoning: { effort: "ultra" },
-      }),
-      headers: { "content-type": "application/json" },
-      method: "POST",
-    })
-
-    expect(response.status).toBe(200)
-    expect(createResponses).toHaveBeenCalledTimes(1)
-    expect(createResponses.mock.calls[0][0].reasoning).toEqual({
-      effort: "max",
-    })
-  })
-
-  test("preserves unknown reasoning effort for upstream validation", async () => {
-    createResponses.mockImplementation((payload) =>
-      Promise.resolve(createResponsesResult(payload.model)),
-    )
-
-    const response = await createApp().request("/v1/responses", {
-      body: JSON.stringify({
-        input: "hello",
-        model: "gpt-test",
-        reasoning: { effort: "turbo" },
-      }),
-      headers: { "content-type": "application/json" },
-      method: "POST",
-    })
-
-    expect(response.status).toBe(200)
-    expect(createResponses).toHaveBeenCalledTimes(1)
-    expect(
-      (createResponses.mock.calls[0][0].reasoning as { effort?: string })
-        ?.effort,
-    ).toBe("turbo")
-  })
-
-  test("preserves supported max reasoning effort for native Responses", async () => {
-    state.models = {
-      object: "list",
-      data: [
-        {
-          capabilities: {
-            limits: { max_prompt_tokens: 128000 },
-            supports: {
-              reasoning_effort: [
-                "none",
-                "low",
-                "medium",
-                "high",
-                "xhigh",
-                "max",
-              ],
-            },
-          },
-          id: "gpt-max-capability",
-          supported_endpoints: ["/responses"],
-        },
-      ],
-    } as typeof state.models
-    createResponses.mockImplementation((payload) =>
-      Promise.resolve(createResponsesResult(payload.model)),
-    )
-
-    const response = await createApp().request("/v1/responses", {
-      body: JSON.stringify({
-        input: "hello",
-        model: "gpt-max-capability",
-        reasoning: { effort: "max" },
-      }),
-      headers: { "content-type": "application/json" },
-      method: "POST",
-    })
-
-    expect(response.status).toBe(200)
-    expect(createResponses).toHaveBeenCalledTimes(1)
-    expect(createResponses.mock.calls[0][0].reasoning).toEqual({
-      effort: "max",
-    })
-  })
+      expect(response.status).toBe(200)
+      expect(createResponses).toHaveBeenCalledTimes(1)
+      expect(
+        createResponses.mock.calls[0][0].reasoning as
+          | { effort?: string }
+          | null
+          | undefined,
+      ).toEqual({
+        effort: expectedEffort,
+      })
+    },
+  )
 
   for (const [transport, supportedEndpoints] of [
     ["http", ["/responses"]],
     ["websocket", ["/responses", "ws:/responses"]],
   ] as const) {
+    test(`translates Guardian agent messages before the ${transport} transport`, async () => {
+      state.models = {
+        object: "list",
+        data: [
+          {
+            capabilities: { limits: { max_prompt_tokens: 128000 } },
+            id: "gpt-test",
+            supported_endpoints: [...supportedEndpoints],
+          },
+        ],
+      } as typeof state.models
+      createResponses.mockImplementation((payload) =>
+        Promise.resolve(createResponsesResult(payload.model)),
+      )
+
+      const response = await createApp().request("/v1/responses", {
+        body: JSON.stringify({
+          model: "gpt-test",
+          prompt_cache_key: "guardian:01a12870-03e0-7331-8eec-2b0677454fba",
+          text: {
+            format: {
+              type: "json_schema",
+              name: "guardian_decision",
+              schema: { type: "object" },
+            },
+          },
+          input: [
+            { type: "message", role: "developer", content: "Review action" },
+            {
+              id: "amsg-1",
+              type: "agent_message",
+              author: "agent-a",
+              recipient: "agent-b",
+              content: [
+                { type: "input_text", text: "Planned action" },
+                {
+                  type: "encrypted_content",
+                  encrypted_content: "encrypted-handoff",
+                },
+              ],
+            },
+          ],
+        }),
+        headers: { "content-type": "application/json" },
+        method: "POST",
+      })
+
+      expect(response.status).toBe(200)
+      expect(createResponses).toHaveBeenCalledTimes(1)
+      const [payload, options] = createResponses.mock.calls[0]
+      expect(options.transport).toBe(transport)
+      expect(options.initiator).toBe("user")
+      expect(payload.input).toEqual([
+        { type: "message", role: "developer", content: "Review action" },
+        {
+          type: "message",
+          role: "user",
+          content: [{ type: "input_text", text: "Planned action" }],
+        },
+      ])
+      expect(payload.prompt_cache_key).toBe(
+        "guardian:01a12870-03e0-7331-8eec-2b0677454fba",
+      )
+      expect(payload.text?.format?.type).toBe("json_schema")
+    })
+
     test(`sanitizes unsupported Copilot input fields before the ${transport} transport`, async () => {
       state.models = {
         object: "list",
@@ -1382,47 +1476,53 @@ describe("responses handler token usage", () => {
     ])
   })
 
-  test("does not compact input ending with compaction trigger when context management is disabled", async () => {
-    createResponses.mockImplementation((payload) =>
-      Promise.resolve(createResponsesResult(payload.model)),
-    )
+  test.each(["other-client/1.0", "opencode/2.0.24"])(
+    "preserves compaction trigger input with context management disabled for %s",
+    async (userAgent) => {
+      createResponses.mockImplementation((payload) =>
+        Promise.resolve(createResponsesResult(payload.model)),
+      )
 
-    const input = [
-      {
-        content: "old content before compaction",
-        role: "user",
-      },
-      {
-        encrypted_content: "cipher",
-        id: "compaction-1",
-        type: "compaction",
-      },
-      {
-        content: "Continue after the latest compaction.",
-        role: "user",
-      },
-      {
-        type: "compaction_trigger",
-      },
-    ]
+      const input = [
+        {
+          content: "old content before compaction",
+          role: "user",
+        },
+        {
+          encrypted_content: "cipher",
+          id: "compaction-1",
+          type: "compaction",
+        },
+        {
+          content: "Continue after the latest compaction.",
+          role: "user",
+        },
+        {
+          type: "compaction_trigger",
+        },
+      ]
 
-    const app = createApp()
-    const response = await app.request("/v1/responses", {
-      body: JSON.stringify({
-        input,
-        model: "gpt-test",
-      }),
-      headers: {
-        "content-type": "application/json",
-      },
-      method: "POST",
-    })
+      const app = createApp()
+      const response = await app.request("/v1/responses", {
+        body: JSON.stringify({
+          input,
+          model: "gpt-test",
+        }),
+        headers: {
+          "content-type": "application/json",
+          "user-agent": userAgent,
+        },
+        method: "POST",
+      })
 
-    expect(response.status).toBe(200)
-    expect(createResponses).toHaveBeenCalledTimes(1)
-    expect(createResponses.mock.calls[0][0].context_management).toBeUndefined()
-    expect(createResponses.mock.calls[0][0].input).toEqual(input)
-  })
+      expect(response.status).toBe(200)
+      expect(createResponses).toHaveBeenCalledTimes(1)
+      expect(
+        createResponses.mock.calls[0][0].context_management,
+      ).toBeUndefined()
+      expect(createResponses.mock.calls[0][0].input).toEqual(input)
+    },
+  )
 
   test("preserves custom apply_patch tools for Copilot Responses", async () => {
     createResponses.mockImplementation((payload) =>
@@ -1498,83 +1598,40 @@ describe("responses handler token usage", () => {
     ).toBe("workspace")
   })
 
-  test("disables context management for gpt-5.6 models even when responses context management is enabled", async () => {
-    state.models = {
-      object: "list",
-      data: [
-        {
-          capabilities: {
-            limits: {
-              max_prompt_tokens: 272000,
-            },
+  test.each(["gpt-5.6-sol", "gpt-6"])(
+    "disables context management for %s even when enabled",
+    async (model) => {
+      state.models = {
+        object: "list",
+        data: [
+          {
+            capabilities: { limits: { max_prompt_tokens: 272000 } },
+            id: model,
+            supported_endpoints: ["/responses"],
           },
-          id: "gpt-5.6-sol",
-          supported_endpoints: ["/responses"],
-        },
-      ],
-    } as typeof state.models
-    responsesUtilsDependencies.isContextManagementEnabledForResponses = () =>
-      true
-    responsesUtilsDependencies.getModelResponsesApiCompactThreshold = () =>
-      231200
-    createResponses.mockImplementation((payload) =>
-      Promise.resolve(createResponsesResult(payload.model)),
-    )
+        ],
+      } as typeof state.models
+      responsesUtilsDependencies.isContextManagementEnabledForResponses = () =>
+        true
+      responsesUtilsDependencies.getModelResponsesApiCompactThreshold = () =>
+        231200
+      createResponses.mockImplementation((payload) =>
+        Promise.resolve(createResponsesResult(payload.model)),
+      )
 
-    const app = createApp()
-    const response = await app.request("/v1/responses", {
-      body: JSON.stringify({
-        input: "hello",
-        model: "gpt-5.6-sol",
-      }),
-      headers: {
-        "content-type": "application/json",
-      },
-      method: "POST",
-    })
+      const response = await createApp().request("/v1/responses", {
+        body: JSON.stringify({ input: "hello", model }),
+        headers: { "content-type": "application/json" },
+        method: "POST",
+      })
 
-    expect(response.status).toBe(200)
-    expect(createResponses).toHaveBeenCalledTimes(1)
-    expect(createResponses.mock.calls[0][0].context_management).toBeUndefined()
-  })
-
-  test("disables context management for gpt-6 models even when responses context management is enabled", async () => {
-    state.models = {
-      object: "list",
-      data: [
-        {
-          capabilities: {
-            limits: {
-              max_prompt_tokens: 272000,
-            },
-          },
-          id: "gpt-6",
-          supported_endpoints: ["/responses"],
-        },
-      ],
-    } as typeof state.models
-    responsesUtilsDependencies.isContextManagementEnabledForResponses = () =>
-      true
-    createResponses.mockImplementation((payload) =>
-      Promise.resolve(createResponsesResult(payload.model)),
-    )
-
-    const app = createApp()
-    const response = await app.request("/v1/responses", {
-      body: JSON.stringify({
-        input: "hello",
-        model: "gpt-6",
-      }),
-      headers: {
-        "content-type": "application/json",
-      },
-      method: "POST",
-    })
-
-    expect(response.status).toBe(200)
-    expect(createResponses).toHaveBeenCalledTimes(1)
-    expect(createResponses.mock.calls[0][0].context_management).toBeUndefined()
-  })
+      expect(response.status).toBe(200)
+      expect(createResponses).toHaveBeenCalledTimes(1)
+      expect(
+        createResponses.mock.calls[0][0].context_management,
+      ).toBeUndefined()
+    },
+  )
 
   test("uses Codex subagent headers for Responses request attribution", async () => {
     createResponses.mockImplementation((payload) =>
@@ -1611,16 +1668,11 @@ describe("responses handler token usage", () => {
     const expectedSessionId = getUUID("root-session")
     expect(options?.initiator).toBe("agent")
     expect(options?.sessionId).toBe(expectedSessionId)
-    expect(options?.requestId).toBe(
-      generateRequestIdFromPayload(
-        { messages: payload.input },
-        expectedSessionId,
-      ),
-    )
+    expect(options?.requestId).toBe(getUUID("child-thread_"))
     expect(options?.subagentMarker).toEqual({
       agent_id: "child-thread",
       agent_type: "collab_spawn",
-      session_id: "child-thread",
+      session_id: "root-session",
     })
   })
 
@@ -1657,7 +1709,7 @@ describe("responses handler token usage", () => {
 
     const options = createResponses.mock.calls[0][1]
     const expectedSessionId = getUUID("root-session")
-    expect(options?.initiator).toBe("agent")
+    expect(options?.initiator).toBe("user")
     expect(options?.sessionId).toBe(expectedSessionId)
     expect(options?.requestId).toBe(
       generateRequestIdFromPayload(
@@ -1665,36 +1717,30 @@ describe("responses handler token usage", () => {
         expectedSessionId,
       ),
     )
-    expect(options?.subagentMarker).toEqual({
-      agent_id: "parent-thread",
-      agent_type: "collab_spawn",
-      session_id: "root-session",
-    })
+    expect(options?.subagentMarker).toBeNull()
   })
 
-  test("uses session headers when Codex subagent header is missing", async () => {
+  test("uses session affinity for the Responses request id before the codex thread", async () => {
     createResponses.mockImplementation((payload) =>
       Promise.resolve(createResponsesResult(payload.model)),
     )
 
-    const payload = {
-      input: [
-        {
-          content: [{ text: "hello", type: "input_text" }],
-          role: "user",
-        },
-      ],
-      model: "gpt-test",
-    }
-
     const app = createApp()
     const response = await app.request("/v1/responses", {
-      body: JSON.stringify(payload),
+      body: JSON.stringify({
+        input: [
+          {
+            content: [{ text: "hello", type: "input_text" }],
+            role: "user",
+          },
+        ],
+        model: "gpt-test",
+      }),
       headers: {
         "content-type": "application/json",
         "session-id": "root-session",
+        "x-opencode-session-id": " affinity-1 ",
         "thread-id": "child-thread",
-        "x-codex-parent-thread-id": "parent-thread",
       },
       method: "POST",
     })
@@ -1703,16 +1749,68 @@ describe("responses handler token usage", () => {
     expect(createResponses).toHaveBeenCalledTimes(1)
 
     const options = createResponses.mock.calls[0][1]
-    const expectedSessionId = getUUID("root-session")
-    const expectedRequestId = generateRequestIdFromPayload(
-      { messages: payload.input },
-      expectedSessionId,
-    )
-    expect(options?.initiator).toBe("user")
-    expect(options?.requestId).toBe(expectedRequestId)
-    expect(options?.sessionId).toBe(expectedSessionId)
-    expect(options?.subagentMarker).toBeNull()
+    expect(options?.sessionId).toBe(getUUID("root-session"))
+    expect(options?.requestId).toBe(getUUID("affinity-1_"))
   })
+
+  test.each([
+    new Headers({
+      "session-id": "root-session",
+      "x-root-session-id": "plugin-root",
+      "x-session-id": "child-session",
+    }),
+    new Headers({
+      "x-root-session-id": "root-session",
+      "x-session-id": "child-session",
+    }),
+    new Headers({ "x-session-id": "root-session" }),
+    new Headers({
+      "session-id": " ",
+      "x-root-session-id": " root-session ",
+      "x-session-id": "child-session",
+    }),
+    new Headers({
+      "x-root-session-id": " ",
+      "x-session-id": "root-session",
+    }),
+  ])(
+    "uses session headers when Codex subagent header is missing (%#)",
+    async (headers) => {
+      createResponses.mockImplementation((payload) =>
+        Promise.resolve(createResponsesResult(payload.model)),
+      )
+
+      const payload = {
+        input: [
+          {
+            content: [{ text: "hello", type: "input_text" }],
+            role: "user",
+          },
+        ],
+        model: "gpt-test",
+      }
+
+      headers.set("content-type", "application/json")
+      headers.set("thread-id", "child-thread")
+      headers.set("x-codex-parent-thread-id", "parent-thread")
+      const app = createApp()
+      const response = await app.request("/v1/responses", {
+        body: JSON.stringify(payload),
+        headers,
+        method: "POST",
+      })
+
+      expect(response.status).toBe(200)
+      expect(createResponses).toHaveBeenCalledTimes(1)
+
+      const options = createResponses.mock.calls[0][1]
+      const expectedSessionId = getUUID("root-session")
+      expect(options?.initiator).toBe("user")
+      expect(options?.requestId).toBe(getUUID("child-thread_"))
+      expect(options?.sessionId).toBe(expectedSessionId)
+      expect(options?.subagentMarker).toBeNull()
+    },
+  )
 
   test("ignores unknown x-openai-subagent values", async () => {
     createResponses.mockImplementation((payload) =>
@@ -1747,9 +1845,14 @@ describe("responses handler token usage", () => {
     expect(createResponses.mock.calls[0][1]?.subagentMarker).toBeNull()
   })
 
-  test("accepts known Codex subagent header values", async () => {
-    for (const agentType of ["compact", "memory_consolidation", "review"]) {
-      createResponses.mockReset()
+  test.each(
+    ["collab_spawn", "compact", "memory_consolidation", "review"].flatMap(
+      (agentType) =>
+        [false, true].map((withParent) => ({ agentType, withParent })),
+    ),
+  )(
+    "recognizes $agentType Codex subagents with parent header=$withParent",
+    async ({ agentType, withParent }) => {
       createResponses.mockImplementation((payload) =>
         Promise.resolve(createResponsesResult(payload.model)),
       )
@@ -1769,6 +1872,9 @@ describe("responses handler token usage", () => {
           "content-type": "application/json",
           "session-id": "root-session",
           "thread-id": "child-thread",
+          ...(withParent ?
+            { "x-codex-parent-thread-id": "parent-thread" }
+          : {}),
           "x-openai-subagent": agentType,
         },
         method: "POST",
@@ -1780,10 +1886,10 @@ describe("responses handler token usage", () => {
       expect(createResponses.mock.calls[0][1]?.subagentMarker).toEqual({
         agent_id: "child-thread",
         agent_type: agentType,
-        session_id: "child-thread",
+        session_id: "root-session",
       })
-    }
-  })
+    },
+  )
 
   test("omits oversized input images before forwarding to Copilot Responses", async () => {
     state.models = {

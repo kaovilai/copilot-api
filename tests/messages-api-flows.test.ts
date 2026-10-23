@@ -11,7 +11,10 @@ import type {
   ChatCompletionResponse,
   ChatCompletionsPayload,
 } from "~/lib/types/chat-completions"
-import type { CreateMessagesReturn } from "~/services/copilot/create-messages"
+import type {
+  createMessages as createCopilotMessages,
+  CreateMessagesReturn,
+} from "~/services/copilot/create-messages"
 import type {
   CreateResponsesReturn,
   ResponsesPayload,
@@ -20,7 +23,10 @@ import type {
 } from "~/lib/types/responses"
 
 import { COMPACT_REQUEST } from "~/lib/compact"
+import { installModelsDevCatalog } from "~/lib/models-dev-cache"
 import { closeUsageStore, getTokenUsageEventsPage } from "~/lib/token-usage"
+
+import { modelsDevCatalogFixture } from "./fixtures/models-dev-catalog"
 
 const DB_PATH_ENV = "COPILOT_API_SQLITE_DB_PATH"
 
@@ -55,7 +61,11 @@ const createChatCompletions = mock(
   },
 )
 const createMessages = mock(
-  (payload: AnthropicMessagesPayload): Promise<CreateMessagesReturn> => {
+  (
+    payload: AnthropicMessagesPayload,
+    _anthropicBetaHeader: Parameters<typeof createCopilotMessages>[1],
+    _options: Parameters<typeof createCopilotMessages>[2],
+  ): Promise<CreateMessagesReturn> => {
     capturedMessagesPayload = payload
     return Promise.resolve(createMessagesResult(payload.model))
   },
@@ -94,8 +104,11 @@ const logger = {
 const createContext = () =>
   ({
     json: (body: unknown) => Response.json(body),
-    req: { raw: { signal: new AbortController().signal } },
-  }) as Parameters<typeof handleWithChatCompletions>[0]
+    req: {
+      header: () => undefined,
+      raw: { signal: new AbortController().signal },
+    },
+  }) as unknown as Parameters<typeof handleWithChatCompletions>[0]
 
 beforeEach(async () => {
   process.env[DB_PATH_ENV] = ":memory:"
@@ -126,6 +139,128 @@ afterEach(async () => {
   await closeUsageStore()
   Reflect.deleteProperty(process.env, DB_PATH_ENV)
 })
+
+test("Messages flow passes the inbound anthropic-version to the Copilot request", async () => {
+  const app = new Hono()
+  app.post("/", (c) =>
+    handleWithMessagesApi(
+      c,
+      {
+        model: "claude-sonnet-5",
+        max_tokens: 16,
+        messages: [{ role: "user", content: "hello" }],
+      },
+      {
+        logger,
+        requestId: "request-version-test",
+        anthropicBetaHeader: "context-management-2025-06-27",
+      },
+    ),
+  )
+
+  const response = await app.request("/", {
+    method: "POST",
+    headers: { "Anthropic-Version": "client-selected-version" },
+  })
+
+  expect(response.status).toBe(200)
+  expect(createMessages.mock.calls[0][1]).toBe("context-management-2025-06-27")
+  expect(createMessages.mock.calls[0][2].anthropicVersionHeader).toBe(
+    "client-selected-version",
+  )
+})
+
+test("messages Chat Completions flow shares the main cache key with dispatched subagents", async () => {
+  const response = await handleWithChatCompletions(
+    createContext(),
+    {
+      model: "gpt-test",
+      max_tokens: 128,
+      metadata: { user_id: JSON.stringify({ session_id: "root" }) },
+      messages: [{ role: "user", content: "hello" }],
+    },
+    {
+      logger,
+      requestId: "request-subagent",
+      subagentMarker: {
+        session_id: "child",
+        agent_id: "agent-a",
+        agent_type: "collab_spawn",
+      },
+    },
+  )
+
+  expect(response.status).toBe(200)
+  expect(capturedPayload?.prompt_cache_key).toBe("root")
+})
+
+test.each(["catalog", "live"])(
+  "messages Chat Completions flow preserves PDFs supported by %s metadata",
+  async (source) => {
+    const selectedModel = createModel([])
+    if (source === "live") {
+      selectedModel.capabilities.limits.vision = {
+        supported_media_types: ["application/pdf"],
+      }
+    }
+    installModelsDevCatalog({
+      ...modelsDevCatalogFixture,
+      "github-copilot": {
+        models: {
+          "gpt-test": {
+            id: "gpt-test",
+            modalities: {
+              input: source === "catalog" ? ["text", "pdf"] : ["text"],
+            },
+          },
+        },
+      },
+    })
+
+    try {
+      const response = await handleWithChatCompletions(
+        createContext(),
+        {
+          model: "gpt-test",
+          max_tokens: 128,
+          messages: [
+            {
+              role: "user",
+              content: [
+                {
+                  type: "document",
+                  source: {
+                    type: "base64",
+                    media_type: "application/pdf",
+                    data: "pdf-data",
+                  },
+                  title: "report.pdf",
+                },
+              ],
+            },
+          ],
+        },
+        { logger, requestId: "request-pdf", selectedModel },
+      )
+
+      expect(response.status).toBe(200)
+      expect(capturedPayload?.messages[0]).toMatchObject({
+        role: "user",
+        content: [
+          {
+            type: "file",
+            file: {
+              file_data: "data:application/pdf;base64,pdf-data",
+              filename: "report.pdf",
+            },
+          },
+        ],
+      })
+    } finally {
+      installModelsDevCatalog(modelsDevCatalogFixture)
+    }
+  },
+)
 
 test("messages Chat Completions flow adds Copilot cache control to system and latest non-system message", async () => {
   const payload: AnthropicMessagesPayload = {

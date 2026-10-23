@@ -11,22 +11,39 @@ import {
   type ProviderConfig,
   type ProviderType,
 } from "./config-store"
+import {
+  getModelsDevModelApi,
+  getModelsDevModelPricing,
+  getModelsDevModelProviderType,
+  getModelsDevProviderApi,
+  getOpencodeGoModelProviderType,
+} from "./models-dev-cache"
+import {
+  resolveProviderModelsDevId,
+  usesModelsDevModelCatalog,
+} from "./provider-model-catalog"
 
 export interface ResolvedProviderConfig {
   name: string
   type: ProviderType
   baseUrl: string
+  modelsDevProviderId?: string
   apiKey: string
   authType: ProviderAuthType
+  authTypeExplicit?: boolean
   pricingCurrency?: string
   models?: Record<string, ModelConfig>
+  agentsModels?: Array<string>
 }
 
-const OPENCODE_ANTHROPIC_MODEL_PATTERN = /^(?:qwen|minimax)/iu
-const OPENCODE_RESPONSES_MODEL_PATTERN = /^(?:gpt|grok|muse-spark)(?:[-_.]|$)/iu
-
 export function normalizeProviderBaseUrl(url: string): string {
-  return url.trim().replace(/\/+$/u, "")
+  return url
+    .trim()
+    .replace(/\/+$/u, "")
+    .replace(
+      /^https:\/\/opencode\.ai\/zen\/go(?=\/|$)/u,
+      "https://opencode.ai/inference/go",
+    )
 }
 
 export function isSupportedProviderType(value: string): value is ProviderType {
@@ -36,6 +53,7 @@ export function isSupportedProviderType(value: string): value is ProviderType {
 function getDefaultProviderAuthType(
   providerType: ProviderType,
 ): ProviderAuthType {
+  if (providerType === "google") return "x-goog-api-key"
   return providerType === "anthropic" ? "x-api-key" : "authorization"
 }
 
@@ -49,17 +67,17 @@ export function resolveProviderAuthType(
     return defaultAuthType
   }
 
-  if (authType === "x-api-key") {
-    return "x-api-key"
+  if (authType === "x-api-key" || authType === "x-goog-api-key") {
+    return authType
   }
 
   if (authType === "oauth2") {
-    if (providerName === "codex") {
+    if (providerName === "codex" || providerName === "xai") {
       return authType
     }
 
     consola.warn(
-      `Provider ${providerName} has authType 'oauth2', which is only supported by the builtin codex provider, falling back to ${defaultAuthType}`,
+      `Provider ${providerName} has authType 'oauth2', which is only supported by the builtin codex and xai providers, falling back to ${defaultAuthType}`,
     )
     return defaultAuthType
   }
@@ -80,7 +98,10 @@ function isProviderApiKeyRequired(
 ): boolean {
   return (
     authType !== "azure-entra"
-    && !(providerName === "codex" && authType === "oauth2")
+    && !(
+      (providerName === "codex" || providerName === "xai")
+      && authType === "oauth2"
+    )
   )
 }
 
@@ -178,10 +199,13 @@ export function getProviderConfig(name: string): ResolvedProviderConfig | null {
     name: providerName,
     type,
     baseUrl,
+    modelsDevProviderId: provider.modelsDevProviderId,
     apiKey,
     authType,
+    authTypeExplicit: provider.authType !== undefined,
     pricingCurrency: normalizePricingCurrency(provider.pricingCurrency),
     models: provider.models,
+    agentsModels: provider.agentsModels,
   }
 }
 
@@ -195,15 +219,78 @@ export function resolveEffectiveProviderType(
   }
 
   if (providerConfig.name === "opencode-go") {
-    if (OPENCODE_ANTHROPIC_MODEL_PATTERN.test(model)) {
-      return "anthropic"
-    }
-    if (OPENCODE_RESPONSES_MODEL_PATTERN.test(model)) {
+    return getOpencodeGoModelProviderType(model)
+  }
+
+  if (providerConfig.modelsDevProviderId) {
+    const catalogType = getModelsDevModelProviderType(
+      providerConfig.modelsDevProviderId,
+      model,
+    )
+    if (catalogType) return catalogType
+  }
+
+  if (providerConfig.name === "openrouter") {
+    if (model.includes("gpt-")) {
       return "openai-responses"
     }
   }
 
   return providerConfig.type
+}
+
+export function resolveProviderConfigForModel(
+  providerConfig: ResolvedProviderConfig,
+  model: string,
+): ResolvedProviderConfig {
+  const type = resolveEffectiveProviderType(providerConfig, model)
+  const modelApi =
+    (
+      providerConfig.modelsDevProviderId
+      && providerConfig.baseUrl
+        === getModelsDevProviderApi(providerConfig.modelsDevProviderId)
+    ) ?
+      getModelsDevModelApi(providerConfig.modelsDevProviderId, model)
+    : undefined
+  const configuredModel = providerConfig.models?.[model]
+  const catalogPricing =
+    (
+      providerConfig.modelsDevProviderId
+      || usesModelsDevModelCatalog(providerConfig.name)
+    ) ?
+      getModelsDevModelPricing(
+        resolveProviderModelsDevId(providerConfig.name, providerConfig),
+        model,
+      )
+    : undefined
+  const useCatalogPricing =
+    catalogPricing !== undefined && configuredModel?.pricing === undefined
+  if (type === providerConfig.type && !modelApi && !useCatalogPricing) {
+    return providerConfig
+  }
+
+  return {
+    ...providerConfig,
+    type,
+    baseUrl: modelApi ?? providerConfig.baseUrl,
+    models:
+      useCatalogPricing ?
+        {
+          ...providerConfig.models,
+          [model]: { ...configuredModel, pricing: catalogPricing },
+        }
+      : providerConfig.models,
+    pricingCurrency: useCatalogPricing ? "USD" : providerConfig.pricingCurrency,
+    authType:
+      (
+        type !== providerConfig.type
+        && !providerConfig.authTypeExplicit
+        && providerConfig.authType !== "azure-entra"
+        && providerConfig.authType !== "oauth2"
+      ) ?
+        resolveProviderAuthType(providerConfig.name, undefined, type)
+      : providerConfig.authType,
+  }
 }
 
 function normalizePricingCurrency(
@@ -216,9 +303,11 @@ function normalizePricingCurrency(
 export function listEnabledProviders(): Array<string> {
   const config = getConfig()
   const providerNames = Object.keys(config.providers ?? {})
-  return providerNames.filter((name) => getProviderConfig(name) !== null)
+  return providerNames.filter(
+    (name) => !isReservedProviderName(name) && getProviderConfig(name) !== null,
+  )
 }
 
 export function isReservedProviderName(name: string): boolean {
-  return name.trim() === "copilot"
+  return name.trim() === "copilot" || name.trim() === "github-copilot"
 }

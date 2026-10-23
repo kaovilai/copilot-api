@@ -19,6 +19,7 @@ import {
 } from "~/lib/config"
 import { HTTPError, UpstreamHeadersTimeoutError } from "~/lib/error"
 import { retryPreResponseFailures } from "~/lib/fetch-timeout"
+import { FULL_MODEL_CATALOG_HEADER } from "~/lib/internal-headers"
 import { state } from "~/lib/state"
 import {
   createPooledWebSocketStream,
@@ -28,7 +29,7 @@ import {
 import {
   createResponsesSafeStream,
   encodePoolKeyPart,
-  isTerminalResponsesStreamChunk,
+  getResponsesStreamTerminalDisposition,
 } from "~/services/responses-websocket-helpers"
 import { createResponsesHttpEventStream } from "~/services/responses-http"
 import { fetchUpstreamWithLifecycle } from "~/services/upstream-http"
@@ -36,6 +37,13 @@ import { requestContext } from "~/lib/request-context"
 import consola from "consola"
 
 export const CODEX_API_BASE_URL = "https://chatgpt.com/backend-api"
+
+const CODEX_RESPONSE_METADATA_EVENT = "codex.response.metadata"
+const RESPONSE_CREATED_EVENT = "response.created"
+const CODEX_USER_AGENT_VERSION_PATTERN =
+  /\bcodex(?:[-_ ][a-z0-9]+)*\/(\d+\.\d+\.\d+)(?:-[a-z0-9.-]+)?(?:\+[a-z0-9.-]+)?(?=$|[\s;)])/iu
+const CODEX_RESPONSES_LITE_METADATA_KEY =
+  "ws_request_header_x_openai_internal_codex_responses_lite"
 
 type CodexResponsesWebSocketPayload = ResponsesPayload & {
   type: "response.create"
@@ -47,10 +55,12 @@ type CodexResponsesWebSocketRequest =
   PooledWebSocketRequest<CodexResponsesWebSocketPayload>
 
 interface CodexResponsesHeaderOptions {
+  payload?: Pick<ResponsesPayload, "model" | "service_tier">
   stream?: boolean | null
 }
 
 const STRIPPED_CODEX_REQUEST_HEADERS = new Set([
+  FULL_MODEL_CATALOG_HEADER,
   "accept-encoding",
   "authorization",
   "cdn-loop",
@@ -70,7 +80,12 @@ const STRIPPED_CODEX_REQUEST_HEADERS = new Set([
   "x-forwarded-proto",
 ])
 
-const STRIPPED_CODEX_WEBSOCKET_HEADERS = new Set(["accept", "content-type"])
+const STRIPPED_CODEX_WEBSOCKET_HEADERS = new Set([
+  "accept",
+  "content-type",
+  "x-openai-internal-codex-responses-lite",
+  "x-codex-turn-state",
+])
 
 const shouldForwardCodexRequestHeader = (headerName: string): boolean => {
   const headerNameLower = headerName.toLowerCase()
@@ -164,6 +179,14 @@ export function buildCodexResponsesHeaders(
     options.stream ? "text/event-stream" : "application/json",
   )
   setDefaultCodexHeader(headers, "content-type", "application/json")
+  if (options.payload) {
+    const { model, service_tier: serviceTier } = options.payload
+    const routingHint = `model=${model}`
+    headers.set(
+      "x-codex-routing-hint",
+      serviceTier ? `${routingHint};tier=${serviceTier}` : routingHint,
+    )
+  }
   return headers
 }
 
@@ -175,8 +198,21 @@ export function buildCodexRequestHeaders(requestHeaders: Headers): Headers {
   headers.set("chatgpt-account-id", accountId)
   setDefaultCodexHeader(headers, "originator", "copilot-api")
   setDefaultCodexHeader(headers, "user-agent", "copilot-api")
+  if (!headers.has("version")) {
+    const version = headers
+      .get("user-agent")
+      ?.match(CODEX_USER_AGENT_VERSION_PATTERN)?.[1]
+    if (version) {
+      headers.set("version", version)
+    }
+  }
   applyOpencodeCodexHeaders(headers)
   return headers
+}
+
+export const codexResponsesDependencies = {
+  isResponsesApiWebSocketEnabled: () =>
+    isConfiguredResponsesApiWebSocketEnabled(),
 }
 
 export function resolveCodexResponsesTransport(
@@ -184,14 +220,17 @@ export function resolveCodexResponsesTransport(
 ): ResponsesTransport {
   return (
     transport
-    ?? (isConfiguredResponsesApiWebSocketEnabled() ? "websocket" : "http")
+    ?? (codexResponsesDependencies.isResponsesApiWebSocketEnabled() ?
+      "websocket"
+    : "http")
   )
 }
 
 export function buildCodexResponsesWebSocketHeaders(
   requestHeaders: Headers,
+  options: CodexResponsesHeaderOptions = {},
 ): Record<string, string> {
-  const headers = buildCodexResponsesHeaders(requestHeaders)
+  const headers = buildCodexResponsesHeaders(requestHeaders, options)
   setDefaultCodexHeader(
     headers,
     "openai-beta",
@@ -227,11 +266,28 @@ export function prepareCodexResponsesWebSocketRequest(
   requestHeaders: Headers,
   baseUrl: string = CODEX_API_BASE_URL,
 ): CodexResponsesWebSocketRequest {
-  const headers = buildCodexResponsesWebSocketHeaders(requestHeaders)
-
+  const headers = buildCodexResponsesWebSocketHeaders(requestHeaders, {
+    payload,
+  })
+  // websocket need not x-codex-turn-state, https need this.
   return {
     headers,
     payload: buildCodexResponsesWebSocketPayload(payload),
+    preparePayload: (websocketPayload) => {
+      const clientMetadata: Record<string, string> = {
+        ...websocketPayload.client_metadata,
+        "x-codex-ws-stream-request-start-ms": Date.now().toString(),
+      }
+      const responsesLite = requestHeaders.get(
+        "x-openai-internal-codex-responses-lite",
+      )
+      if (responsesLite) {
+        clientMetadata[CODEX_RESPONSES_LITE_METADATA_KEY] = responsesLite
+      } else {
+        delete clientMetadata[CODEX_RESPONSES_LITE_METADATA_KEY]
+      }
+      return { ...websocketPayload, client_metadata: clientMetadata }
+    },
     poolKey: buildCodexResponsesWebSocketPoolKey(payload, headers, baseUrl),
     url: buildCodexResponsesWebSocketUrl(baseUrl),
   }
@@ -243,6 +299,7 @@ export async function forwardCodexResponses(
   baseUrl: string = CODEX_API_BASE_URL,
   options: {
     clientSignal?: AbortSignal
+    onResponseHeaders?: (headers: Headers) => void
     transport?: ResponsesTransport
   } = {},
 ): Promise<CreateResponsesReturn> {
@@ -255,10 +312,15 @@ export async function forwardCodexResponses(
       requestHeaders,
       baseUrl,
       options.clientSignal,
+      options.onResponseHeaders,
     )
   }
 
   const normalizedPayload = normalizeCodexResponsesPayload(payload)
+  const headers = buildCodexResponsesHeaders(requestHeaders, {
+    payload: normalizedPayload,
+    stream: normalizedPayload.stream,
+  })
 
   const transportConfig = getUpstreamTransportConfig()
   const response = await retryPreResponseFailures(
@@ -267,9 +329,7 @@ export async function forwardCodexResponses(
         resolveCodexResponsesUrl(baseUrl),
         {
           method: "POST",
-          headers: buildCodexResponsesHeaders(requestHeaders, {
-            stream: normalizedPayload.stream,
-          }),
+          headers,
           body: JSON.stringify(normalizedPayload),
         },
         {
@@ -285,6 +345,8 @@ export async function forwardCodexResponses(
   if (!response.ok) {
     throw new HTTPError("Failed to create codex responses", response)
   }
+
+  options.onResponseHeaders?.(response.headers)
 
   if (normalizedPayload.stream) {
     return createResponsesSafeStream(createResponsesHttpEventStream(response))
@@ -438,7 +500,7 @@ const buildCodexResponsesWebSocketPoolKey = (
     .update(
       JSON.stringify(
         Object.entries(headers)
-          .filter(([headerName]) => !headerName.toLowerCase().includes("trace"))
+          .filter(([headerName]) => shouldIncludeHeader(headerName))
           .sort(([left], [right]) => left.localeCompare(right)),
       ),
     )
@@ -461,6 +523,7 @@ const forwardCodexResponsesOverWebSocket = (
   requestHeaders: Headers,
   baseUrl: string,
   clientSignal?: AbortSignal,
+  onResponseHeaders?: (headers: Headers) => void,
 ): ResponsesStream => {
   const websocketRequest = prepareCodexResponsesWebSocketRequest(
     payload,
@@ -468,33 +531,108 @@ const forwardCodexResponsesOverWebSocket = (
     baseUrl,
   )
 
-  return createCodexResponsesWebSocketStream(websocketRequest, clientSignal)
+  return createCodexResponsesWebSocketStream(
+    websocketRequest,
+    clientSignal,
+    onResponseHeaders,
+  )
 }
 
 const createCodexResponsesWebSocketStream = (
   request: CodexResponsesWebSocketRequest,
   clientSignal?: AbortSignal,
+  onResponseHeaders?: (headers: Headers) => void,
 ): ResponsesStream => {
   const transportConfig = getUpstreamTransportConfig()
   return createResponsesSafeStream(
     createClientPreflightStream(
-      createPooledWebSocketStream(request, {
-        createChunk: createCodexResponsesWebSocketStreamChunk,
-        maxBufferedBytes: transportConfig.websocketMaxBufferedBytes,
-        maxBufferedMessages: transportConfig.websocketMaxBufferedMessages,
-        isTerminalChunk: isTerminalResponsesStreamChunk,
-        openErrorMessage: "Failed to create codex responses websocket",
-        openTimeoutMs: transportConfig.websocketOpenTimeoutMs,
-        poolIdleTimeoutMs: transportConfig.websocketPoolIdleTimeoutMs,
-        streamInactivityTimeoutMs: transportConfig.streamInactivityTimeoutMs,
-        streamErrorMessage:
-          "Upstream connection lost, Codex responses websocket stream error",
-        terminalChunkMissingMessage:
-          "Codex responses websocket ended without a terminal response, retry your request.",
-      }),
+      filterCodexResponsesWebSocketMetadata(
+        createPooledWebSocketStream(request, {
+          createChunk: createCodexResponsesWebSocketStreamChunk,
+          maxBufferedBytes: transportConfig.websocketMaxBufferedBytes,
+          maxBufferedMessages: transportConfig.websocketMaxBufferedMessages,
+          getTerminalDisposition: getResponsesStreamTerminalDisposition,
+          openErrorMessage: "Failed to create codex responses websocket",
+          openTimeoutMs: transportConfig.websocketOpenTimeoutMs,
+          poolIdleTimeoutMs: transportConfig.websocketPoolIdleTimeoutMs,
+          streamInactivityTimeoutMs: transportConfig.streamInactivityTimeoutMs,
+          streamErrorMessage:
+            "Upstream connection lost, Codex responses websocket stream error",
+          terminalChunkMissingMessage:
+            "Codex responses websocket ended without a terminal response, retry your request.",
+        }),
+        onResponseHeaders,
+      ),
       clientSignal,
     ),
   )
+}
+
+const filterCodexResponsesWebSocketMetadata = async function* (
+  source: AsyncIterable<ServerSentEventChunk>,
+  onResponseHeaders?: (headers: Headers) => void,
+): AsyncGenerator<ServerSentEventChunk, void, unknown> {
+  const pendingChunks: Array<ServerSentEventChunk> = []
+  let responseStarted = false
+
+  for await (const chunk of source) {
+    const metadataHeaders = getCodexResponseMetadataHeaders(chunk)
+    if (metadataHeaders !== undefined) {
+      if (!responseStarted) {
+        onResponseHeaders?.(metadataHeaders)
+      }
+      continue
+    }
+
+    if (!responseStarted) {
+      if (chunk.event !== RESPONSE_CREATED_EVENT) {
+        pendingChunks.push(chunk)
+        continue
+      }
+
+      responseStarted = true
+      for (const pendingChunk of pendingChunks) {
+        yield pendingChunk
+      }
+      pendingChunks.length = 0
+    }
+
+    yield chunk
+  }
+
+  for (const pendingChunk of pendingChunks) {
+    yield pendingChunk
+  }
+}
+
+const getCodexResponseMetadataHeaders = (
+  chunk: ServerSentEventChunk,
+): Headers | undefined => {
+  if (chunk.event !== CODEX_RESPONSE_METADATA_EVENT) return undefined
+  if (!chunk.data || chunk.data === "[DONE]") return new Headers()
+
+  let parsed: { headers?: unknown }
+  try {
+    parsed = JSON.parse(chunk.data) as typeof parsed
+  } catch {
+    return new Headers()
+  }
+
+  const headers = new Headers()
+  if (typeof parsed.headers !== "object" || parsed.headers === null) {
+    return headers
+  }
+
+  for (const [headerName, headerValue] of Object.entries(parsed.headers)) {
+    if (typeof headerValue === "string") {
+      try {
+        headers.set(headerName, headerValue)
+      } catch {
+        // Ignore malformed metadata headers without exposing the internal event.
+      }
+    }
+  }
+  return headers
 }
 
 const createClientPreflightStream = async function* <T>(
@@ -537,4 +675,9 @@ const createCodexResponsesWebSocketStreamChunk = (
   } catch {
     return { data }
   }
+}
+
+function shouldIncludeHeader(headerName: string): boolean {
+  const header = headerName.toLowerCase()
+  return !header.includes("trace") && !header.startsWith("x-codex-turn")
 }

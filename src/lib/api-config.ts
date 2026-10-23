@@ -1,5 +1,7 @@
 import { randomUUID } from "node:crypto"
 
+import { assertGitHubCopilotEnabled } from "./github-copilot-provider"
+
 import { COMPACT_REQUEST, type CompactType } from "~/lib/compact"
 
 import type { State } from "./state"
@@ -53,6 +55,8 @@ const getOpencodeLLMHeaders = (): Record<string, string> => {
 
 const normalizeOpencodeUserAgent = (userAgent: string): string => {
   const candidate = userAgent.trim()
+  if (candidate.startsWith("opencode/latest")) return candidate
+
   const opencodeProduct = candidate.match(/^opencode\/[^\s,]+/u)?.[0]
 
   if (!opencodeProduct || candidate.includes(`, ${opencodeProduct}`)) {
@@ -145,15 +149,15 @@ const OPENCODE_VERSION = "opencode/1.14.29"
 const OPENCODE_LLM_USER_AGENT =
   "opencode/1.14.29 ai-sdk/provider-utils/4.0.23 runtime/bun/1.3.13, opencode/1.14.29"
 
-const COPILOT_VERSION = "0.58.0"
+const COPILOT_VERSION = "0.68.0"
 const EDITOR_PLUGIN_VERSION = `copilot-chat/${COPILOT_VERSION}`
 const USER_AGENT = `GitHubCopilotChat/${COPILOT_VERSION}`
 const CLAUDE_AGENT_USER_AGENT =
-  "vscode_claude_code/2.1.112 (external, sdk-ts, agent-sdk/0.2.112)"
+  "vscode_claude_code/2.1.281 (external, sdk-ts, agent-sdk/0.3.281)"
 const COPILOT_WEBSOCKET_VERSION = COPILOT_VERSION
 const EDITOR_WEBSOCKET_PLUGIN_VERSION = `copilot-chat/${COPILOT_WEBSOCKET_VERSION}`
 
-const API_VERSION = "2026-06-01"
+const API_VERSION = "2026-08-01"
 const WEBSOCKET_API_VERSION = API_VERSION
 
 export const copilotBaseUrl = (state: State) => {
@@ -175,23 +179,53 @@ export const copilotBaseUrl = (state: State) => {
     : `https://api.${state.accountType}.githubcopilot.com`
 }
 
-export const prepareMessageProxyHeaders = (headers: Record<string, string>) => {
+export const prepareMessageProxyHeaders = (
+  headers: Record<string, string>,
+  state: State,
+) => {
   if (isOpencodeOauthApp()) {
     return
   }
 
-  // vscode copilot claude agent regenerates request id for
-  // each request, keeping it consistent
+  if (!state.githubToken) throw new Error("GitHub token not found")
+
+  // Preserve the Claude agent's fresh request ID for every upstream request.
   const requestIdValue = randomUUID()
-  headers["x-agent-task-id"] = requestIdValue
-  headers["x-request-id"] = requestIdValue
+  const source = createHeaderResolver(headers)
+  const proxyHeaders: Record<string, string> = {
+    "anthropic-version": source("anthropic-version", "2023-06-01"),
+    "User-Agent": CLAUDE_AGENT_USER_AGENT,
+    "Content-Type": source("content-type", "application/json"),
+    Authorization: `Bearer ${state.githubToken}`,
+    "X-Request-Id": requestIdValue,
+    "X-GitHub-Api-Version": API_VERSION,
+    "OpenAI-Intent": "messages-proxy",
+    "X-Interaction-Type": "messages-proxy",
+  }
 
-  // Consistent with vscode copilot claude agent
-  headers["x-interaction-type"] = "messages-proxy"
-  headers["openai-intent"] = "messages-proxy"
-  headers["user-agent"] = CLAUDE_AGENT_USER_AGENT
+  setPreparedHeader(proxyHeaders, "anthropic-beta", headers, "anthropic-beta")
+  setPreparedHeader(
+    proxyHeaders,
+    "VScode-SessionId",
+    headers,
+    "vscode-sessionid",
+  )
+  setPreparedHeader(
+    proxyHeaders,
+    "VScode-MachineId",
+    headers,
+    "vscode-machineid",
+  )
+  Object.assign(proxyHeaders, {
+    "Editor-Device-Id": source("editor-device-id", state.vsCodeDeviceId),
+    "Editor-Plugin-Version": `copilot-chat/${state.vsCodeVersion}`,
+    "Editor-Version": source("editor-version", `vscode/${state.vsCodeVersion}`),
+  })
 
-  delete headers["copilot-integration-id"]
+  for (const headerName of Object.keys(headers)) {
+    delete headers[headerName]
+  }
+  Object.assign(headers, proxyHeaders)
 }
 
 export const githubUserHeaders = (state: State): Record<string, string> => {
@@ -211,6 +245,7 @@ export const githubUserHeaders = (state: State): Record<string, string> => {
 }
 
 export const copilotModelsHeaders = (state: State) => {
+  assertGitHubCopilotEnabled()
   if (isOpencodeOauthApp()) {
     return {
       Authorization: `Bearer ${state.copilotToken}`,
@@ -230,6 +265,7 @@ export const copilotHeaders = (
   requestId?: string,
   vision: boolean = false,
 ) => {
+  assertGitHubCopilotEnabled()
   if (isOpencodeOauthApp()) {
     const headers: Record<string, string> = {
       Authorization: `Bearer ${state.copilotToken}`,
@@ -264,6 +300,7 @@ export const copilotHeaders = (
 export const copilotWebSocketHeaders = (
   preparedHeaders: Record<string, string>,
 ) => {
+  assertGitHubCopilotEnabled()
   if (isOpencodeOauthApp()) {
     return omitHeader(preparedHeaders, "x-initiator")
   }

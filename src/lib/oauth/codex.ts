@@ -1,5 +1,6 @@
 import { randomBytes } from "node:crypto"
 import { createServer } from "node:http"
+import type { OAuthCredentials } from "~/lib/types/oauth"
 
 export { CODEX_API_BASE_URL } from "~/services/codex/create-responses"
 
@@ -13,12 +14,17 @@ const REDIRECT_URI = `http://localhost:${CALLBACK_PORT}${CALLBACK_PATH}`
 const SCOPE = "openid profile email offline_access"
 const JWT_CLAIM_PATH = "https://api.openai.com/auth"
 const REFRESH_BUFFER_MS = 60_000
-const CALLBACK_TIMEOUT_MS = 45_000
+const CALLBACK_TIMEOUT_MS = 120_000
+const REFRESH_TIMEOUT_MS = 30_000
 
 interface TokenSuccessResult {
   accessToken: string
   refreshToken: string
   expiresAt: number
+}
+
+export interface RefreshCodexCredentialsOptions {
+  timeoutMs?: number
 }
 
 interface OAuthPageOptions {
@@ -27,12 +33,7 @@ interface OAuthPageOptions {
   message: string
 }
 
-export interface CodexCredentials {
-  accessToken: string
-  refreshToken: string
-  expiresAt: number
-  accountId: string
-}
+export type CodexCredentials = OAuthCredentials
 
 export interface CodexAuthInfo {
   url: string
@@ -43,6 +44,21 @@ export interface LoginCodexOptions {
   onAuth: (info: CodexAuthInfo) => void
   onPrompt: (message: string) => Promise<string>
   onProgress?: (message: string) => void
+  signal?: AbortSignal
+}
+
+export class CodexOAuthError extends Error {
+  readonly reason: "callback_timeout" | "callback_unavailable"
+
+  constructor(reason: CodexOAuthError["reason"]) {
+    super(
+      reason === "callback_timeout" ?
+        "Codex authorization timed out after 2 minutes"
+      : "Could not listen for Codex authorization on port 1455",
+    )
+    this.reason = reason
+    this.name = "CodexOAuthError"
+  }
 }
 
 function base64UrlEncode(bytes: Uint8Array): string {
@@ -208,6 +224,7 @@ function renderOAuthErrorPage(message: string): string {
 async function exchangeAuthorizationCode(
   code: string,
   verifier: string,
+  signal?: AbortSignal,
 ): Promise<TokenSuccessResult> {
   const response = await fetch(TOKEN_URL, {
     method: "POST",
@@ -221,6 +238,7 @@ async function exchangeAuthorizationCode(
       code_verifier: verifier,
       redirect_uri: REDIRECT_URI,
     }),
+    signal,
   })
 
   if (!response.ok) {
@@ -253,18 +271,33 @@ async function exchangeAuthorizationCode(
 
 async function refreshAccessToken(
   refreshToken: string,
+  options: RefreshCodexCredentialsOptions = {},
 ): Promise<TokenSuccessResult> {
-  const response = await fetch(TOKEN_URL, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/x-www-form-urlencoded",
-    },
-    body: new URLSearchParams({
-      grant_type: "refresh_token",
-      refresh_token: refreshToken,
-      client_id: CLIENT_ID,
-    }),
-  })
+  const timeoutMs = options.timeoutMs ?? REFRESH_TIMEOUT_MS
+  const signal = AbortSignal.timeout(timeoutMs)
+  let response: Response
+
+  try {
+    response = await fetch(TOKEN_URL, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/x-www-form-urlencoded",
+      },
+      body: new URLSearchParams({
+        grant_type: "refresh_token",
+        refresh_token: refreshToken,
+        client_id: CLIENT_ID,
+      }),
+      signal,
+    })
+  } catch (error) {
+    if (signal.aborted) {
+      throw new Error(`Codex token refresh timed out after ${timeoutMs}ms`, {
+        cause: error,
+      })
+    }
+    throw error
+  }
 
   if (!response.ok) {
     const details = await response.text().catch(() => "")
@@ -316,7 +349,11 @@ async function createAuthorizationFlow(): Promise<{
   return { verifier, state, url: url.toString() }
 }
 
-async function waitForAuthorizationCode(state: string): Promise<string | null> {
+async function waitForAuthorizationCode(
+  state: string,
+  signal?: AbortSignal,
+): Promise<string> {
+  signal?.throwIfAborted()
   let resolveCode: ((code: string | null) => void) | undefined
   const waitForCode = new Promise<string | null>((resolve) => {
     resolveCode = resolve
@@ -373,15 +410,22 @@ async function waitForAuthorizationCode(state: string): Promise<string | null> {
       })
     })
   } catch {
-    return null
+    throw new CodexOAuthError("callback_unavailable")
   }
 
+  let timeout: ReturnType<typeof setTimeout> | undefined
+  const onAbort = () => resolveCode?.(null)
+  signal?.addEventListener("abort", onAbort, { once: true })
   try {
-    const timeout = new Promise<null>((resolve) => {
-      setTimeout(() => resolve(null), CALLBACK_TIMEOUT_MS)
-    })
-    return await Promise.race([waitForCode, timeout])
+    signal?.throwIfAborted()
+    timeout = setTimeout(() => resolveCode?.(null), CALLBACK_TIMEOUT_MS)
+    const code = await waitForCode
+    signal?.throwIfAborted()
+    if (!code) throw new CodexOAuthError("callback_timeout")
+    return code
   } finally {
+    clearTimeout(timeout)
+    signal?.removeEventListener("abort", onAbort)
     await new Promise<void>((resolve, reject) => {
       server.close((error) => {
         if (error) {
@@ -390,6 +434,7 @@ async function waitForAuthorizationCode(state: string): Promise<string | null> {
         }
         resolve()
       })
+      server.closeAllConnections()
     }).catch(() => undefined)
   }
 }
@@ -397,7 +442,9 @@ async function waitForAuthorizationCode(state: string): Promise<string | null> {
 export async function loginCodex(
   options: LoginCodexOptions,
 ): Promise<CodexCredentials> {
+  options.signal?.throwIfAborted()
   const { verifier, state, url } = await createAuthorizationFlow()
+  options.signal?.throwIfAborted()
   options.onAuth({
     url,
     instructions:
@@ -405,11 +452,21 @@ export async function loginCodex(
   })
   options.onProgress?.("Waiting for Codex OAuth callback")
 
-  let code = await waitForAuthorizationCode(state)
+  let code: string | null = null
+  let callbackError: CodexOAuthError | undefined
+  try {
+    code = await waitForAuthorizationCode(state, options.signal)
+  } catch (error) {
+    options.signal?.throwIfAborted()
+    if (!(error instanceof CodexOAuthError)) throw error
+    callbackError = error
+  }
+  options.signal?.throwIfAborted()
   if (!code) {
     const input = await options.onPrompt(
       "Paste the authorization code or full redirect URL:",
     )
+    options.signal?.throwIfAborted()
     const parsed = parseAuthorizationInput(input)
     if (parsed.state && parsed.state !== state) {
       throw new Error("Codex OAuth state mismatch")
@@ -418,10 +475,15 @@ export async function loginCodex(
   }
 
   if (!code) {
-    throw new Error("Missing Codex authorization code")
+    throw callbackError ?? new Error("Missing Codex authorization code")
   }
 
-  const tokenResult = await exchangeAuthorizationCode(code, verifier)
+  const tokenResult = await exchangeAuthorizationCode(
+    code,
+    verifier,
+    options.signal,
+  )
+  options.signal?.throwIfAborted()
   const accountId = getAccountId(tokenResult.accessToken)
   if (!accountId) {
     throw new Error("Failed to extract Codex account id from access token")
@@ -437,8 +499,12 @@ export async function loginCodex(
 
 export async function refreshCodexCredentials(
   credentials: CodexCredentials,
+  options: RefreshCodexCredentialsOptions = {},
 ): Promise<CodexCredentials> {
-  const tokenResult = await refreshAccessToken(credentials.refreshToken)
+  const tokenResult = await refreshAccessToken(
+    credentials.refreshToken,
+    options,
+  )
   const accountId = getAccountId(tokenResult.accessToken)
   if (!accountId) {
     throw new Error("Failed to extract Codex account id from access token")

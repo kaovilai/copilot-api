@@ -11,6 +11,7 @@ import type {
 import {
   copilotBaseUrl,
   copilotHeaders,
+  isOpencodeOauthApp,
   prepareForCompact,
   prepareInteractionHeaders,
   prepareMessageProxyHeaders,
@@ -28,13 +29,17 @@ export type CreateMessagesReturn = AnthropicResponse | MessagesStream
 
 const INTERLEAVED_THINKING_BETA = "interleaved-thinking-2025-05-14"
 const ADVANCED_TOOL_USE_BETA = "advanced-tool-use-2025-11-20"
+const EXTENDED_CACHE_TTL_BETA = "extended-cache-ttl-2025-04-11"
 const allowedAnthropicBetas = new Set([
   INTERLEAVED_THINKING_BETA,
   "context-management-2025-06-27",
   ADVANCED_TOOL_USE_BETA,
+  EXTENDED_CACHE_TTL_BETA,
+  "mid-conversation-output-config-2026-07-01",
+  "per-turn-control-2026-07-01",
 ])
 
-const buildAnthropicBetaHeader = (
+export const buildAnthropicBetaHeader = (
   anthropicBetaHeader: string | undefined,
   thinking: AnthropicMessagesPayload["thinking"],
   _model: string,
@@ -69,6 +74,7 @@ export const createMessages = async (
   payload: AnthropicMessagesPayload,
   anthropicBetaHeader: string | undefined,
   options: {
+    anthropicVersionHeader?: string
     clientSignal?: AbortSignal
     subagentMarker?: SubagentMarker | null
     requestId: string
@@ -114,19 +120,10 @@ export const createMessages = async (
   const { safetyIdentifier, sessionId } = parseUserIdMetadata(
     payload.metadata?.user_id,
   )
-
-  // claude-opus-4.8 is excluded: Copilot's upstream WAF returns a generic
-  // "Access to this endpoint is forbidden" 403 whenever a request carries
-  // the Claude-Code-style user-agent without a `copilot-integration-id`
-  // header. The exact same header set is accepted on claude-opus-4.7, so
-  // the gate is a model-id rollout gap on Copilot's side. Skipping the
-  // rewrite for 4.8 keeps the default Copilot identity
-  // (copilot-integration-id: vscode-chat + GitHubCopilotChat UA +
-  // conversation-agent intent) in place; that path is 200. Remove this
-  // skip once Copilot's upstream accepts the Claude-Code identity on 4.8.
-  // Probed 2026-05-29.
-  if (safetyIdentifier && sessionId && payload.model !== "claude-opus-4.8") {
-    prepareMessageProxyHeaders(headers)
+  if (safetyIdentifier && sessionId && !isOpencodeOauthApp()) {
+    headers["anthropic-version"] =
+      options.anthropicVersionHeader ?? "2023-06-01"
+    prepareMessageProxyHeaders(headers, state)
   }
 
   // align with vscode copilot extension anthropic-beta

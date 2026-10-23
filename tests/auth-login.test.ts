@@ -4,15 +4,20 @@ import os from "node:os"
 import path from "node:path"
 import { fileURLToPath } from "node:url"
 
+import { modelsDevCatalogFixture } from "./fixtures/models-dev-catalog"
+
 interface ConfigFileShape {
   providers?: Record<
     string,
     {
+      accountId?: string
       apiKey?: string
       authType?: string
       baseUrl?: string
+      agentsModels?: Array<string>
       enabled?: boolean
       models?: Record<string, unknown>
+      modelsDevProviderId?: string
       pricingCurrency?: string
       type?: string
     }
@@ -90,7 +95,7 @@ describe("auth login validation", () => {
     )
 
     expect(output).toBe(
-      "Unknown provider 'unknown'. Expected one of: copilot, codex, opencode-go, kimi, deepseek, dashscope, openrouter, custom",
+      "Unknown provider 'unknown'. Expected one of: copilot, codex, xai, opencode-go, kimi, deepseek, dashscope, openrouter, custom",
     )
   })
 
@@ -350,7 +355,7 @@ describe("auth login validation", () => {
 
     expect(readConfigFile(tempDir).providers?.["opencode-go"]).toEqual({
       apiKey: "opencode-key",
-      baseUrl: "https://opencode.ai/zen/go",
+      baseUrl: "https://opencode.ai/inference/go",
       enabled: true,
       pricingCurrency: "USD",
       type: "openai-compatible",
@@ -411,13 +416,14 @@ describe("auth login validation", () => {
     })
   })
 
-  test("preserves quick provider model settings when reconfiguring credentials", () => {
+  test("preserves quick provider model settings and hidden Codex selection when reconfiguring credentials", () => {
     const tempDir = createTempDir()
     writeConfigFile(tempDir, {
       providers: {
         dashscope: {
           apiKey: "old-key",
           baseUrl: "https://old.example",
+          agentsModels: [],
           enabled: true,
           models: {
             "qwen-plus": {
@@ -446,6 +452,7 @@ describe("auth login validation", () => {
     expect(readConfigFile(tempDir).providers?.dashscope).toEqual({
       apiKey: "new-key",
       baseUrl: "https://dashscope.aliyuncs.com/compatible-mode",
+      agentsModels: [],
       enabled: true,
       models: {
         "qwen-plus": {
@@ -466,7 +473,7 @@ describe("auth login validation", () => {
       `
       const consolaModule = await import("consola");
       const consola = consolaModule.default ?? consolaModule;
-      const answers = ["dash", "openai-compatible", "https://dashscope.example///", "provider-key", "__default__"];
+      const answers = ["manual", "dash", "openai-compatible", "https://dashscope.example///", "provider-key", "__default__"];
       consola.prompt = async () => answers.shift();
       consola.info = () => {};
       consola.success = () => {};
@@ -483,6 +490,46 @@ describe("auth login validation", () => {
     })
   })
 
+  test("configures a models.dev provider using the cached API URL and protocol", () => {
+    const tempDir = createTempDir()
+    writeConfigFile(tempDir, {})
+    fs.writeFileSync(
+      path.join(tempDir, "models-dev-api.json"),
+      JSON.stringify({
+        ...modelsDevCatalogFixture,
+        example: {
+          id: "example",
+          name: "Example Provider",
+          npm: "@ai-sdk/openai",
+          api: "https://api.example.com/openai/v1",
+          models: { answer: { id: "answer" } },
+        },
+      }),
+    )
+
+    runScript(
+      tempDir,
+      `
+      const consolaModule = await import("consola");
+      const consola = consolaModule.default ?? consolaModule;
+      const answers = ["models-dev", "exam", "example", "", "openai-responses", "", "provider-key", "__default__"];
+      consola.prompt = async () => answers.shift();
+      consola.info = () => {};
+      consola.success = () => {};
+      const { runAuthLogin } = await import("./src/auth");
+      await runAuthLogin({ provider: "custom", verbose: false, showToken: false });
+      `,
+    )
+
+    expect(readConfigFile(tempDir).providers?.example).toEqual({
+      apiKey: "provider-key",
+      baseUrl: "https://api.example.com/openai/v1",
+      enabled: true,
+      modelsDevProviderId: "example",
+      type: "openai-responses",
+    })
+  })
+
   test("configures a custom provider selected from the provider prompt", () => {
     const tempDir = createTempDir()
     writeConfigFile(tempDir, {})
@@ -492,7 +539,7 @@ describe("auth login validation", () => {
       `
       const consolaModule = await import("consola");
       const consola = consolaModule.default ?? consolaModule;
-      const answers = ["custom", "claude", "anthropic", "https://api.anthropic.example", "provider-key", "x-api-key"];
+      const answers = ["custom", "manual", "claude", "anthropic", "https://api.anthropic.example", "provider-key", "x-api-key"];
       consola.prompt = async () => answers.shift();
       consola.info = () => {};
       consola.success = () => {};
@@ -510,6 +557,34 @@ describe("auth login validation", () => {
     })
   })
 
+  test.each(["__default__", "x-goog-api-key"])(
+    "configures Google with %s auth from the CLI",
+    (authType) => {
+      const tempDir = createTempDir()
+      writeConfigFile(tempDir, {})
+      runScript(
+        tempDir,
+        `
+      const consolaModule = await import("consola");
+      const consola = consolaModule.default ?? consolaModule;
+      const answers = ["manual", "google", "google", "https://generativelanguage.googleapis.com/v1beta", "google-key", "${authType}"];
+      consola.prompt = async () => answers.shift();
+      consola.info = () => {};
+      consola.success = () => {};
+      const { runAuthLogin } = await import("./src/auth");
+      await runAuthLogin({ provider: "custom", verbose: false, showToken: false });
+    `,
+      )
+      expect(readConfigFile(tempDir).providers?.google).toEqual({
+        apiKey: "google-key",
+        baseUrl: "https://generativelanguage.googleapis.com/v1beta",
+        enabled: true,
+        type: "google",
+        ...(authType !== "__default__" && { authType }),
+      })
+    },
+  )
+
   test("writes the selected authorization auth type", () => {
     const tempDir = createTempDir()
     writeConfigFile(tempDir, {})
@@ -519,7 +594,7 @@ describe("auth login validation", () => {
       `
       const consolaModule = await import("consola");
       const consola = consolaModule.default ?? consolaModule;
-      const answers = ["responses", "openai-responses", "https://responses.example", "provider-key", "authorization"];
+      const answers = ["manual", "responses", "openai-responses", "https://responses.example", "provider-key", "authorization"];
       consola.prompt = async () => answers.shift();
       consola.info = () => {};
       consola.success = () => {};
@@ -537,7 +612,7 @@ describe("auth login validation", () => {
     })
   })
 
-  test("preserves custom provider model settings when reconfiguring credentials", () => {
+  test("preserves custom provider model settings and Codex selection when reconfiguring credentials", () => {
     const tempDir = createTempDir()
     writeConfigFile(tempDir, {
       providers: {
@@ -545,6 +620,7 @@ describe("auth login validation", () => {
           apiKey: "old-key",
           authType: "x-api-key",
           baseUrl: "https://old.example",
+          agentsModels: ["qwen-plus"],
           enabled: true,
           models: {
             "qwen-plus": {
@@ -561,7 +637,7 @@ describe("auth login validation", () => {
       `
       const consolaModule = await import("consola");
       const consola = consolaModule.default ?? consolaModule;
-      const answers = ["dash", "openai-compatible", "https://new.example", "new-key", "__default__"];
+      const answers = ["manual", "dash", "openai-compatible", "https://new.example", "new-key", "__default__"];
       consola.prompt = async () => answers.shift();
       consola.info = () => {};
       consola.success = () => {};
@@ -573,6 +649,7 @@ describe("auth login validation", () => {
     expect(readConfigFile(tempDir).providers?.dash).toEqual({
       apiKey: "new-key",
       baseUrl: "https://new.example",
+      agentsModels: ["qwen-plus"],
       enabled: true,
       models: {
         "qwen-plus": {
@@ -631,7 +708,7 @@ describe("auth login validation", () => {
         `
         const consolaModule = await import("consola");
         const consola = consolaModule.default ?? consolaModule;
-        const answers = ${JSON.stringify(item.answers)};
+        const answers = ["manual", ...${JSON.stringify(item.answers)}];
         consola.prompt = async () => answers.shift();
         consola.info = () => {};
         consola.success = () => {};
@@ -648,5 +725,265 @@ describe("auth login validation", () => {
       expect(output).toBe(item.message)
       expect(readConfigFile(tempDir).providers).toBeUndefined()
     }
+  })
+})
+
+describe("Codex account commands", () => {
+  const codexAccounts = [
+    {
+      accessToken: "secret-access-one",
+      refreshToken: "secret-refresh-one",
+      expiresAt: 1,
+      accountId: "acct_one",
+      alias: "Work",
+    },
+    {
+      accessToken: "secret-access-two",
+      refreshToken: "secret-refresh-two",
+      expiresAt: 2,
+      accountId: "acct_two",
+      alias: "Personal",
+    },
+  ]
+
+  function writeCodexAccounts(
+    tempDir: string,
+    accounts: Array<(typeof codexAccounts)[number]> = codexAccounts,
+  ): void {
+    fs.writeFileSync(
+      path.join(tempDir, "codex_credentials.json"),
+      `${JSON.stringify({ version: 1, accounts }, null, 2)}\n`,
+      "utf8",
+    )
+  }
+
+  function readCodexAccountIds(tempDir: string): Array<string> {
+    const store = JSON.parse(
+      fs.readFileSync(path.join(tempDir, "codex_credentials.json"), "utf8"),
+    ) as { accounts: Array<{ accountId: string }> }
+    return store.accounts.map((account) => account.accountId)
+  }
+
+  test("lists Codex accounts without exposing credentials", () => {
+    const tempDir = createTempDir()
+    writeConfigFile(tempDir, {
+      providers: { codex: { accountId: "acct_two" } },
+    })
+    writeCodexAccounts(tempDir)
+
+    const output = runScript(
+      tempDir,
+      `
+      const consolaModule = await import("consola");
+      const consola = consolaModule.default ?? consolaModule;
+      const messages = [];
+      consola.info = (...args) => messages.push(args.join(" "));
+      const { runAuthCodex } = await import("./src/auth");
+      await runAuthCodex({ list: true });
+      console.log(JSON.stringify(messages));
+      `,
+    )
+
+    const messages = JSON.parse(output) as Array<string>
+    expect(messages).toContain("- Work (acct_one)")
+    expect(messages).toContain("* Personal (acct_two)")
+    expect(output).not.toContain("secret-access")
+    expect(output).not.toContain("secret-refresh")
+  })
+
+  test("selects a Codex account by case-insensitive alias", () => {
+    const tempDir = createTempDir()
+    writeConfigFile(tempDir, {
+      providers: { codex: { accountId: "acct_two", enabled: true } },
+    })
+    writeCodexAccounts(tempDir)
+
+    const output = runScript(
+      tempDir,
+      `
+      const consolaModule = await import("consola");
+      const consola = consolaModule.default ?? consolaModule;
+      consola.info = () => {};
+      consola.success = () => {};
+      const { runAuthCodex } = await import("./src/auth");
+      const { getRawProviderConfig } = await import("./src/lib/config");
+      await runAuthCodex({ use: "work" });
+      console.log(JSON.stringify(getRawProviderConfig("codex")));
+      `,
+    )
+
+    expect(JSON.parse(output)).toMatchObject({
+      accountId: "acct_one",
+      enabled: true,
+      authType: "oauth2",
+      baseUrl: "https://chatgpt.com/backend-api",
+      type: "openai-responses",
+    })
+  })
+
+  test("rejects an unknown Codex account without changing selection", () => {
+    const tempDir = createTempDir()
+    writeConfigFile(tempDir, {
+      providers: { codex: { accountId: "acct_two", enabled: true } },
+    })
+    writeCodexAccounts(tempDir)
+
+    const output = runScript(
+      tempDir,
+      `
+      const { runAuthCodex } = await import("./src/auth");
+      try {
+        await runAuthCodex({ use: "missing" });
+      } catch (error) {
+        console.log(error instanceof Error ? error.message : String(error));
+      }
+      `,
+    )
+
+    expect(output).toBe("Codex account 'missing' was not found")
+    expect(readConfigFile(tempDir).providers?.codex?.accountId).toBe("acct_two")
+  })
+
+  test("removes an unused Codex account by alias", () => {
+    const tempDir = createTempDir()
+    writeConfigFile(tempDir, {
+      providers: { codex: { accountId: "acct_two", enabled: true } },
+    })
+    writeCodexAccounts(tempDir)
+
+    const output = runScript(
+      tempDir,
+      `
+      const consolaModule = await import("consola");
+      const consola = consolaModule.default ?? consolaModule;
+      const messages = [];
+      consola.success = (...args) => messages.push(args.join(" "));
+      consola.info = () => {};
+      const { runAuthCodex } = await import("./src/auth");
+      await runAuthCodex({ remove: "work" });
+      console.log(JSON.stringify(messages));
+      `,
+    )
+
+    expect(JSON.parse(output)).toEqual([
+      "Removed Codex account Work (acct_one)",
+    ])
+    expect(readCodexAccountIds(tempDir)).toEqual(["acct_two"])
+    expect(readConfigFile(tempDir).providers?.codex?.accountId).toBe("acct_two")
+  })
+
+  test("keeps an account selected by another process after local config was cached", () => {
+    const tempDir = createTempDir()
+    writeConfigFile(tempDir, {
+      providers: { codex: { accountId: "acct_one", enabled: true } },
+    })
+    writeCodexAccounts(tempDir)
+
+    const output = runScript(
+      tempDir,
+      `
+      const { getRawProviderConfig } = await import("./src/lib/config");
+      const { removeCodexAccount } = await import("./src/lib/token");
+      getRawProviderConfig("codex");
+
+      const switchResult = Bun.spawnSync({
+        cmd: [
+          process.execPath,
+          "--eval",
+          'const { selectCodexAccount } = await import("./src/lib/token"); await selectCodexAccount("acct_two");',
+        ],
+        cwd: process.cwd(),
+        env: { ...process.env },
+      });
+      if (switchResult.exitCode !== 0) {
+        throw new Error(new TextDecoder().decode(switchResult.stderr));
+      }
+
+      try {
+        await removeCodexAccount("acct_two");
+      } catch (error) {
+        console.log(error instanceof Error ? error.message : String(error));
+      }
+      `,
+    )
+
+    expect(output).toBe(
+      "Codex account 'acct_two' is currently in use; switch to another account before removing it",
+    )
+    expect(readCodexAccountIds(tempDir)).toEqual(["acct_one", "acct_two"])
+    expect(readConfigFile(tempDir).providers?.codex?.accountId).toBe("acct_two")
+    expect(
+      fs.existsSync(path.join(tempDir, "codex_credentials.json.accounts.lock")),
+    ).toBe(false)
+  })
+
+  test("rejects removing the Codex account that is in use", () => {
+    const tempDir = createTempDir()
+    writeConfigFile(tempDir, {
+      providers: { codex: { accountId: "acct_one", enabled: true } },
+    })
+    writeCodexAccounts(tempDir)
+
+    const output = runScript(
+      tempDir,
+      `
+      const { runAuthCodex } = await import("./src/auth");
+      try {
+        await runAuthCodex({ remove: "Work" });
+      } catch (error) {
+        console.log(error instanceof Error ? error.message : String(error));
+      }
+      `,
+    )
+
+    expect(output).toBe(
+      "Codex account 'acct_one' is currently in use; switch to another account before removing it",
+    )
+    expect(readCodexAccountIds(tempDir)).toEqual(["acct_one", "acct_two"])
+  })
+
+  test("rejects removing the only stored Codex account", () => {
+    const tempDir = createTempDir()
+    writeConfigFile(tempDir, {})
+    writeCodexAccounts(tempDir, [codexAccounts[0]])
+
+    const output = runScript(
+      tempDir,
+      `
+      const { runAuthCodex } = await import("./src/auth");
+      try {
+        await runAuthCodex({ remove: "acct_one" });
+      } catch (error) {
+        console.log(error instanceof Error ? error.message : String(error));
+      }
+      `,
+    )
+
+    expect(output).toBe(
+      "Codex account 'acct_one' is currently in use; switch to another account before removing it",
+    )
+    expect(readCodexAccountIds(tempDir)).toEqual(["acct_one"])
+  })
+
+  test("rejects combining Codex account operations", () => {
+    const tempDir = createTempDir()
+    writeConfigFile(tempDir, {})
+    writeCodexAccounts(tempDir)
+
+    const output = runScript(
+      tempDir,
+      `
+      const { runAuthCodex } = await import("./src/auth");
+      try {
+        await runAuthCodex({ list: true, remove: "work" });
+      } catch (error) {
+        console.log(error instanceof Error ? error.message : String(error));
+      }
+      `,
+    )
+
+    expect(output).toBe(
+      "Use only one of --list, --use, or --remove per invocation",
+    )
   })
 })
