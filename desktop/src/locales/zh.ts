@@ -220,6 +220,11 @@ const zh: Locale = {
     tokenUsageCacheHitRate: '缓存命中率',
     tokenUsageCost: '费用',
     tokenUsageEndpoint: '端点',
+    tokenUsageAverageFirstToken: '平均首 token',
+    tokenUsageOutputSpeed: '输出速度',
+    tokenUsageDuration: '总耗时',
+    tokenUsageTimingHint:
+      '从思考开始或首段有效输出计时；速度为输出 token 数除以生成耗时。仅统计有效的完整请求。',
     tokenUsageEvents: '事件明细',
     tokenUsageInput: '输入',
     tokenUsageModel: '模型',
@@ -473,7 +478,7 @@ const zh: Locale = {
         description: '按 provider 配置模型；空字符串表示禁用切换。',
       },
       claudeAutoModel: {
-        label: 'Claude Code 审核模型',
+        label: 'Claude Code 安全审核模型',
         description: '支持继承动态默认值、禁用替换或指定模型。',
       },
       modelReasoningEfforts: {

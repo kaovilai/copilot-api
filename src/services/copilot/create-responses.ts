@@ -27,6 +27,7 @@ import {
 } from "~/lib/copilot-rate-limit"
 import { HTTPError, UpstreamHeadersTimeoutError } from "~/lib/error"
 import { retryPreResponseFailures } from "~/lib/fetch-timeout"
+import { setPluginRequestActualModel } from "~/lib/request-context"
 import { state } from "~/lib/state"
 import {
   createPooledWebSocketStream,
@@ -85,6 +86,7 @@ export const createResponses = async (
   const effectiveTransport =
     compactType === COMPACT_REQUEST ? "http" : transport
 
+  setPluginRequestActualModel(payload.model)
   if (payload.stream === true && effectiveTransport === "websocket") {
     clientSignal?.throwIfAborted()
     const websocketRequest = prepareResponsesWebSocketRequest(

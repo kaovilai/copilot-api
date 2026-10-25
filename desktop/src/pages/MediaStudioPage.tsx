@@ -7,6 +7,7 @@ import {
   type ReactNode,
 } from 'react'
 import { useLanguage } from '../contexts/LanguageContext'
+import { primaryButtonClass } from '../lib/button-styles'
 import {
   serializeMediaFile,
   serializeVideoMediaFile,
@@ -96,10 +97,10 @@ export default function MediaStudioPage({
   const prompt = prompts[mode]
   const [size, setSize] = useState<ImageCreationInput['size']>('auto')
   const [quality, setQuality] = useState<ImageCreationInput['quality']>('auto')
-  const [count, setCount] = useState(1)
+  const [count, setCount] = useState('1')
   const [editFiles, setEditFiles] = useState<File[]>([])
   const [firstFrame, setFirstFrame] = useState<File[]>([])
-  const [duration, setDuration] = useState(8)
+  const [duration, setDuration] = useState('8')
   const [aspectRatio, setAspectRatio] =
     useState<VideoCreationInput['aspectRatio']>('16:9')
   const [resolution, setResolution] =
@@ -255,7 +256,7 @@ export default function MediaStudioPage({
       if (mode === 'video') {
         const result = await window.electronAPI.createVideo(id, {
           prompt,
-          duration,
+          duration: Number(duration),
           aspectRatio,
           resolution,
           generateAudio: audio,
@@ -273,7 +274,7 @@ export default function MediaStudioPage({
           prompt,
           size,
           quality,
-          n: count,
+          n: Number(count),
           images: uploads,
         })
         if (generationRequest.current !== id) return
@@ -491,7 +492,10 @@ export default function MediaStudioPage({
                     max={4}
                     value={count}
                     required
-                    onChange={(e) => setCount(Number(e.target.value))}
+                    onChange={(e) => setCount(e.target.value)}
+                    onBlur={() =>
+                      setCount(count === '' ? '' : String(Number(count)))
+                    }
                     className={fieldClass}
                   />
                 </Field>
@@ -505,7 +509,12 @@ export default function MediaStudioPage({
                       max={15}
                       value={duration}
                       required
-                      onChange={(e) => setDuration(Number(e.target.value))}
+                      onChange={(e) => setDuration(e.target.value)}
+                      onBlur={() =>
+                        setDuration(
+                          duration === '' ? '' : String(Number(duration)),
+                        )
+                      }
                       className={fieldClass}
                     />
                   </Field>
@@ -581,7 +590,7 @@ export default function MediaStudioPage({
                   || (mode === 'edit' && !editFiles.length)
                   || videoPending
                 }
-                className="flex-1 rounded-lg bg-accent-strong px-4 py-2.5 text-[13px] font-semibold text-white disabled:cursor-not-allowed disabled:opacity-40"
+                className={`flex-1 px-4 py-2.5 ${primaryButtonClass}`}
               >
                 {busy ? t('studio.creating') : t('studio.create')}
               </button>
