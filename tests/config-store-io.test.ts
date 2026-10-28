@@ -16,7 +16,11 @@ import {
   writeConfigToDisk,
   type AppConfig,
 } from "~/lib/config-store"
-import { getSmallModel, getSmallModelForProvider } from "~/lib/model-policy"
+import {
+  getSmallModel,
+  getSmallModelForProvider,
+  isOutputEncryptedContentDisabled,
+} from "~/lib/model-policy"
 import { PATHS } from "~/lib/paths"
 import { state } from "~/lib/state"
 
@@ -104,11 +108,54 @@ test("reloadConfig creates a default config when it is missing", () => {
   expect(config.alphaSearchModel).toBe("gpt-6-luna")
   expect(config.messageApiWebSearchModel).toBe("gpt-6-luna")
   expect(config.opencodeModelContextWindow).toBe(400_000)
+  expect(config.noEncryptedOutputModels).toEqual([])
+  expect(isOutputEncryptedContentDisabled("gpt-6-astra")).toBe(false)
   expect(getOpencodeModelContextWindow()).toBe(400_000)
   expect(config.extraPrompts).toBeUndefined()
   expect(config.modelReasoningEfforts).toBeUndefined()
   if (process.platform !== "win32") {
     expect(fs.statSync(configPath).mode & 0o777).toBe(0o600)
+  }
+})
+
+test.each([
+  { configured: undefined, expected: false },
+  { configured: [], expected: false },
+  { configured: ["gpt-6-astra"], expected: true },
+  { configured: ["gpt-6-luna"], expected: false },
+  { configured: ["gpt-6-astra-preview"], expected: false },
+  { configured: null, expected: false },
+  { configured: "gpt-6-astra", expected: false },
+  { configured: {}, expected: false },
+])(
+  "matches only exact encrypted output exclusions from config %j",
+  ({ configured, expected }) => {
+    const configPath = useTempConfigPath()
+    fs.writeFileSync(
+      configPath,
+      JSON.stringify({ noEncryptedOutputModels: configured }),
+      "utf8",
+    )
+    invalidateConfigCache()
+
+    expect(isOutputEncryptedContentDisabled("gpt-6-astra")).toBe(expected)
+  },
+)
+
+test("reloadConfig refreshes and clears encrypted output model exclusions", () => {
+  useTempConfigPath()
+  for (const models of [["gpt-6-astra"], ["gpt-6-luna"], []]) {
+    writeConfigToDisk({
+      auth: { adminApiKey: "existing-admin-key" },
+      noEncryptedOutputModels: models,
+    })
+    expect(reloadConfig().noEncryptedOutputModels).toEqual(models)
+    expect(isOutputEncryptedContentDisabled("gpt-6-astra")).toBe(
+      models.includes("gpt-6-astra"),
+    )
+    expect(isOutputEncryptedContentDisabled("gpt-6-luna")).toBe(
+      models.includes("gpt-6-luna"),
+    )
   }
 })
 

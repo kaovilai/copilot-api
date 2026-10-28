@@ -1,6 +1,9 @@
 import { afterEach, beforeEach, expect, mock, test } from "bun:test"
+import fs from "node:fs"
+import os from "node:os"
+import path from "node:path"
 
-import type { ResponsesResult } from "~/lib/types/responses"
+import type { ResponsesPayload, ResponsesResult } from "~/lib/types/responses"
 
 type ListenerEvent = {
   data?: unknown
@@ -178,6 +181,8 @@ await mock.module("undici", () => ({
 }))
 
 const { state } = await import("~/lib/state")
+const { getConfig, invalidateConfigCache } = await import("~/lib/config")
+const { PATHS } = await import("~/lib/paths")
 const { createResponses } = await import("~/services/copilot/create-responses")
 const {
   createPooledWebSocketStream,
@@ -195,6 +200,8 @@ const originalState = {
   vsCodeDeviceId: state.vsCodeDeviceId,
   vsCodeVersion: state.vsCodeVersion,
 }
+const originalConfigPath = PATHS.CONFIG_PATH
+let configDir: string
 
 const createResponsesResult = (
   model: string,
@@ -220,6 +227,12 @@ const createResponsesResult = (
 })
 
 beforeEach(() => {
+  configDir = fs.mkdtempSync(
+    path.join(os.tmpdir(), "responses-websocket-config-"),
+  )
+  PATHS.CONFIG_PATH = path.join(configDir, "config.json")
+  fs.writeFileSync(PATHS.CONFIG_PATH, "{}")
+  invalidateConfigCache()
   globalThis.WebSocket = MockWebSocket as unknown as typeof globalThis.WebSocket
   MockWebSocket.autoComplete = true
   MockWebSocket.closeAfterComplete = false
@@ -236,6 +249,9 @@ beforeEach(() => {
 })
 
 afterEach(() => {
+  PATHS.CONFIG_PATH = originalConfigPath
+  invalidateConfigCache()
+  fs.rmSync(configDir, { recursive: true, force: true })
   globalThis.WebSocket = originalWebSocket
   MockWebSocket.autoComplete = true
   MockWebSocket.closeAfterComplete = false
@@ -257,6 +273,94 @@ afterEach(() => {
   ).clearTimeout = originalClearTimeout
   ;(globalThis as unknown as { setTimeout: typeof setTimeout }).setTimeout =
     originalSetTimeout
+})
+
+test.each([
+  { models: undefined },
+  { models: [] },
+  { models: ["gpt-6-astra"] },
+  { models: ["gpt-6-luna-preview"] },
+])(
+  "Responses websocket preserves output token replay include for unlisted models with config %j",
+  async ({ models }) => {
+    getConfig().noEncryptedOutputModels = models
+    const payload: ResponsesPayload = {
+      include: ["reasoning.encrypted_content", "output.encrypted_content"],
+      input: "hello",
+      model: "gpt-6-luna",
+      stream: true,
+    }
+
+    const response = await createResponses(payload, {
+      initiator: "user",
+      requestId: "request-output-replay",
+      transport: "websocket",
+      vision: false,
+    })
+    await collectStreamChunks(response as AsyncIterable<unknown>)
+
+    const sent = JSON.parse(
+      MockWebSocket.instances[0]?.sent[0] ?? "",
+    ) as ResponsesPayload
+    expect(sent.include).toEqual([
+      "reasoning.encrypted_content",
+      "output.encrypted_content",
+    ])
+    expect(payload.include).toEqual(sent.include)
+  },
+)
+
+test("Responses websocket removes output token replay include for configured models", async () => {
+  getConfig().noEncryptedOutputModels = ["gpt-6-astra"]
+  const payload: ResponsesPayload = {
+    include: ["reasoning.encrypted_content", "output.encrypted_content"],
+    input: "hello",
+    model: "gpt-6-astra",
+    stream: true,
+  }
+
+  const response = await createResponses(payload, {
+    initiator: "user",
+    requestId: "request-output-replay",
+    transport: "websocket",
+    vision: false,
+  })
+  await collectStreamChunks(response as AsyncIterable<unknown>)
+
+  const sent = JSON.parse(MockWebSocket.instances[0]?.sent[0] ?? "") as {
+    include?: Array<string>
+    type?: string
+  }
+  expect(sent.type).toBe("response.create")
+  expect(sent.include).toEqual(["reasoning.encrypted_content"])
+  expect(payload.include).toEqual([
+    "reasoning.encrypted_content",
+    "output.encrypted_content",
+  ])
+})
+
+test("Responses websocket omits include when only disabled output token replay is requested", async () => {
+  getConfig().noEncryptedOutputModels = ["gpt-6-astra"]
+  const payload: ResponsesPayload = {
+    include: ["output.encrypted_content"],
+    input: "hello",
+    model: "gpt-6-astra",
+    stream: true,
+  }
+
+  const response = await createResponses(payload, {
+    initiator: "user",
+    requestId: "request-output-replay-only",
+    transport: "websocket",
+    vision: false,
+  })
+  await collectStreamChunks(response as AsyncIterable<unknown>)
+
+  const sent = JSON.parse(
+    MockWebSocket.instances[0]?.sent[0] ?? "",
+  ) as ResponsesPayload
+  expect(sent).not.toHaveProperty("include")
+  expect(payload.include).toEqual(["output.encrypted_content"])
 })
 
 test("Responses websocket pool reuses the same connection for matching pool keys", async () => {

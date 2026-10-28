@@ -26,6 +26,8 @@ export interface AppConfig {
   >
   useMessagesApi?: boolean
   useResponsesApiWebSocket?: boolean
+  // Copilot model IDs that must not request output.encrypted_content.
+  noEncryptedOutputModels?: Array<string>
   upstreamTransport?: UpstreamTransportConfig
   anthropicApiKey?: string
   useResponsesApiWebSearch?: boolean
@@ -175,6 +177,7 @@ export const defaultConfig: AppConfig = {
   modelResponsesApiCompactThresholds,
   useMessagesApi: true,
   useResponsesApiWebSocket: true,
+  noEncryptedOutputModels: [],
   upstreamTransport: defaultUpstreamTransportConfig,
   useResponsesApiWebSearch: true,
   alphaSearchCodexPriority: true,

@@ -1,4 +1,7 @@
 import { afterEach, beforeEach, describe, expect, mock, test } from "bun:test"
+import fs from "node:fs"
+import os from "node:os"
+import path from "node:path"
 
 import type { ResponsesPayload, ResponsesResult } from "~/lib/types/responses"
 
@@ -9,6 +12,8 @@ import {
   prepareInteractionHeaders,
 } from "~/lib/api-config"
 import { COMPACT_REQUEST } from "~/lib/compact"
+import { getConfig, invalidateConfigCache } from "~/lib/config"
+import { PATHS } from "~/lib/paths"
 import { state } from "~/lib/state"
 import {
   buildResponsesWebSocketPoolKey,
@@ -20,6 +25,8 @@ import {
 
 const originalFetch = globalThis.fetch
 const originalOauthApp = process.env.COPILOT_API_OAUTH_APP
+const originalConfigPath = PATHS.CONFIG_PATH
+let configDir: string
 const originalState = {
   accountType: state.accountType,
   copilotToken: state.copilotToken,
@@ -61,6 +68,10 @@ const fetchMock = mock((_url: string | URL | Request, _init?: RequestInit) =>
 )
 
 beforeEach(() => {
+  configDir = fs.mkdtempSync(path.join(os.tmpdir(), "create-responses-config-"))
+  PATHS.CONFIG_PATH = path.join(configDir, "config.json")
+  fs.writeFileSync(PATHS.CONFIG_PATH, "{}")
+  invalidateConfigCache()
   delete process.env.COPILOT_API_OAUTH_APP
   state.accountType = "individual"
   state.copilotToken = "test-token"
@@ -75,6 +86,9 @@ beforeEach(() => {
 })
 
 afterEach(() => {
+  PATHS.CONFIG_PATH = originalConfigPath
+  invalidateConfigCache()
+  fs.rmSync(configDir, { recursive: true, force: true })
   if (originalOauthApp === undefined) {
     delete process.env.COPILOT_API_OAUTH_APP
   } else {
@@ -140,6 +154,86 @@ describe("createResponses", () => {
     >
     expect(body.initiator).toBeUndefined()
     expect(body.type).toBeUndefined()
+  })
+
+  test.each([
+    { models: undefined },
+    { models: [] },
+    { models: ["gpt-6-astra"] },
+    { models: ["gpt-6-luna-preview"] },
+  ])(
+    "preserves HTTP output token replay include for unlisted models with config %j",
+    async ({ models }) => {
+      getConfig().noEncryptedOutputModels = models
+      const payload: ResponsesPayload = {
+        include: ["reasoning.encrypted_content", "output.encrypted_content"],
+        input: "hello",
+        model: "gpt-6-luna",
+      }
+
+      await createResponses(payload, {
+        initiator: "user",
+        requestId: "request-1",
+        vision: false,
+      })
+
+      const [, init] = fetchMock.mock.calls[0]
+      const body = JSON.parse(
+        (init as RequestInit).body as string,
+      ) as ResponsesPayload
+      expect(body.include).toEqual([
+        "reasoning.encrypted_content",
+        "output.encrypted_content",
+      ])
+      expect(payload.include).toEqual(body.include)
+    },
+  )
+
+  test("removes output token replay include for configured Copilot HTTP models", async () => {
+    getConfig().noEncryptedOutputModels = ["gpt-6-astra"]
+    const payload: ResponsesPayload = {
+      include: ["reasoning.encrypted_content", "output.encrypted_content"],
+      input: "hello",
+      model: "gpt-6-astra",
+    }
+
+    await createResponses(payload, {
+      initiator: "user",
+      requestId: "request-1",
+      vision: false,
+    })
+
+    const [, init] = fetchMock.mock.calls[0]
+    const body = JSON.parse(
+      (init as RequestInit).body as string,
+    ) as ResponsesPayload
+    expect(body.include).toEqual(["reasoning.encrypted_content"])
+    expect(payload.include).toEqual([
+      "reasoning.encrypted_content",
+      "output.encrypted_content",
+    ])
+  })
+
+  test("omits include when only unsupported output token replay is requested", async () => {
+    getConfig().noEncryptedOutputModels = ["gpt-6-astra"]
+    const payload: ResponsesPayload = {
+      include: ["output.encrypted_content"],
+      input: "hello",
+      model: "gpt-6-astra",
+    }
+
+    await createResponses(payload, {
+      initiator: "user",
+      requestId: "request-1",
+      vision: false,
+    })
+
+    const [, init] = fetchMock.mock.calls[0]
+    const body = JSON.parse(
+      (init as RequestInit).body as string,
+    ) as ResponsesPayload
+    expect(body).not.toHaveProperty("include")
+    expect(payload.include).toEqual(["output.encrypted_content"])
   })
 
   test("sets subagent interaction headers for HTTP responses requests", async () => {

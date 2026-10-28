@@ -362,6 +362,8 @@ export function createSyntheticCodexModel(
     web_search_tool_type: "text_and_image",
     supports_search_tool: false,
     use_responses_lite: true,
+    // Gateway adapters use request-level effort, regardless of template capabilities.
+    supports_reasoning_effort_updates: false,
     tool_mode: "code_mode_only",
     multi_agent_version: "v2",
     multi_agent_reasoning_effort: null,

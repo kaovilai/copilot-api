@@ -31,6 +31,7 @@
     },
     "useMessagesApi": true,
     "useResponsesApiWebSocket": true,
+    "noEncryptedOutputModels": [],
     "upstreamTransport": {
       "headersTimeoutMs": 300000,
       "streamInactivityTimeoutMs": 300000,
@@ -80,6 +81,7 @@
 - **opencodeModelContextWindow：** OpenCode 模型目录（携带 OpenCode User-Agent 的 `GET /v1/models`）中 `limit.context` 和已有 `limit.input` 的 token 上限，默认 `400000`。两个字段分别在超过上限时截断，较小值保持不变，未提供的 input 上限不会补填。不修改 `limit.output`、上游实际限制或其他客户端的模型目录。正数会向下取整；缺失、无效、零或负数回退到默认值。启动合并配置时会将归一化后的值写入 `config.json`。
 - **contextManagement：** 控制代理是否为 Responses API 附加 `context_management` 压缩指令。`messages` 作用于被翻译成 Responses API 的 Anthropic 风格 `/v1/messages` 请求，包括 `openai-responses` provider 的 Messages 路由，默认值为 `true`。`responses` 作用于 native `/v1/responses` 流量，包括 `provider/model` 别名和内置 `codex` provider，默认值为 `false`。只有在确认客户端支持 context management compaction 后，才建议在 Responses API 下启用 `responses`。启用后，请求体会带上 `context_management`，并在后续轮次中仅保留最新的压缩承载内容。代理仅为 `gpt-*` 模型添加 context management 并压缩历史；这两个配置开关对 Grok 等非 GPT 模型不生效。**注意：** 对于 GPT-5.6 及以上模型（如 `gpt-5.6-sol`、`gpt-5.6-terra`、`gpt-5.6-luna`），context management 功能同样会被强制禁用，因为开启后会破坏这些模型的 prompt 缓存命中。这些强制覆盖优先于 `contextManagement` 和 `modelResponsesApiCompactThresholds` 配置。
  - **modelResponsesApiCompactThresholds：** 按模型覆盖 Responses API 的 `compact_threshold`，仅在代理自动附加 `context_management` 时使用。它的优先级高于 `resolveResponsesCompactThreshold` 基于 `max_prompt_tokens * ratio` 的兜底阈值。默认将 `gpt-5.4` 和 `gpt-5.5` 设为 `217600`（`272000 * 0.8`）。未列出的模型继续使用原有兜底逻辑。
+- **noEncryptedOutputModels：** 不支持 Responses 输出加密内容的 Copilot 模型 ID 名单。仅对名单内的模型移除请求 `include` 中的 `output.encrypted_content`；默认 `[]`，省略或留空时所有模型均原样透传该字段。按模型映射后的最终上游模型 ID 精确匹配，HTTP 和 WebSocket 请求均生效。其他 include 项（包括 `reasoning.encrypted_content`）保持不变。仅作用于 GitHub Copilot，不影响内置 `codex` 或第三方 provider。
 - **modelReasoningEfforts：** `/v1/messages` 请求的模型级默认推理强度。仅当请求没有传入 `output_config.effort` 时，该配置才会生效。
   - **优先级：** 请求中的 `output_config.effort` > `modelReasoningEfforts[model]` > 内置默认值（GPT-5.3+ 模型为 `xhigh`，其他模型为 `high`）。
   - **转发字段：** 走 Copilot 原生 Messages API 时，最终值写入 `output_config.effort`；转换为 Responses API 时，最终值写入 `reasoning.effort`。

@@ -15,7 +15,7 @@
   <a href="https://github.com/caozhiyuan/copilot-api/blob/dev/LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue.svg" alt="License"></a>
   <a href="https://github.com/caozhiyuan/copilot-api/stargazers"><img src="https://img.shields.io/github/stars/caozhiyuan/copilot-api.svg" alt="GitHub stars"></a>
   <a href="https://bun.sh"><img src="https://img.shields.io/badge/Bun-%3E%3D1.4.4-orange.svg" alt="Bun >= 1.4.4"></a>
-  <a href="https://nodejs.org"><img src="https://img.shields.io/badge/Node-%3E%3D22.13.0-green.svg" alt="Node >= 22.13.0"></a>
+  <a href="https://nodejs.org"><img src="https://img.shields.io/badge/Node-22%20%7C%2024%20%7C%2026-green.svg" alt="Node.js 22, 24, or 26 with security updates"></a>
 </p>
 
 <p align="center">
@@ -34,7 +34,10 @@ Copilot API is a local AI gateway that connects Claude Code, OpenCode, Codex, an
 
 ## Quick Start
 
-Requires **Node.js >= 22.13.0** (npx) or **Bun >= 1.4.4**. A Copilot subscription is needed only for the GitHub Copilot provider; other configured providers can run independently.
+Use **Node.js 22.x, 24.x, or 26.x with the security updates below** (npx) or **Bun >= 1.4.4**. A Copilot subscription is needed only for the GitHub Copilot provider; other configured providers can run independently.
+
+> [!WARNING]
+> **CVE-2026-111497:** The Brotli decoder in affected Node.js and Bun runtimes can corrupt memory and allow remote code execution. Upgrade Node.js 22.x to **22.23.4 or later**, 24.x to **24.22.1 or later**, or 26.x to **26.12.1 or later**; upgrade Bun to **1.4.4 or later**. Restart the gateway after upgrading. For Docker deployments, rebuild and redeploy the image with a patched runtime. See the [Node.js security release](https://nodejs.org/en/blog/vulnerability/october-2026-security-releases) and [Bun security advisory](https://github.com/oven-sh/bun/security/advisories/GHSA-663w-cv8g-jj2p).
 
 ```sh
 npx @jeffreycao/copilot-api@latest start
