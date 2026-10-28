@@ -15,7 +15,7 @@
   <a href="https://github.com/caozhiyuan/copilot-api/blob/dev/LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue.svg" alt="License"></a>
   <a href="https://github.com/caozhiyuan/copilot-api/stargazers"><img src="https://img.shields.io/github/stars/caozhiyuan/copilot-api.svg" alt="GitHub stars"></a>
   <a href="https://bun.sh"><img src="https://img.shields.io/badge/Bun-%3E%3D1.4.4-orange.svg" alt="Bun >= 1.4.4"></a>
-  <a href="https://nodejs.org"><img src="https://img.shields.io/badge/Node-%3E%3D22.13.0-green.svg" alt="Node >= 22.13.0"></a>
+  <a href="https://nodejs.org"><img src="https://img.shields.io/badge/Node-22%20%7C%2024%20%7C%2026-green.svg" alt="Node.js 22、24 或 26，需安装安全更新"></a>
 </p>
 
 <p align="center">
@@ -38,7 +38,10 @@ Copilot API 是一个本地 AI 网关，让 Claude Code、OpenCode、Codex 等�
 
 ## 快速开始
 
-需要 **Node.js >= 22.13.0**（npx）或 **Bun >= 1.4.4**。使用 GitHub Copilot 时需要相应订阅；也可以配置其他 provider 独立运行。
+请使用已安装下述安全更新的 **Node.js 22.x、24.x 或 26.x**（npx），或 **Bun >= 1.4.4**。使用 GitHub Copilot 时需要相应订阅；也可以配置其他 provider 独立运行。
+
+> [!WARNING]
+> **CVE-2026-111497 安全提示：** 受影响的 Node.js 和 Bun 内置 Brotli 解码器存在内存破坏及远程代码执行风险。请将 Node.js 22.x 升级至 **22.23.4 或更高版本**、24.x 升级至 **24.22.1 或更高版本**，或 26.x 升级至 **26.12.1 或更高版本**；Bun 请升级至 **1.4.4 或更高版本**。升级后重启网关；Docker 部署请使用修复后的运行时重新构建并部署镜像。详见 [Node.js 安全公告](https://nodejs.org/en/blog/vulnerability/october-2026-security-releases)和 [Bun 安全公告](https://github.com/oven-sh/bun/security/advisories/GHSA-663w-cv8g-jj2p)。
 
 ```sh
 npx @jeffreycao/copilot-api@latest start

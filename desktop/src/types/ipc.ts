@@ -1,5 +1,10 @@
 import type { LangPreference } from '../locales'
 import type {
+  SubscriptionProvider,
+  SubscriptionUsage,
+} from '../../../src/lib/types/subscription-usage'
+export type { SubscriptionProvider, SubscriptionUsage }
+import type {
   CreatedImage,
   ImageCreationInput,
   SaveMediaInput,
@@ -165,6 +170,8 @@ export interface TokenUsageTotals {
 }
 
 export interface TokenUsageModelSummary extends TokenUsageTotals {
+  average_first_token_ms: number | null
+  output_tokens_per_second: number | null
   model: string
 }
 
@@ -206,10 +213,16 @@ export interface TokenUsageDailySummary {
 }
 
 export interface TokenUsageEventRecord {
+  request_id: string | null
+  first_token_ms: number | null
+  duration_ms: number | null
+  request_outcome: 'completed' | 'cancelled' | 'error' | null
+  output_tokens_per_second: number | null
   id: number
   created_at_ms: number
   created_at_utc: string
   trace_id: string
+  user_agent: string
   session_id: string
   user_id: string
   source: 'copilot' | 'provider'
@@ -370,6 +383,9 @@ declare global {
       ) => Promise<void>
       openUrl: (url: string) => Promise<void>
       fetchUsage: () => Promise<unknown>
+      fetchSubscriptionUsage: (
+        provider: SubscriptionProvider,
+      ) => Promise<SubscriptionUsage | null>
       fetchModels: () => Promise<unknown>
       createImages: (
         id: string,

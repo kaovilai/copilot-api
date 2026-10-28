@@ -10,12 +10,17 @@ import {
   getMessageApiWebSearchModel,
   getOpencodeModelContextWindow,
   invalidateConfigCache,
+  mergeConfigWithDefaults,
   reloadConfig,
   setConfiguredApiKeys,
   writeConfigToDisk,
   type AppConfig,
 } from "~/lib/config-store"
-import { getSmallModel, getSmallModelForProvider } from "~/lib/model-policy"
+import {
+  getSmallModel,
+  getSmallModelForProvider,
+  isOutputEncryptedContentDisabled,
+} from "~/lib/model-policy"
 import { PATHS } from "~/lib/paths"
 import { state } from "~/lib/state"
 
@@ -103,11 +108,54 @@ test("reloadConfig creates a default config when it is missing", () => {
   expect(config.alphaSearchModel).toBe("gpt-6-luna")
   expect(config.messageApiWebSearchModel).toBe("gpt-6-luna")
   expect(config.opencodeModelContextWindow).toBe(400_000)
+  expect(config.noEncryptedOutputModels).toEqual([])
+  expect(isOutputEncryptedContentDisabled("gpt-6-astra")).toBe(false)
   expect(getOpencodeModelContextWindow()).toBe(400_000)
   expect(config.extraPrompts).toBeUndefined()
   expect(config.modelReasoningEfforts).toBeUndefined()
   if (process.platform !== "win32") {
     expect(fs.statSync(configPath).mode & 0o777).toBe(0o600)
+  }
+})
+
+test.each([
+  { configured: undefined, expected: false },
+  { configured: [], expected: false },
+  { configured: ["gpt-6-astra"], expected: true },
+  { configured: ["gpt-6-luna"], expected: false },
+  { configured: ["gpt-6-astra-preview"], expected: false },
+  { configured: null, expected: false },
+  { configured: "gpt-6-astra", expected: false },
+  { configured: {}, expected: false },
+])(
+  "matches only exact encrypted output exclusions from config %j",
+  ({ configured, expected }) => {
+    const configPath = useTempConfigPath()
+    fs.writeFileSync(
+      configPath,
+      JSON.stringify({ noEncryptedOutputModels: configured }),
+      "utf8",
+    )
+    invalidateConfigCache()
+
+    expect(isOutputEncryptedContentDisabled("gpt-6-astra")).toBe(expected)
+  },
+)
+
+test("reloadConfig refreshes and clears encrypted output model exclusions", () => {
+  useTempConfigPath()
+  for (const models of [["gpt-6-astra"], ["gpt-6-luna"], []]) {
+    writeConfigToDisk({
+      auth: { adminApiKey: "existing-admin-key" },
+      noEncryptedOutputModels: models,
+    })
+    expect(reloadConfig().noEncryptedOutputModels).toEqual(models)
+    expect(isOutputEncryptedContentDisabled("gpt-6-astra")).toBe(
+      models.includes("gpt-6-astra"),
+    )
+    expect(isOutputEncryptedContentDisabled("gpt-6-luna")).toBe(
+      models.includes("gpt-6-luna"),
+    )
   }
 })
 
@@ -200,6 +248,72 @@ test("small and search model getters use gpt-6-luna when config fields are absen
   expect(getMessageApiWebSearchModel()).toBe("gpt-6-luna")
   expect(getClaudeAutoModel()).toBeUndefined()
 })
+
+test.each([undefined, "existing-admin-key"])(
+  "startup migrates retired role models with admin key %j and persists once",
+  (adminApiKey) => {
+    const configPath = useTempConfigPath()
+    const legacyConfig: AppConfig = {
+      ...defaultConfig,
+      auth: { apiKeys: ["existing-api-key"], adminApiKey },
+      alphaSearchModel: "gpt-5-mini",
+      messageApiWebSearchModel: "gpt-5-mini",
+      claudeAutoModel: "gpt-5-mini",
+      modelMappings: { "gpt-5-mini": "custom/gpt-5-mini" },
+      extraPrompts: { "gpt-5-mini": "custom prompt" },
+      modelReasoningEfforts: { "gpt-5-mini": "low" },
+      providers: { custom: { apiKey: "provider-key" } },
+    }
+    fs.writeFileSync(configPath, JSON.stringify(legacyConfig), "utf8")
+
+    const config = mergeConfigWithDefaults()
+
+    expect(config).toMatchObject({
+      ...legacyConfig,
+      auth: {
+        apiKeys: ["existing-api-key"],
+        ...(adminApiKey ? { adminApiKey } : {}),
+      },
+      alphaSearchModel: "gpt-6-luna",
+      messageApiWebSearchModel: "gpt-6-luna",
+      claudeAutoModel: "gpt-6-luna",
+    })
+    expect(config.auth?.adminApiKey).toBeTruthy()
+    const storedConfig = fs.readFileSync(configPath, "utf8")
+    expect(JSON.parse(storedConfig)).toEqual(config)
+    expect(getAlphaSearchModel()).toBe("gpt-6-luna")
+    expect(getMessageApiWebSearchModel()).toBe("gpt-6-luna")
+    expect(getClaudeAutoModel()).toBe("gpt-6-luna")
+
+    fs.utimesSync(configPath, 1, 1)
+    const modifiedTime = fs.statSync(configPath).mtimeMs
+    expect(mergeConfigWithDefaults()).toEqual(config)
+    expect(fs.readFileSync(configPath, "utf8")).toBe(storedConfig)
+    expect(fs.statSync(configPath).mtimeMs).toBe(modifiedTime)
+  },
+)
+
+test.each(["", "custom/gpt-5-mini", "gpt-5-mini-custom", "gpt-6-luna"])(
+  "startup preserves explicit role model setting %j without rewriting the file",
+  (model) => {
+    const configPath = useTempConfigPath()
+    const config: AppConfig = {
+      ...defaultConfig,
+      auth: { adminApiKey: "existing-admin-key" },
+      alphaSearchModel: model,
+      messageApiWebSearchModel: model,
+      claudeAutoModel: model,
+    }
+    const storedConfig = JSON.stringify(config)
+    fs.writeFileSync(configPath, storedConfig, "utf8")
+    fs.utimesSync(configPath, 1, 1)
+    const modifiedTime = fs.statSync(configPath).mtimeMs
+
+    expect(mergeConfigWithDefaults()).toEqual(config)
+    expect(fs.readFileSync(configPath, "utf8")).toBe(storedConfig)
+    expect(fs.statSync(configPath).mtimeMs).toBe(modifiedTime)
+  },
+)
 
 test.each<{
   name: string

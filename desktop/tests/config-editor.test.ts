@@ -475,11 +475,22 @@ describe('configuration validation and editing helpers', () => {
     '{"auth":{"apiKeys":[""]}}',
     '{"imageGenerationModel":"other/model"}',
     '{"smallModels":[]}',
+    '{"noEncryptedOutputModels":"gpt-6-astra"}',
+    '{"noEncryptedOutputModels":[1]}',
+    '{"noEncryptedOutputModels":[""]}',
     '{"providers":{"custom":{"enabled":"false"}}}',
     '{"anthropicApiKey":"••••••"}',
   ])('rejects invalid known config: %s', (content) => {
     expect(() => validateConfigContent(content)).toThrow()
   })
+
+  test.each([{ models: [] }, { models: ['gpt-6-astra'] }])(
+    'accepts encrypted output model exclusions %j',
+    ({ models }) => {
+      const config = { noEncryptedOutputModels: models }
+      expect(validateConfigContent(JSON.stringify(config))).toEqual(config)
+    },
+  )
 
   test('keeps all supported fields and future fields while allowing inherited defaults', () => {
     const config = {

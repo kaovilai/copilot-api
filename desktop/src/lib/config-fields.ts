@@ -53,6 +53,12 @@ export const configFields = [
     section: 'models',
     type: 'json',
   },
+  {
+    id: 'noEncryptedOutputModels',
+    path: 'noEncryptedOutputModels',
+    section: 'models',
+    type: 'json',
+  },
   { id: 'extraPrompts', path: 'extraPrompts', section: 'models', type: 'json' },
   {
     id: 'useResponsesApiWebSearch',

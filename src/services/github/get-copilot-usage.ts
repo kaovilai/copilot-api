@@ -110,6 +110,7 @@ const waitForCopilotOperational = async (): Promise<boolean> => {
 const waitBeforeRetry = async (
   attempt: number,
   retryAfterMs: number | null,
+  signal?: AbortSignal,
 ): Promise<void> => {
   const { health, label } = await getCopilotHealth()
 
@@ -133,7 +134,25 @@ const waitBeforeRetry = async (
   consola.warn(
     `Retrying in ${Math.round(delayMs / 1000)}s (attempt ${attempt})`,
   )
-  await sleep(delayMs)
+  // A caller with a deadline (e.g. the desktop subscription view) must not
+  // wait out a long backoff after it has given up.
+  if (!signal) {
+    await sleep(delayMs)
+    return
+  }
+  signal.throwIfAborted()
+  let onAbort: (() => void) | undefined
+  try {
+    await Promise.race([
+      sleep(delayMs),
+      new Promise<never>((_resolve, reject) => {
+        onAbort = () => reject(signal.reason as Error)
+        signal.addEventListener("abort", onAbort, { once: true })
+      }),
+    ])
+  } finally {
+    if (onAbort) signal.removeEventListener("abort", onAbort)
+  }
 }
 
 // Emit the ASCII BEL so the macOS Terminal rings/bounces when service recovers.
@@ -143,6 +162,7 @@ const ringBell = (): void => {
 
 export const getCopilotUsage = async (
   githubToken?: string,
+  signal?: AbortSignal,
 ): Promise<CopilotUsageResponse | null> => {
   const resolvedGithubToken = githubToken ?? state.githubToken
   if (!resolvedGithubToken) {
@@ -153,18 +173,21 @@ export const getCopilotUsage = async (
 
   let attempt = 0
   for (;;) {
+    signal?.throwIfAborted()
     attempt++
     let response: Response
     try {
       response = await fetch(`${getGitHubApiBaseUrl()}/copilot_internal/user`, {
         headers: githubHeaders(authState),
+        signal,
       })
     } catch (error) {
+      if (signal?.aborted) throw error
       // Network-level failure (connect/DNS/reset) -- retriable, retry forever.
       consola.warn(
         `Failed to reach Copilot usage endpoint (attempt ${attempt}): ${error instanceof Error ? error.message : String(error)}`,
       )
-      await waitBeforeRetry(attempt, null)
+      await waitBeforeRetry(attempt, null, signal)
       continue
     }
 
@@ -188,7 +211,7 @@ export const getCopilotUsage = async (
     consola.warn(
       `Failed to get Copilot usage (status ${response.status}, attempt ${attempt}): ${errorText}`,
     )
-    await waitBeforeRetry(attempt, parseRetryAfterMs(response.headers))
+    await waitBeforeRetry(attempt, parseRetryAfterMs(response.headers), signal)
   }
 }
 

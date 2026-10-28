@@ -64,15 +64,18 @@ export const getResponsesStreamTerminalDisposition = (chunk: {
   }
 
   try {
-    const parsed = JSON.parse(chunk.data) as { type?: unknown }
-    if (parsed.type === "error" || parsed.type === "response.failed") {
+    // WebSocket decoders already extracted the event type. Parse only for
+    // callers that provide a raw chunk without event metadata.
+    const type =
+      chunk.event === undefined ?
+        (JSON.parse(chunk.data) as { type?: unknown }).type
+      : chunk.event
+
+    if (type === "error" || type === "response.failed") {
       return "discard"
     }
 
-    if (
-      parsed.type === "response.completed"
-      || parsed.type === "response.incomplete"
-    ) {
+    if (type === "response.completed" || type === "response.incomplete") {
       return "reuse"
     }
 

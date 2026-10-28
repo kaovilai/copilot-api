@@ -51,12 +51,18 @@ describe("builtin provider model registry", () => {
       BuiltinProviderModelRegistry,
     )
     expect(
-      builtinProviderModelRegistry.getModelConfig(" Codex ", " GPT-5.5 "),
+      builtinProviderModelRegistry.getModelConfig(" Codex ", " GPT-6.1-SOL "),
     ).toMatchObject({
       pricing: {
         tiers: [
-          { cachedInput: 0.5, input: 5, maxInputTokens: 272_000, output: 30 },
-          { cachedInput: 1, input: 10, output: 45 },
+          {
+            cacheCreationInput: 2.5,
+            cachedInput: 0.1,
+            input: 2,
+            maxInputTokens: 272_000,
+            output: 10,
+          },
+          { cacheCreationInput: 5, cachedInput: 0.2, input: 4, output: 15 },
         ],
       },
     })
@@ -167,6 +173,28 @@ describe("builtin provider model registry", () => {
         ],
       },
     })
+
+    expect(
+      builtinProviderModelRegistry.getModelConfig("codex", "gpt-6.1-terra"),
+    ).toEqual({
+      pricing: {
+        tiers: [
+          {
+            cacheCreationInput: 1.25,
+            cachedInput: 0.05,
+            input: 1,
+            maxInputTokens: 272_000,
+            output: 5,
+          },
+          {
+            cacheCreationInput: 2.5,
+            cachedInput: 0.1,
+            input: 2,
+            output: 7.5,
+          },
+        ],
+      },
+    })
   })
 
   test("prices Codex review and reserve models exactly like GPT-6 Luna", () => {
@@ -185,8 +213,13 @@ describe("builtin provider model registry", () => {
     }
   })
 
-  test("removes selected older Codex models while retaining GPT-5.5 pricing", () => {
-    for (const modelId of ["gpt-5.3-codex", "gpt-5.4", "gpt-5.4-mini"]) {
+  test("removes selected older Codex models", () => {
+    for (const modelId of [
+      "gpt-5.3-codex",
+      "gpt-5.4",
+      "gpt-5.4-mini",
+      "gpt-5.5",
+    ]) {
       expect(builtinProviderModelRegistry.getModelIds("codex")).not.toContain(
         modelId,
       )
@@ -194,16 +227,6 @@ describe("builtin provider model registry", () => {
         builtinProviderModelRegistry.getModelConfig("codex", modelId),
       ).toBeUndefined()
     }
-    expect(
-      builtinProviderModelRegistry.getModelConfig("codex", "gpt-5.5"),
-    ).toEqual({
-      pricing: {
-        tiers: [
-          { cachedInput: 0.5, input: 5, maxInputTokens: 272_000, output: 30 },
-          { cachedInput: 1, input: 10, output: 45 },
-        ],
-      },
-    })
   })
 
   test("returns empty results for unknown providers and models", () => {

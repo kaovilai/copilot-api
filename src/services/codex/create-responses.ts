@@ -33,7 +33,10 @@ import {
 } from "~/services/responses-websocket-helpers"
 import { createResponsesHttpEventStream } from "~/services/responses-http"
 import { fetchUpstreamWithLifecycle } from "~/services/upstream-http"
-import { requestContext } from "~/lib/request-context"
+import {
+  requestContext,
+  setPluginRequestActualModel,
+} from "~/lib/request-context"
 import consola from "consola"
 
 export const CODEX_API_BASE_URL = "https://chatgpt.com/backend-api"
@@ -305,6 +308,7 @@ export async function forwardCodexResponses(
 ): Promise<CreateResponsesReturn> {
   consola.log(`<-- model: ${payload.model}`)
   options.clientSignal?.throwIfAborted()
+  setPluginRequestActualModel(payload.model)
   const transport = resolveCodexResponsesTransport(options.transport)
   if (payload.stream && transport === "websocket") {
     return forwardCodexResponsesOverWebSocket(
@@ -643,7 +647,7 @@ const createClientPreflightStream = async function* <T>(
   yield* source
 }
 
-const createCodexResponsesWebSocketStreamChunk = (
+export const createCodexResponsesWebSocketStreamChunk = (
   data: string,
 ): ServerSentEventChunk => {
   if (data === "[DONE]") {
@@ -660,18 +664,20 @@ const createCodexResponsesWebSocketStreamChunk = (
       message?: string
     }
 
-    const event = typeof parsed.type === "string" ? parsed.type : undefined
-    const id = typeof parsed.id === "string" ? parsed.id : undefined
-
+    // Preserve upstream JSON for normal events; error messages retain the
+    // top-level field expected by existing Responses clients.
+    let forwardedData = data
     if (parsed.type === "error" && parsed.error) {
       consola.warn("Codex responses websocket stream error:", parsed.error)
       parsed.message = parsed.error.message
-      return { data: JSON.stringify(parsed), event, id }
+      forwardedData = JSON.stringify(parsed)
     }
 
-    // parsed is unmutated on the non-error path, so `data` is already
-    // byte-identical to JSON.stringify(parsed) -- reuse it.
-    return { data, event, id }
+    return {
+      event: typeof parsed.type === "string" ? parsed.type : undefined,
+      data: forwardedData,
+      id: typeof parsed.id === "string" ? parsed.id : undefined,
+    }
   } catch {
     return { data }
   }

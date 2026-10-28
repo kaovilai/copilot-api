@@ -17,6 +17,7 @@ import {
 import { getUpstreamTransportConfig } from "~/lib/config"
 import { logCopilotRateLimits } from "~/lib/copilot-rate-limit"
 import { HTTPError } from "~/lib/error"
+import { setPluginRequestActualModel } from "~/lib/request-context"
 import { state } from "~/lib/state"
 
 import { fetchCopilotWithReauth } from "./fetch-with-reauth"
@@ -67,6 +68,7 @@ export const createChatCompletions = async (
   consola.log(`<-- model: ${payload.model}`)
 
   const transportConfig = getUpstreamTransportConfig()
+  setPluginRequestActualModel(payload.model)
   const response = await fetchCopilotWithReauth(
     `${copilotBaseUrl(state)}/chat/completions`,
     {
