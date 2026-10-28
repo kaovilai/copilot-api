@@ -208,9 +208,7 @@ const parseChatCompletionChunk = (
   chunk: unknown,
 ): ChatCompletionChunk | null => {
   const data = (chunk as { data?: string }).data
-  // Only the final chunk of a stream carries usage/copilot_usage, which is
-  // all this parses for -- skip the JSON.parse on every other token.
-  if (!data || data === "[DONE]" || !data.includes("usage")) {
+  if (!data || data === "[DONE]") {
     return null
   }
 

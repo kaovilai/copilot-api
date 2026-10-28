@@ -24,6 +24,7 @@ import type {
 
 import { COMPACT_REQUEST } from "~/lib/compact"
 import { installModelsDevCatalog } from "~/lib/models-dev-cache"
+import { requestContext } from "~/lib/request-context"
 import { closeUsageStore, getTokenUsageEventsPage } from "~/lib/token-usage"
 
 import { modelsDevCatalogFixture } from "./fixtures/models-dev-catalog"
@@ -656,6 +657,102 @@ test("Copilot Chat Completions payload preparation marks two system and latest n
       },
     },
   ])
+})
+
+test("messages Messages flow records the first token from content block events", async () => {
+  createMessages.mockImplementationOnce(
+    (payload: AnthropicMessagesPayload): Promise<CreateMessagesReturn> =>
+      Promise.resolve(
+        createMessagesStream([
+          {
+            event: "message_start",
+            data: JSON.stringify({
+              message: {
+                content: [],
+                id: "msg-ttft",
+                model: payload.model,
+                role: "assistant",
+                stop_reason: null,
+                stop_sequence: null,
+                type: "message",
+                usage: { input_tokens: 3, output_tokens: 0 },
+              },
+              type: "message_start",
+            }),
+          },
+          {
+            event: "content_block_start",
+            data: JSON.stringify({
+              content_block: { text: "", type: "text" },
+              index: 0,
+              type: "content_block_start",
+            }),
+          },
+          {
+            event: "content_block_delta",
+            data: JSON.stringify({
+              delta: { text: "Hi", type: "text_delta" },
+              index: 0,
+              type: "content_block_delta",
+            }),
+          },
+          {
+            event: "message_delta",
+            data: JSON.stringify({
+              delta: { stop_reason: "end_turn", stop_sequence: null },
+              type: "message_delta",
+              usage: { output_tokens: 1 },
+            }),
+          },
+          {
+            event: "message_stop",
+            data: JSON.stringify({ type: "message_stop" }),
+          },
+        ]) as unknown as CreateMessagesReturn,
+      ),
+  )
+
+  let firstTokens = 0
+  const payload: AnthropicMessagesPayload = {
+    max_tokens: 128,
+    messages: [{ role: "user", content: "hello" }],
+    model: "claude-sonnet-4.6",
+    stream: true,
+  }
+  const app = new Hono()
+  app.post("/", (c) =>
+    requestContext.run(
+      {
+        traceId: "trace-ttft",
+        startTime: Date.now(),
+        userAgent: "",
+        sessionAffinity: undefined,
+        parentSessionId: undefined,
+        requestTiming: {
+          id: "timing-ttft",
+          firstTokenMs: null,
+          durationMs: null,
+          outcome: null,
+          hasUsage: false,
+          recordFirstToken: () => {
+            firstTokens++
+          },
+        },
+      },
+      () =>
+        handleWithMessagesApi(c, payload, {
+          logger,
+          requestId: "request-ttft",
+        }),
+    ),
+  )
+
+  const response = await app.request("/", { method: "POST" })
+  expect(response.status).toBe(200)
+  await response.text()
+
+  // Usage-only parsing (message_start/message_delta) never sees the text delta.
+  expect(firstTokens).toBeGreaterThan(0)
 })
 
 test("messages Messages flow records Copilot AIU from streaming message delta", async () => {

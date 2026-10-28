@@ -433,12 +433,7 @@ export const handleWithMessagesApi = async (
             continue
           }
           debugLazy(logger, () => ["Messages raw stream event:", data])
-          // Only message_start/message_delta carry usage -- skip the parse
-          // (and the writeSSE below always sends the original `data` either way).
-          const parsedEvent =
-            data.includes("message_start") || data.includes("message_delta") ?
-              parseAnthropicStreamEvent(data)
-            : null
+          const parsedEvent = parseAnthropicStreamEvent(data)
           recordAnthropicFirstToken(parsedEvent)
           if (parsedEvent?.type === "message_start") {
             usage = mergeAnthropicUsage(usage, {
