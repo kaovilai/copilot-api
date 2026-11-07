@@ -2,7 +2,7 @@
 
 import { defineCommand } from "citty"
 import consola from "consola"
-import { serve, type ServerHandler } from "srvx"
+import { serve } from "srvx"
 
 import { runProviderSetup } from "./auth"
 import { isGitHubCopilotEnabled } from "./lib/github-copilot-provider"
@@ -165,21 +165,42 @@ export async function runServer(options: RunServerOptions): Promise<void> {
     port: options.port,
     baseDir: PATHS.APP_DIR,
   })
-  if (plugins) registerProcessCleanup(() => plugins.close())
   const server = createServer({
     networkExposed: binding.networkExposed,
     port: options.port,
     plugins,
   })
 
-  serve({
-    fetch: server.fetch as ServerHandler,
+  const listener = serve({
+    fetch: server.fetch,
     hostname: binding.hostname,
     port: options.port,
     bun: {
       idleTimeout: 0,
+      // SO_REUSEPORT: a replacement gateway can bind alongside this one and the
+      // kernel keeps routing new connections here until this listener closes —
+      // the zero-gap restart path. With no second binder, nothing changes.
+      reusePort: true,
     },
   })
+
+  // SIGTERM is how a restart swap retires this process: stop accepting, let
+  // in-flight requests finish (capped at 30s), then let the remaining cleanups
+  // (plugin close, exit) run. The replacement already holds the port, so no
+  // request is refused and none is cut mid-response.
+  registerProcessCleanup(async () => {
+    const srv = listener as {
+      stop?: (closeActiveConnections?: boolean) => void
+      pendingRequests?: number
+    }
+    if (typeof srv?.stop !== "function") return
+    srv.stop(false)
+    const deadline = Date.now() + 30_000
+    while ((srv.pendingRequests ?? 0) > 0 && Date.now() < deadline) {
+      await new Promise((resolve) => setTimeout(resolve, 100))
+    }
+  })
+  if (plugins) registerProcessCleanup(() => plugins.close())
 }
 
 export const start = defineCommand({
