@@ -5,7 +5,12 @@ import type { AnthropicMessagesPayload } from "~/lib/types/anthropic"
 const actualConfigModule = await import("~/lib/config")
 
 let mockedReasoningEffort:
-  "none" | "minimal" | "low" | "medium" | "high" | "xhigh" = "xhigh"
+  | "none"
+  | "minimal"
+  | "low"
+  | "medium"
+  | "high"
+  | "xhigh" = "xhigh"
 
 await mock.module("~/lib/config", () => ({
   ...actualConfigModule,
