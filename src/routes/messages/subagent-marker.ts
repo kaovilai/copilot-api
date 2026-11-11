@@ -13,7 +13,9 @@ export const parseSubagentMarkerFromFirstUser = (
   }
 
   for (const block of firstUserMessage.content) {
-    if (block.type !== "text") {
+    if (block.type !== "text" || !block.text) {
+      // Claude Code can emit text blocks with a missing or empty text field;
+      // they carry no system-reminder marker and must not crash parsing.
       continue
     }
 

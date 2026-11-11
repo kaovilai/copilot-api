@@ -141,6 +141,21 @@ describe("OpenCode v1 subagent marker", () => {
     expect(next.parts).toHaveLength(1)
   })
 
+  test("skips text blocks with missing or empty text instead of crashing", () => {
+    expect(
+      parseSubagentMarkerFromFirstUser({
+        model: "test-model",
+        max_tokens: 128,
+        messages: [
+          {
+            role: "user",
+            content: [{ type: "text" }, { type: "text", text: "" }],
+          },
+        ],
+      } as unknown as Parameters<typeof parseSubagentMarkerFromFirstUser>[0]),
+    ).toBeNull()
+  })
+
   test("uses the default agent name and prevents concurrent duplicate markers", async () => {
     const hooks = await pluginModule.default.server()
     await sessionEvent(hooks, { id: "child", parentID: "root" })
