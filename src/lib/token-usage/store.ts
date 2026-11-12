@@ -2,6 +2,10 @@ import consola from "consola"
 import path from "node:path"
 
 import type { RequestTiming } from "~/lib/request-context"
+import {
+  getTokenUsageRetentionDays,
+  resolveTokenUsageRetentionDays,
+} from "~/lib/config-store"
 import { PATHS } from "~/lib/paths"
 import { registerProcessCleanup } from "~/lib/process-cleanup"
 import {
@@ -15,9 +19,12 @@ export type TokenUsageSource = "copilot" | "provider"
 export type TokenUsageEndpoint =
   | "chat_completions"
   | "embeddings"
+  | "images_generations"
+  | "images_edits"
   | "messages"
   | "provider_messages"
   | "responses"
+  | "videos_generations"
 
 export type TokenUsagePeriod =
   | "today"
@@ -32,9 +39,16 @@ export interface UsageTokens {
   cache_read_input_tokens?: number | null
   cost?: number | null
   input_tokens?: number | null
+  input_tokens_details?: ImageTokenDetails
   output_tokens?: number | null
+  output_tokens_details?: ImageTokenDetails
   total_nano_aiu?: number | null
   total_tokens?: number | null
+}
+
+export interface ImageTokenDetails {
+  image_tokens?: number
+  text_tokens?: number
 }
 
 export interface TokenUsageCost {
@@ -74,6 +88,7 @@ export interface PersistedTokenUsageEvent extends TokenUsageTiming {
   trace_id: string
   user_agent: string
   user_id: string
+  upstream_request_id?: string | null
 }
 
 export interface TokenUsageTotals {
@@ -173,8 +188,12 @@ export type TokenUsageSessionsPage = TokenUsagePage<TokenUsageSessionSummary>
 const DB_PATH_ENV = "COPILOT_API_SQLITE_DB_PATH"
 const DEFAULT_DB_FILENAME = "copilot-api.sqlite"
 const COST_NANOS_PER_UNIT = 1_000_000_000
+const TOKEN_USAGE_RETENTION_INTERVAL_MS = 24 * 60 * 60 * 1000
+const DAY_MS = 24 * 60 * 60 * 1000
 
 let writeQueue: Promise<void> = Promise.resolve()
+let retentionTimer: ReturnType<typeof setInterval> | undefined
+let retentionStarted = false
 
 function getDbPath(): string {
   return (
@@ -230,9 +249,14 @@ function initializeTokenUsageDb(db: SqliteDatabase): void {
   ensureColumn(db, "total_cost_nanos", "INTEGER")
   ensureColumn(db, "cost_source", "TEXT")
   ensureColumn(db, "request_id", "TEXT")
+  ensureColumn(db, "upstream_request_id", "TEXT")
   ensureColumn(db, "first_token_ms", "REAL")
   ensureColumn(db, "duration_ms", "REAL")
   ensureColumn(db, "request_outcome", "TEXT")
+  db.exec(`
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_token_usage_events_upstream_request
+    ON token_usage_events(source, provider_name, endpoint, upstream_request_id)
+  `)
   db.exec(`
     CREATE INDEX IF NOT EXISTS idx_token_usage_events_request_id
     ON token_usage_events(request_id)
@@ -338,11 +362,13 @@ async function writeTokenUsageEvent(
         total_cost_nanos,
         cost_source,
         request_id,
+        upstream_request_id,
         first_token_ms,
         duration_ms,
         request_outcome,
         user_agent
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      ON CONFLICT(source, provider_name, endpoint, upstream_request_id) DO NOTHING
     `,
   ).run(
     event.created_at_ms,
@@ -364,6 +390,7 @@ async function writeTokenUsageEvent(
     event.total_cost_nanos,
     event.cost_source,
     event.request_id,
+    event.upstream_request_id ?? null,
     event.first_token_ms,
     event.duration_ms,
     event.request_outcome,
@@ -1005,7 +1032,8 @@ function getModelTimingRows(
     WITH selected_requests AS (
       SELECT DISTINCT request_id FROM token_usage_events
       WHERE created_at_ms >= ? AND created_at_ms < ? AND request_id IS NOT NULL
-    ), requests AS (
+    -- The bucket join would otherwise re-run request grouping for every day.
+    ), requests AS MATERIALIZED (
       SELECT e.request_id, MIN(e.model) AS model,
         MIN(e.created_at_ms) AS first_usage_at_ms,
         MAX(e.created_at_ms) AS last_usage_at_ms,
@@ -1352,7 +1380,63 @@ export async function getTokenUsageSessionsPage(input: {
   }
 }
 
+export async function pruneTokenUsageEvents(options?: {
+  nowMs?: number
+  retentionDays?: number | null
+}): Promise<number> {
+  const retentionDays = resolveTokenUsageRetentionDays(
+    options && "retentionDays" in options ?
+      options.retentionDays
+    : getTokenUsageRetentionDays(),
+  )
+  if (retentionDays === null || !isTokenUsageStorageEnabled()) {
+    return 0
+  }
+
+  await flushTokenUsageEvents()
+  const nowMs = options?.nowMs ?? Date.now()
+  const cutoffMs = nowMs - retentionDays * DAY_MS
+  let deleted = 0
+  const task = writeQueue.then(async () => {
+    const db = await getDb()
+    const result = db
+      .prepare("DELETE FROM token_usage_events WHERE created_at_ms < ?")
+      .run(cutoffMs) as { changes?: number }
+    deleted = typeof result.changes === "number" ? result.changes : 0
+  })
+  writeQueue = task.catch((error: unknown) => {
+    consola.warn("Failed to prune token usage", error)
+  })
+  await task
+  return deleted
+}
+
+export async function startTokenUsageRetention(): Promise<void> {
+  if (retentionStarted) return
+  retentionStarted = true
+  try {
+    await pruneTokenUsageEvents()
+  } catch (error) {
+    consola.warn("Failed to prune token usage", error)
+  }
+  retentionTimer = setInterval(() => {
+    void pruneTokenUsageEvents().catch((error: unknown) => {
+      consola.warn("Failed to prune token usage", error)
+    })
+  }, TOKEN_USAGE_RETENTION_INTERVAL_MS)
+  retentionTimer.unref?.()
+}
+
+function stopTokenUsageRetention(): void {
+  if (retentionTimer) {
+    clearInterval(retentionTimer)
+    retentionTimer = undefined
+  }
+  retentionStarted = false
+}
+
 export async function closeUsageStore(): Promise<void> {
+  stopTokenUsageRetention()
   await flushTokenUsageEvents()
   await tokenUsageDbStore.close({
     beforeClose: (db) => {

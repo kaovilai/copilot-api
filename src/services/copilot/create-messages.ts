@@ -19,9 +19,11 @@ import {
 import { getUpstreamTransportConfig } from "~/lib/config"
 import { logCopilotRateLimits } from "~/lib/copilot-rate-limit"
 import { HTTPError } from "~/lib/error"
-import { setPluginRequestActualModel } from "~/lib/request-context"
+import {
+  requestContext,
+  setPluginRequestActualModel,
+} from "~/lib/request-context"
 import { state } from "~/lib/state"
-import { parseUserIdMetadata } from "~/lib/utils"
 
 import { fetchCopilotWithReauth } from "./fetch-with-reauth"
 
@@ -37,6 +39,7 @@ const allowedAnthropicBetas = new Set([
   ADVANCED_TOOL_USE_BETA,
   EXTENDED_CACHE_TTL_BETA,
   "mid-conversation-output-config-2026-07-01",
+  "mid-conversation-tool-changes-2026-07-01",
   "per-turn-control-2026-07-01",
 ])
 
@@ -118,10 +121,7 @@ export const createMessages = async (
 
   prepareForCompact(headers, options.compactType)
 
-  const { safetyIdentifier, sessionId } = parseUserIdMetadata(
-    payload.metadata?.user_id,
-  )
-  if (safetyIdentifier && sessionId && !isOpencodeOauthApp()) {
+  if (requestContext.getStore()?.isClaudeCode && !isOpencodeOauthApp()) {
     headers["anthropic-version"] =
       options.anthropicVersionHeader ?? "2023-06-01"
     prepareMessageProxyHeaders(headers, state)

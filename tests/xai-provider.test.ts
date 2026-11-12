@@ -8,6 +8,7 @@ import {
   test,
 } from "bun:test"
 import fs from "node:fs"
+import fsPromises from "node:fs/promises"
 import os from "node:os"
 import path from "node:path"
 import { fileURLToPath } from "node:url"
@@ -51,6 +52,7 @@ if (process.env.COPILOT_API_XAI_TEST_PROCESS !== "1") {
   const { PATHS } = await import("~/lib/paths")
   const { resolveProviderConfig } = await import("~/lib/provider-resolver")
   const { requestContext } = await import("~/lib/request-context")
+  const { traceIdMiddleware } = await import("~/lib/trace")
   const {
     getXaiAccessToken,
     persistXaiCredentials,
@@ -164,6 +166,48 @@ if (process.env.COPILOT_API_XAI_TEST_PROCESS !== "1") {
       expect(await getXaiAccessToken()).toBe(credentials.accessToken)
     })
 
+    test("reads xAI OAuth credentials once per request", async () => {
+      await persistXaiCredentials(credentials)
+      const readFile = spyOn(fsPromises, "readFile")
+      const app = new Hono().use(traceIdMiddleware).get("/", async (c) => {
+        const providers = await Promise.all([
+          resolveProviderConfig("xai"),
+          resolveProviderConfig("xai"),
+        ])
+        providers.push(await resolveProviderConfig("xai"))
+        return c.json(providers.map((provider) => provider?.apiKey))
+      })
+      for (let request = 0; request < 2; request++) {
+        readFile.mockClear()
+        const response = await app.request("/", {
+          headers: { "x-trace-id": "same-trace" },
+        })
+        expect(await response.json()).toEqual(
+          Array<string>(3).fill(credentials.accessToken),
+        )
+        expect(
+          readFile.mock.calls.filter(
+            ([file]) => file === PATHS.XAI_CREDENTIAL_PATH,
+          ),
+        ).toHaveLength(1)
+      }
+    })
+
+    test("retries a failed xAI credential lookup in the same request", async () => {
+      await persistXaiCredentials(credentials)
+      const lookupError = new Error("credential lookup failed")
+      spyOn(fsPromises, "readFile").mockRejectedValueOnce(lookupError)
+      const app = new Hono().use(traceIdMiddleware).get("/", async (c) => {
+        expect(await getXaiAccessToken().catch((error: unknown) => error)).toBe(
+          lookupError,
+        )
+        return c.json(await getXaiAccessToken())
+      })
+
+      const response = await app.request("/")
+      expect(await response.json()).toBe(credentials.accessToken)
+    })
+
     test("returns null for missing credentials or a disabled OAuth provider", async () => {
       expect(await readXaiCredentials()).toBeNull()
       expect(await getXaiAccessToken()).toBeNull()
@@ -196,13 +240,15 @@ if (process.env.COPILOT_API_XAI_TEST_PROCESS !== "1") {
     })
 
     test.each(["oauth2", "authorization"] as const)(
-      "routes configured image generation with real %s provider resolution",
+      "routes image model mappings with real %s provider resolution and ignores retired overrides",
       async (authType) => {
         if (authType === "oauth2") await persistXaiCredentials(credentials)
         fs.writeFileSync(
           PATHS.CONFIG_PATH,
           JSON.stringify({
-            imageGenerationModel: "xai/grok-imagine-image-2.0",
+            imageGenerationModel: "xai/retired-override",
+            imageEditModel: "xai/retired-edit-override",
+            modelMappings: { "gpt-image-1": "xai/grok-imagine-image-2.0" },
             providers: {
               xai: {
                 apiKey:
@@ -536,7 +582,7 @@ if (process.env.COPILOT_API_XAI_TEST_PROCESS !== "1") {
       expect(consola.log).not.toHaveBeenCalledWith("cli-access")
     })
 
-    test("lists cached models.dev xAI models in provider and aggregated endpoints without upstream discovery", async () => {
+    test("combines cached xAI chat models and built-in images in aggregated discovery without upstream requests", async () => {
       await persistXaiCredentials(credentials)
       const upstream = mock(() =>
         Promise.reject(new Error("Model listing must stay local")),
@@ -562,7 +608,15 @@ if (process.env.COPILOT_API_XAI_TEST_PROCESS !== "1") {
       expect(models.data.map((model) => model.id)).toEqual([
         "xai/grok-4.7",
         "xai/grok-catalog-only",
+        "xai/grok-imagine-image-2.0",
       ])
+      expect(
+        models.data.find((model) => model.id === "xai/grok-imagine-image-2.0"),
+      ).toMatchObject({
+        type: "image",
+        input_modalities: ["text", "image"],
+        output_modalities: ["image"],
+      })
       expect(upstream).not.toHaveBeenCalled()
       const codex = await app.request("/v1/models", {
         headers: { "user-agent": "codex/1.0" },

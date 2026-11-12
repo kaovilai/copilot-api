@@ -72,9 +72,11 @@ curl http://localhost:4141/v1/models
 ```
 
 > [!NOTE]
-> token usage 存储需要 Node.js >= 22.13.0 或 Bun。详见[通过 npx 使用](docs/guides/zh-CN/getting-started.md#using-with-npx)。
+> token usage 存储需要 Bun >= 1.4.4，或带内置 `node:sqlite` 的 Node.js（22.13.0 起可用）。请使用上方安全公告中的已修补 Node.js 版本。详见[通过 npx 使用](docs/guides/zh-CN/getting-started.md#using-with-npx)。
 
 接下来可按你的客户端选择指南：[与 Claude Code 一起使用](docs/guides/zh-CN/claude-code.md#using-with-claude-code)、[与 OpenCode 一起使用](docs/guides/zh-CN/opencode.md#using-with-opencode)、[与 Codex 一起使用](docs/guides/zh-CN/codex.md#using-with-codex)、[与 DeepSeek Harness 一起使用](docs/guides/zh-CN/dsh.md#using-with-deepseek-harness)，或通过 [Docker](docs/guides/zh-CN/docker.md#using-with-docker) 运行。
+
+**Codex 多 Agent 兼容性：** 可通过 [`codexMultiAgentV1`](docs/guides/zh-CN/configuration.md#codex-多-agent-兼容性) 在目录中声明 V1，默认仍为 V2。应用网关配置后需**新建 Codex 会话**。运行中刷新目录不会切换会话已确定的版本，恢复旧会话也会沿用已记录的版本；CLI 显式配置可能优先。
 
 <a id="compatibility"></a>
 
@@ -107,6 +109,8 @@ curl http://localhost:4141/v1/models
 </p>
 
 Windows x64（`.exe`）、macOS Apple Silicon（`.dmg`）和 Linux x64（`.AppImage`）安装包发布在 [GitHub Releases](https://github.com/caozhiyuan/copilot-api/releases)。完整配置与高级设置见 [Electron 桌面应用](docs/guides/zh-CN/desktop.md#electron-desktop-app)。
+
+首次下载完整安装包安装后，后续更新通常会使用增量下载，减少下载量。macOS 首次更新若尚无 DMG 缓存，可能会先完整下载一次以建立缓存；缓存不可用或增量下载失败时，会自动回退完整下载。
 
 ## 文档导航
 

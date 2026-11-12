@@ -19,6 +19,10 @@ export interface Locale {
     size: string
     quality: string
     count: string
+    outputFormat: string
+    frameCount: string
+    frameDurationMs: string
+    gifHint: string
     auto: string
     low: string
     medium: string
@@ -74,6 +78,10 @@ export interface Locale {
     restartInstall: string
     openRelease: string
     manualInstall: string
+    packageReady: string
+    showPackage: string
+    openPackage: string
+    manualPackageNote: string
     restartNote: string
     progress: string
     actionFailed: string

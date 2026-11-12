@@ -1,14 +1,28 @@
-import { afterEach, beforeEach, describe, expect, mock, test } from "bun:test"
+import {
+  afterEach,
+  beforeEach,
+  describe,
+  expect,
+  mock,
+  spyOn,
+  test,
+} from "bun:test"
 import { Hono, type Context } from "hono"
 
 import type {
   AnthropicMessagesPayload,
   AnthropicResponse,
 } from "~/lib/types/anthropic"
-import type { ResponsesResult } from "~/lib/types/responses"
+import type {
+  ResponsesResult,
+  ResponseStreamEvent,
+} from "~/lib/types/responses"
 import type { CompletionPayloadOptions } from "~/routes/messages/handler"
 import { MESSAGES_TOOL_CALL_TIPS } from "~/routes/responses/messages-translation"
-import type { createResponses as createCopilotResponses } from "~/services/copilot/create-responses"
+import {
+  createResponsesWebSocketStreamChunk,
+  type createResponses as createCopilotResponses,
+} from "~/services/copilot/create-responses"
 
 let responsesApiWebSocketEnabled = true
 
@@ -208,6 +222,81 @@ afterEach(async () => {
   )
   Object.assign(responsesUtilsDependencies, defaultResponsesUtilsDependencies)
   Object.assign(taskTitleDependencies, defaultTaskTitleDependencies)
+})
+
+describe("Responses reasoning summary defaults", () => {
+  for (const [transport, supportedEndpoints] of [
+    ["http", ["/responses"]],
+    ["websocket", ["/responses", "ws:/responses"]],
+  ] as const) {
+    for (const [scenario, reasoning, expectedReasoning] of [
+      [
+        "effort is set",
+        { effort: "high", context: "all_turns" },
+        { effort: "high", context: "all_turns", summary: "auto" },
+      ],
+      [
+        "effort is none",
+        { effort: "none" },
+        { effort: "none", summary: "auto" },
+      ],
+      [
+        "summary is auto",
+        { effort: "high", summary: "auto" },
+        { effort: "high", summary: "auto" },
+      ],
+      [
+        "summary is concise",
+        { effort: "high", summary: "concise" },
+        { effort: "high", summary: "concise" },
+      ],
+      [
+        "summary is detailed",
+        { effort: "high", summary: "detailed" },
+        { effort: "high", summary: "detailed" },
+      ],
+      [
+        "summary is null",
+        { effort: "high", summary: null },
+        { effort: "high", summary: null },
+      ],
+      ["effort is empty", { effort: "" }, { effort: "" }],
+      ["effort is null", { effort: null }, { effort: null }],
+      ["effort is omitted", {}, {}],
+      ["reasoning is null", null, null],
+      ["reasoning is omitted", undefined, undefined],
+    ] as const) {
+      test(`forwards reasoning when ${scenario} over ${transport}`, async () => {
+        state.models!.data[0].supported_endpoints = [...supportedEndpoints]
+        createResponses.mockImplementation((payload) =>
+          Promise.resolve(
+            payload.stream ?
+              streamChunks([])
+            : createResponsesResult(payload.model),
+          ),
+        )
+
+        const response = await createApp().request("/v1/responses", {
+          body: JSON.stringify({
+            input: "hello",
+            model: "gpt-test",
+            reasoning,
+            stream: transport === "websocket",
+          }),
+          headers: { "content-type": "application/json" },
+          method: "POST",
+        })
+        await response.text()
+
+        expect(response.status).toBe(200)
+        expect(createResponses).toHaveBeenCalledTimes(1)
+        expect<unknown>(createResponses.mock.calls[0][0].reasoning).toEqual(
+          expectedReasoning,
+        )
+        expect(createResponses.mock.calls[0][1].transport).toBe(transport)
+      })
+    }
+  }
 })
 
 describe("Codex task title model routing on Responses", () => {
@@ -689,7 +778,7 @@ describe("responses handler token usage", () => {
     expect(dispatchOptions?.requestId).toBe(getUUID("child-thread_"))
     expect(dispatchOptions?.subagentMarker).toEqual({
       agent_id: "child-thread",
-      agent_type: "collab_spawn",
+      agent_type: "subagent",
       session_id: "root-session",
     })
   })
@@ -1211,11 +1300,12 @@ describe("responses handler token usage", () => {
       expect(createResponses).toHaveBeenCalledTimes(1)
       expect(
         createResponses.mock.calls[0][0].reasoning as
-          | { effort?: string }
+          | { effort?: string; summary?: string | null }
           | null
           | undefined,
       ).toEqual({
         effort: expectedEffort,
+        summary: "auto",
       })
     },
   )
@@ -1633,7 +1723,7 @@ describe("responses handler token usage", () => {
     },
   )
 
-  test("uses Codex subagent headers for Responses request attribution", async () => {
+  test("uses root and current sessions for Responses request attribution", async () => {
     createResponses.mockImplementation((payload) =>
       Promise.resolve(createResponsesResult(payload.model)),
     )
@@ -1671,7 +1761,7 @@ describe("responses handler token usage", () => {
     expect(options?.requestId).toBe(getUUID("child-thread_"))
     expect(options?.subagentMarker).toEqual({
       agent_id: "child-thread",
-      agent_type: "collab_spawn",
+      agent_type: "subagent",
       session_id: "root-session",
     })
   })
@@ -1774,7 +1864,7 @@ describe("responses handler token usage", () => {
       "x-session-id": "root-session",
     }),
   ])(
-    "uses session headers when Codex subagent header is missing (%#)",
+    "attributes differing sessions without a Codex subagent header (%#)",
     async (headers) => {
       createResponses.mockImplementation((payload) =>
         Promise.resolve(createResponsesResult(payload.model)),
@@ -1805,14 +1895,18 @@ describe("responses handler token usage", () => {
 
       const options = createResponses.mock.calls[0][1]
       const expectedSessionId = getUUID("root-session")
-      expect(options?.initiator).toBe("user")
+      expect(options?.initiator).toBe("agent")
       expect(options?.requestId).toBe(getUUID("child-thread_"))
       expect(options?.sessionId).toBe(expectedSessionId)
-      expect(options?.subagentMarker).toBeNull()
+      expect(options?.subagentMarker).toEqual({
+        session_id: "root-session",
+        agent_id: "child-thread",
+        agent_type: "subagent",
+      })
     },
   )
 
-  test("ignores unknown x-openai-subagent values", async () => {
+  test("attributes differing sessions independently of x-openai-subagent values", async () => {
     createResponses.mockImplementation((payload) =>
       Promise.resolve(createResponsesResult(payload.model)),
     )
@@ -1841,8 +1935,12 @@ describe("responses handler token usage", () => {
 
     expect(response.status).toBe(200)
     expect(createResponses).toHaveBeenCalledTimes(1)
-    expect(createResponses.mock.calls[0][1]?.initiator).toBe("user")
-    expect(createResponses.mock.calls[0][1]?.subagentMarker).toBeNull()
+    expect(createResponses.mock.calls[0][1]?.initiator).toBe("agent")
+    expect(createResponses.mock.calls[0][1]?.subagentMarker).toEqual({
+      session_id: "root-session",
+      agent_id: "child-thread",
+      agent_type: "subagent",
+    })
   })
 
   test.each(
@@ -1851,7 +1949,7 @@ describe("responses handler token usage", () => {
         [false, true].map((withParent) => ({ agentType, withParent })),
     ),
   )(
-    "recognizes $agentType Codex subagents with parent header=$withParent",
+    "attributes differing sessions regardless of hint $agentType or parent=$withParent",
     async ({ agentType, withParent }) => {
       createResponses.mockImplementation((payload) =>
         Promise.resolve(createResponsesResult(payload.model)),
@@ -1885,7 +1983,7 @@ describe("responses handler token usage", () => {
       expect(createResponses.mock.calls[0][1]?.initiator).toBe("agent")
       expect(createResponses.mock.calls[0][1]?.subagentMarker).toEqual({
         agent_id: "child-thread",
-        agent_type: agentType,
+        agent_type: "subagent",
         session_id: "root-session",
       })
     },
@@ -2208,6 +2306,147 @@ describe("responses handler token usage", () => {
   })
 })
 
+describe("Responses compaction stream IDs", () => {
+  for (const [transport, supportedEndpoints] of [
+    ["http", ["/responses"]],
+    ["websocket", ["/responses", "ws:/responses"]],
+  ] as const) {
+    test.each([true, false])(
+      `keeps one response and checkpoint over ${transport} with SSE event names=%s`,
+      async (includeEventName) => {
+        state.models!.data[0].supported_endpoints = [...supportedEndpoints]
+        const checkpoint = {
+          id: "checkpoint-added",
+          type: "compaction",
+          encrypted_content: "final-checkpoint",
+        } as const
+        const events: Array<ResponseStreamEvent> = [
+          {
+            type: "response.created",
+            sequence_number: 0,
+            response: {
+              ...createResponsesResult("gpt-test"),
+              id: "response-created",
+              status: "in_progress",
+            },
+          },
+          {
+            type: "response.in_progress",
+            sequence_number: 1,
+            response: {
+              ...createResponsesResult("gpt-test"),
+              id: "response-in-progress",
+              status: "in_progress",
+            },
+          },
+          {
+            type: "response.output_item.added",
+            sequence_number: 2,
+            output_index: 0,
+            item: { ...checkpoint, encrypted_content: "initial-checkpoint" },
+          },
+          {
+            type: "response.output_item.done",
+            sequence_number: 3,
+            output_index: 0,
+            item: { ...checkpoint, id: "checkpoint-done" },
+          },
+          {
+            type: "response.completed",
+            sequence_number: 4,
+            response: {
+              ...createResponsesResult("gpt-test"),
+              id: "response-completed",
+              output: [
+                {
+                  ...checkpoint,
+                  id: "checkpoint-completed",
+                  encrypted_content: "rewrapped-checkpoint",
+                },
+              ],
+            },
+          },
+        ]
+        const instructions = "x".repeat(256 * 1024)
+        const rawFrames = events.map((event) => {
+          const frame =
+            "response" in event ?
+              { ...event, response: { ...event.response, instructions } }
+            : event
+          return ` ${JSON.stringify(frame)} `
+        })
+        createResponses.mockImplementation(() =>
+          Promise.resolve(
+            streamChunks(
+              rawFrames.map((data, index) => {
+                const chunk =
+                  transport === "websocket" ?
+                    createResponsesWebSocketStreamChunk(data)
+                  : { data, event: events[index].type }
+                return {
+                  ...chunk,
+                  event: includeEventName ? chunk.event : undefined,
+                }
+              }),
+            ),
+          ),
+        )
+
+        const parseSpy = spyOn(JSON, "parse")
+        let body: string
+        try {
+          const response = await createApp().request("/v1/responses", {
+            body: JSON.stringify({
+              input: [
+                { role: "user", content: "Compact this conversation." },
+                { type: "compaction_trigger" },
+              ],
+              model: "gpt-test",
+              stream: true,
+            }),
+            headers: { "content-type": "application/json" },
+            method: "POST",
+          })
+          expect(response.status).toBe(200)
+          body = await response.text()
+          for (const data of rawFrames) {
+            expect(
+              parseSpy.mock.calls.filter(([input]) => input === data),
+            ).toHaveLength(1)
+          }
+        } finally {
+          parseSpy.mockRestore()
+        }
+        expect(body).toContain(`data: ${rawFrames[0]}\n`)
+        const forwarded = body
+          .split("\n")
+          .filter((line) => line.startsWith("data: "))
+          .map((line) => JSON.parse(line.slice(6)) as ResponseStreamEvent)
+
+        expect(createResponses.mock.calls[0][1].transport).toBe(transport)
+        expect(forwarded.map((event) => event.type)).toEqual(
+          events.map((event) => event.type),
+        )
+        const checkpointIds = new Set<string | undefined>()
+        for (const event of forwarded) {
+          if ("response" in event) {
+            expect(event.response.id).toBe("response-created")
+          }
+          if (event.type === "response.output_item.done") {
+            expect(event.item).toEqual(checkpoint)
+            checkpointIds.add(event.item.id)
+          }
+          if (event.type === "response.completed") {
+            expect(event.response.output).toEqual([checkpoint])
+            for (const item of event.response.output) checkpointIds.add(item.id)
+          }
+        }
+        expect([...checkpointIds]).toEqual([checkpoint.id])
+      },
+    )
+  }
+})
+
 describe("responses handler interrupted streams", () => {
   test("delivers failure events when the Messages stream ends before initialization", async () => {
     state.models = {
@@ -2274,6 +2513,120 @@ describe("responses handler interrupted streams", () => {
       "response.in_progress",
       "error",
       "response.failed",
+    ])
+  })
+})
+
+describe("responses handler native stream termination", () => {
+  const createdChunk = (model: string) => ({
+    data: JSON.stringify({
+      response: { ...createResponsesResult(model), status: "in_progress" },
+      sequence_number: 0,
+      type: "response.created",
+    }),
+    event: "response.created",
+  })
+
+  const completedChunk = (model: string) => ({
+    data: JSON.stringify({
+      response: createResponsesResult(model),
+      sequence_number: 1,
+      type: "response.completed",
+    }),
+    event: "response.completed",
+  })
+
+  const streamRequest = async (
+    chunks: () => AsyncGenerator<Record<string, unknown>>,
+  ) => {
+    createResponses.mockImplementation(() => Promise.resolve(chunks()))
+    const response = await createApp().request("/v1/responses", {
+      body: JSON.stringify({ input: "hello", model: "gpt-test", stream: true }),
+      headers: { "content-type": "application/json" },
+      method: "POST",
+    })
+    expect(response.status).toBe(200)
+    return (await response.text())
+      .split("\n")
+      .filter((line) => line.startsWith("data: "))
+      .map((line) => JSON.parse(line.slice(6)) as ResponseStreamEvent)
+  }
+
+  test("closes a stream that ended without a terminal event with response.failed", async () => {
+    const events = await streamRequest(async function* () {
+      await Promise.resolve()
+      yield createdChunk("gpt-test")
+    })
+
+    expect(events.map((event) => event.type)).toEqual([
+      "response.created",
+      "response.failed",
+    ])
+    const failed = events.at(-1)
+    expect(failed?.type === "response.failed" && failed.response).toMatchObject(
+      {
+        error: { code: "server_error" },
+        id: "resp-test",
+        model: "gpt-test",
+        status: "failed",
+      },
+    )
+  })
+
+  test("follows a bare upstream error event with a classified response.failed", async () => {
+    const events = await streamRequest(async function* () {
+      await Promise.resolve()
+      yield {
+        data: JSON.stringify({
+          code: null,
+          message: "Upstream connection lost",
+          param: null,
+          sequence_number: 0,
+          type: "error",
+        }),
+        event: "error",
+      }
+    })
+
+    expect(events.map((event) => event.type)).toEqual([
+      "error",
+      "response.failed",
+    ])
+    const failed = events[1]
+    expect(failed.type === "response.failed" && failed.response.error).toEqual({
+      code: "server_error",
+      message: "Upstream connection lost",
+    })
+  })
+
+  test("still sends response.failed when an undecodable event aborts the loop", async () => {
+    const errorSpy = spyOn(console, "error").mockImplementation(() => {})
+    try {
+      const events = await streamRequest(async function* () {
+        await Promise.resolve()
+        yield createdChunk("gpt-test")
+        yield { data: "{not json", event: "response.output_text.delta" }
+      })
+
+      expect(events.map((event) => event.type)).toEqual([
+        "response.created",
+        "response.failed",
+      ])
+    } finally {
+      errorSpy.mockRestore()
+    }
+  })
+
+  test("does not add events when the upstream sent its own terminal event", async () => {
+    const events = await streamRequest(async function* () {
+      await Promise.resolve()
+      yield createdChunk("gpt-test")
+      yield completedChunk("gpt-test")
+    })
+
+    expect(events.map((event) => event.type)).toEqual([
+      "response.created",
+      "response.completed",
     ])
   })
 })

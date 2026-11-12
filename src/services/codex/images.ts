@@ -4,12 +4,14 @@ import {
 } from "undici"
 
 import { createTimeoutDispatcher } from "~/lib/timeout-dispatcher"
-import {
-  buildCodexRequestHeaders,
-  CODEX_API_BASE_URL,
-} from "~/services/codex/create-responses"
+import { DEFAULT_IMAGE_MODELS } from "~/lib/image-models"
+import { CODEX_API_BASE_URL } from "~/services/codex/constants"
+import { buildCodexRequestHeaders } from "~/services/codex/create-responses"
 
 export type CodexImagesOperation = "generations" | "edits"
+
+// Codex's default differs from the public OpenAI Images API default.
+export const DEFAULT_CODEX_IMAGE_MODEL = DEFAULT_IMAGE_MODELS.codex
 
 const CODEX_IMAGES_TIMEOUT_MS = 15 * 60 * 1000
 
@@ -46,7 +48,10 @@ export async function forwardCodexImages(
     headers,
     body: request.body,
     duplex: "half",
-    signal: AbortSignal.timeout(CODEX_IMAGES_TIMEOUT_MS),
+    signal: AbortSignal.any([
+      request.signal,
+      AbortSignal.timeout(CODEX_IMAGES_TIMEOUT_MS),
+    ]),
   }
 
   const upstreamUrl = resolveCodexImagesUrl(request.url, operation)

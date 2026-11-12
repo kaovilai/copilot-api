@@ -73,6 +73,10 @@ const ensureSystemReminderText = (text: string): string => {
   return `${SYSTEM_REMINDER_START}\n${text.trim()}\n${SYSTEM_REMINDER_END}`
 }
 
+// Fork-specific: Claude Code's SubagentStart hook prepends a marker line
+// ("SubagentStart hook additional") to the first system text block; keeping
+// that marker out of the reminder-wrapped content preserves the split between
+// the marker line and the rest of the block.
 const normalizeSystemStringForMerge = (
   text: string,
 ): string | Array<AnthropicTextBlock> => {
@@ -99,26 +103,34 @@ const normalizeSystemContentForMerge = (
   content: string | Array<AnthropicTextBlock>,
 ): string | Array<AnthropicTextBlock> => {
   if (typeof content === "string") {
+    if (content.length === 0) {
+      return []
+    }
     return normalizeSystemStringForMerge(content)
   }
 
-  return content.flatMap((block) => {
-    // Claude Code can emit text blocks with a missing text field; they carry
-    // no content, so drop them instead of crashing string operations.
-    if (typeof block.text !== "string") {
-      return []
-    }
-    const normalized = normalizeSystemStringForMerge(block.text)
-    if (typeof normalized === "string") {
-      return [{ ...block, text: normalized }]
-    }
-
-    return normalized.map((normalizedBlock, index) =>
-      index === normalized.length - 1 ?
-        { ...block, text: normalizedBlock.text }
-      : normalizedBlock,
+  return content
+    .filter(
+      (block): block is AnthropicTextBlock =>
+        block.type === "text"
+        // Claude Code can emit text blocks with a missing text field; they
+        // carry no content, so drop them instead of crashing string
+        // operations.
+        && typeof block.text === "string"
+        && block.text.length > 0,
     )
-  })
+    .flatMap((block) => {
+      const normalized = normalizeSystemStringForMerge(block.text)
+      if (typeof normalized === "string") {
+        return [{ ...block, text: normalized }]
+      }
+
+      return normalized.map((normalizedBlock, index) =>
+        index === normalized.length - 1 ?
+          { ...block, text: normalizedBlock.text }
+        : normalizedBlock,
+      )
+    })
 }
 
 const toSystemTextBlocks = (
@@ -229,6 +241,9 @@ export const normalizeSystemMessages = (
   for (const message of payload.messages) {
     if (message.role === "system") {
       const normalizedContent = normalizeSystemContentForMerge(message.content)
+      if (normalizedContent.length === 0) {
+        continue
+      }
       const previousMessage = normalizedMessages.at(-1)
       if (previousMessage?.role === "user") {
         prependSystemContentToUserMessage(previousMessage, normalizedContent)

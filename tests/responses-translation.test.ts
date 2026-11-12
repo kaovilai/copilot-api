@@ -445,7 +445,7 @@ describe("translateAnthropicMessagesToResponsesPayload", () => {
 
       expect(result.temperature).toBe(1)
       expect(result.top_p).toBeNull()
-      expect(result.max_output_tokens).toBe(12800)
+      expect(result.max_output_tokens).toBe(1024)
       expect(result.reasoning?.summary).toBe("auto")
       expect(result.include).toEqual(["reasoning.encrypted_content"])
       expect(result.input).toEqual([
@@ -464,60 +464,56 @@ describe("translateAnthropicMessagesToResponsesPayload", () => {
     },
   )
 
-  it("extracts identifiers from JSON-like user_id metadata", () => {
-    const result = translateAnthropicMessagesToResponsesPayload({
-      ...samplePayload,
-      metadata: {
-        user_id: jsonStyleUserId,
-      },
-      tools: sampleTools,
-    })
-
-    expect(result.prompt_cache_key).toBe("2c4e1cf0-7a67-4d2e-9a4b-1d16d3f44752")
-  })
-
-  it.each([undefined, "agent-a", "agent-b"])(
-    "shares the metadata cache key between main and subagents (%s)",
-    (agentId) => {
+  it.each([1, 64, 1024, 12800, 32768])(
+    "preserves the explicit output token limit %i",
+    (maxTokens) => {
       const result = translateAnthropicMessagesToResponsesPayload({
-        ...samplePayload,
-        metadata: { user_id: jsonStyleUserId },
-        tools: sampleTools,
-        messages: [
-          {
-            role: "user",
-            content: [
-              {
-                type: "text",
-                text:
-                  agentId ?
-                    `<system-reminder>__SUBAGENT_MARKER__${JSON.stringify({ session_id: "child", agent_id: agentId, agent_type: "Explore" })}</system-reminder>`
-                  : "hello",
-              },
-            ],
-          },
-        ],
+        model: "gpt-5.4",
+        max_tokens: maxTokens,
+        messages: [{ role: "user", content: "Hello" }],
       })
-
-      expect(result.prompt_cache_key).toBe(
-        "2c4e1cf0-7a67-4d2e-9a4b-1d16d3f44752",
-      )
+      expect(result.max_output_tokens).toBe(maxTokens)
     },
   )
 
-  it("keeps legacy user_id parsing before JSON fallback", () => {
-    const result = translateAnthropicMessagesToResponsesPayload({
-      ...samplePayload,
-      metadata: {
-        user_id: legacyStyleUserId,
-      },
-      tools: sampleTools,
-    })
+  it.each([jsonStyleUserId, legacyStyleUserId, emptySessionUserId])(
+    "preserves metadata without using it as the cache key (%s)",
+    (userId) => {
+      const metadata = { user_id: userId }
+      const result = translateAnthropicMessagesToResponsesPayload({
+        ...samplePayload,
+        metadata,
+        tools: sampleTools,
+      })
+      expect(result.prompt_cache_key).toBeNull()
+      expect(result.metadata).toEqual(metadata)
+    },
+  )
 
-    expect(result.prompt_cache_key).toBe("7d0e2f61-4b5c-4a9d-8f11-2c3d4e5f6a7b")
-  })
+  it.each([undefined, "agent-a", "agent-b"])(
+    "shares the trace root cache key between main and subagents (%s)",
+    (agentId) => {
+      const result = requestContext.run(
+        {
+          parentSessionId: undefined,
+          rootSessionId: "root",
+          sessionAffinity: agentId ? `root:${agentId}` : "root",
+          startTime: Date.now(),
+          traceId: "trace-123",
+          userAgent: "test",
+        },
+        () =>
+          translateAnthropicMessagesToResponsesPayload({
+            ...samplePayload,
+            metadata: { user_id: jsonStyleUserId },
+            tools: sampleTools,
+          }),
+      )
+      expect(result.prompt_cache_key).toBe("root")
+    },
+  )
 
-  it("falls back to session affinity when metadata session id is empty", () => {
+  it("uses trace affinity when the root session is absent", () => {
     const result = requestContext.run(
       {
         parentSessionId: undefined,
@@ -529,13 +525,10 @@ describe("translateAnthropicMessagesToResponsesPayload", () => {
       () =>
         translateAnthropicMessagesToResponsesPayload({
           ...samplePayload,
-          metadata: {
-            user_id: emptySessionUserId,
-          },
+          metadata: { user_id: jsonStyleUserId },
           tools: sampleTools,
         }),
     )
-
     expect(result.prompt_cache_key).toBe("opencode-session")
   })
 
@@ -896,6 +889,83 @@ describe("translateAnthropicMessagesToResponsesPayload", () => {
 
     expect(result.instructions).not.toContain("undefined")
     expect(result.instructions).toContain("real prompt")
+  })
+
+  it("translates only text blocks in inline system messages", () => {
+    const toolAdditionBlock = {
+      type: "tool_addition",
+      tool: {
+        type: "tool_reference",
+        name: "mcp__plugin_tool-search_tool_search__search",
+      },
+    }
+    const payload = {
+      model: "gpt-5.4",
+      max_tokens: 1024,
+      messages: [
+        {
+          role: "system",
+          content: [
+            {
+              type: "text",
+              text: "tools are available",
+            },
+            toolAdditionBlock,
+          ],
+        },
+        {
+          role: "user",
+          content: "hello",
+        },
+        {
+          role: "system",
+          content: [toolAdditionBlock],
+        },
+        {
+          role: "system",
+          content: "",
+        },
+        {
+          role: "system",
+          content: [
+            {
+              type: "text",
+              text: " \n\t",
+            },
+          ],
+        },
+      ],
+    } as unknown as AnthropicMessagesPayload
+
+    const result = translateAnthropicMessagesToResponsesPayload(payload)
+
+    expect(result.input).toEqual([
+      {
+        type: "message",
+        role: "developer",
+        content: [
+          {
+            type: "input_text",
+            text: "tools are available",
+          },
+        ],
+      },
+      {
+        type: "message",
+        role: "user",
+        content: "hello",
+      },
+      {
+        type: "message",
+        role: "developer",
+        content: [
+          {
+            type: "input_text",
+            text: " \n\t",
+          },
+        ],
+      },
+    ])
   })
 
   it("keeps prompt_cache_key null when no session id is provided", () => {

@@ -98,7 +98,7 @@ unsubscribe()
 | `request.actual_model` | 网关准备调用上游，确定或切换实际目标模型时 | 公共字段，带 `actualModel` |
 | `request.session` | 请求进行中，现有会话解析逻辑确定或更新会话时 | 公共请求字段，带已确定的 `sessionId` |
 | `request.first_token` | 现有流解析逻辑观察到思考开始或首个非空模型输出时 | 公共字段，加 `firstTokenMs` |
-| `request.end` | 响应体结束、出错、被取消，或客户端中断时 | 公共字段，加 `durationMs`、`firstTokenMs`、`status`、`outcome` |
+| `request.end` | 响应体结束、HTTP/处理错误、SSE 协议失败、被取消，或客户端中断时 | 公共字段，加 `durationMs`、`firstTokenMs`、`status`、`outcome` |
 | `usage.recorded` | 现有用量记录逻辑生成有效用量事件时 | 现有用量字段，加 `requestId`、`userAgent`、`sessionId` 和 `actualModel` |
 
 公共请求字段：
@@ -132,7 +132,9 @@ unsubscribe()
 
 `durationMs` 从鉴权后的请求开始计时，持续到响应体结束，包含读取请求体、解压和生成过程。持续时间采用单调时钟，单位为毫秒。响应头返回前中断时，`status` 为 `0`。
 
-`model` 保留原始请求模型，`actualModel` 记录模型映射、provider 别名解析、自动选模和端点模型归一化之后，实际发给上游的目标模型（Google 取模型 URL 中的 ID）。例如请求 `my-alias` 最终调用 `gpt-5.4`，事件中分别为 `model: "my-alias"`、`actualModel: "gpt-5.4"`。
+`outcome` 为 `completed`、`error` 或 `cancelled`。响应体正常结束且未观察到流式协议失败时为 `completed`；HTTP 状态错误、处理异常，或即使 HTTP 200 的 SSE 流中出现 `error` / `response.failed` 事件时为 `error`；客户端取消时为 `cancelled`，取消优先于协议失败。SSE 协议失败不改变 `status`，因此可能同时出现 `status: 200` 与 `outcome: "error"`；用量库使用相同的 `request_outcome`，详见[请求计时](usage.md#request-timing)。
+
+`model` 保留原始请求模型，`actualModel` 记录模型映射、provider 别名解析、自动选模和端点模型归一化之后，实际发给上游的目标模型（Google 取模型 URL 中的 ID）。目标使用配置中的 provider 名作为前缀，如 `codex/gpt-5.4`、`xai/grok-4` 或 `my-provider/claude-sonnet-4.6`；`github-copilot` 保留不带 provider 前缀的模型 ID。例如请求 `my-alias` 最终经 Codex 调用 `gpt-5.4`，事件中分别为 `model: "my-alias"`、`actualModel: "codex/gpt-5.4"`。`usage.recorded` 的 `actualModel` 使用相同规则，用量库原有模型字段格式不变。
 
 `actualModel` 在开始时为 `null`；确定上游目标时立即触发 `request.actual_model`，不需要等模型响应或 usage，运行中以及失败但没有用量的请求也能获取。未知目标或无法获取模型的原始透传路由保持 `null`。同一请求先后切换模型时会再次触发该事件，后续生命周期事件带最新目标；上游服务内部的二次选模无法确认。插件可这样订阅：
 
@@ -193,6 +195,7 @@ copilot-api start --port 5000
 ## 当前版本的范围
 
 - 覆盖现有 POST Chat Completions、Messages、Responses 和 alpha search 路由，包括对应的 `/v1` 与 provider 路径。鉴权失败、模型发现和 token 计数接口不产生这些生命周期事件。
+- 图片生成、图片编辑和视频端点不发布插件生命周期或用量事件。图片用量、费用和请求计时仍写入 SQLite。
 - 模型事件复用现有解析结果，zstd 请求在已有解压流程后获取模型。完全透传且不解析正文的 alpha search 请求可能始终为 `model: null`。
 - 同一插件内的事件按顺序执行；异步钩子不会被请求链路等待。每个插件最多积压 1024 次 handler 调用，满后会丢弃新事件并记录警告，因此这是尽力投递的监控接口，没有持久队列或自动重放。
 - 退出时最多等待 2 秒，用于排空队列和执行清理函数。

@@ -12,6 +12,8 @@
 
 远程目录响应限制为 1 MiB JSON。合并后的目录超出该限制时，网关会优先保留通过 provider `agentsModels` 选中的模型，其余模型会被丢弃。请在 Provider 管理页选择需要的模型；如果需要完整列表，则生成本地目录文件。
 
+Codex 客户端目录始终排除仅输出图片的模型，即使 `agentsModels` 显式选择也不会展示；支持图片输入的聊天模型仍可按筛选规则展示。OpenCode 可以通过同一份名单发现仅输出图片的模型；普通聚合目录也包含图片模型，不受 `agentsModels` 限制。
+
 当 `modelMappings` 已将裸名 `model` 映射到同一个 `codex/model` 时，Codex 目录会省略重复的 `codex/model` 条目并保留裸名的完整元数据。默认的 `codex-auto-review` 和 `gpt-reserve` 映射也适用。显式前缀调用继续可用；映射到其他模型或 provider 时保留前缀条目。
 
 ### Codex `config.toml` 参考配置
@@ -25,8 +27,8 @@ model_provider = "copilot_api"
 model_reasoning_summary = "auto"
 plan_mode_reasoning_effort = "max"
 # 上下文窗口和自动压缩阈值（单位：token）可自行调整。
-# 按 OpenAI API 定价，GPT 模型（如 gpt-6.1-sol）输入超过 272000 token 时，
-# 输入及缓存费用翻倍，输出费用为 1.5 倍。
+# ChatGPT 账号登录的 Codex，输入超过 272000 token 不加收长上下文费用。
+# API Key 调用则适用独立的 OpenAI API 定价。
 model_context_window = 400000
 # 沙箱策略。可改用 "workspace-write" 以启用限制。
 sandbox_mode = "danger-full-access"
@@ -57,7 +59,6 @@ api_key_model_discovery = true
 default_mode_request_user_input = true
 standalone_web_search = true
 daemon_auto_start = false
-apps = false
 prevent_idle_sleep = true
 defer_mailbox_preemption = true
 instant_interrupt = false
@@ -72,13 +73,45 @@ enabled = false
 > [!NOTE]
 > `name` 一定要配置为 `"OpenAI"`。
 >
-> **延迟子 Agent 消息抢占（Mailbox Preemption）：** 在 `[features]` 中设置 `defer_mailbox_preemption = true`。默认情况下，主 Agent 收到子 Agent 消息后，可能在当前模型输出 reasoning/commentary 等完整输出项时提前结束 SSE 读取，无需等待 `response.completed`，就发起下一次模型请求。
+> **GitHub Copilot 用户需在 `[features]` 中设置 `instant_interrupt = false`。** 这样插话会走常规 steer 路径，等待当前模型响应完成，保留 WebSocket 复用和增量续接的机会。
 >
-> 开启后，不再因收到子 Agent 消息而提前结束当前模型响应；消息将在正常的下一次输入处理时机交付，可减少旧请求尚未结束、新请求就已启动的短暂并发。通过 GitHub Copilot 使用 Codex 时，若遇到 `Encrypted function output content could not be decrypted or decoded` 异常，可尝试开启此项。
+> **多 Agent 混用：** 在网关配置或桌面端高级配置中开启 [`codexMultiAgentV1`](configuration.md#codex-多-agent-兼容性)，使用 V1 明文任务消息混用 GPT 与第三方模型，避开 V2 的 GPT 原生加密消息兼容限制。默认 V2，切换后需新建会话。
+>
+> **GitHub Copilot 多 Agent V2：** 在 `[features]` 中启用 `defer_mailbox_preemption = true`，避免子 Agent 消息抢占、提前中断当前响应。
 >
 > 使用 Codex 需先通过 ChatGPT 或 API Key 登录。`requires_openai_auth = true` 用于在 UI 中显示登录账号信息，ChatGPT 登录时还可显示额度和订阅信息；请求鉴权仍优先使用 `env_key`。如需绕过 Codex 客户端的账号限制，可尝试设为 `false`。注意：设为 `false` 后，桌面应用会隐藏 Remote（**Settings → Connections** 中的 **Control this Mac**）（[openai/codex#36879](https://github.com/openai/codex/issues/36879)）。
 >
-> `GITHUB_COPILOT_API_KEY` 需设置为系统级用户环境变量，以便 Codex 应用也能读取。填写任一[网关 API Key](cli.md#auth-命令选项)；未配置 Key 时，填写任意非空占位值即可。未设置时，Codex 会报 `Missing environment variable` 错误。
+> `GITHUB_COPILOT_API_KEY` 用于网关鉴权。填写任一[网关 API Key](cli.md#auth-命令选项)；未配置 Key 时，填写任意非空占位值即可。未设置时，Codex 会报 `Missing environment variable` 错误。
+
+### 设置 `GITHUB_COPILOT_API_KEY` 环境变量
+
+网关未配置 API Key 时，可使用 `dummy` 占位；启用鉴权时请换成实际 API Key。
+
+**macOS（终端）：**
+
+```sh
+launchctl setenv GITHUB_COPILOT_API_KEY dummy
+```
+
+此命令设置当前用户登录会话的环境变量，供之后从 Dock/Finder 启动的应用读取。设置后完全退出（`⌘Q`）并重新打开 Codex；使用 CLI 时也需完全退出并重新打开终端应用。注销或重启 macOS 后需重新执行。
+
+**Linux（终端）：**
+
+在所用 shell 的启动文件中加入以下行（Bash 为 `~/.bashrc`，Zsh 为 `~/.zshrc`），然后重新打开终端：
+
+```sh
+export GITHUB_COPILOT_API_KEY=dummy
+```
+
+该配置会长期生效。修改已有值后还需完全退出并重新打开 Codex。
+
+**Windows（CMD / PowerShell）：**
+
+```sh
+setx GITHUB_COPILOT_API_KEY dummy
+```
+
+此命令保存当前用户的环境变量。设置后完全退出并重新打开 Codex 或终端，使新环境变量生效。
 
 ### 自动审核模型映射
 
@@ -96,7 +129,7 @@ enabled = false
 
 ### 一键生成 `model_catalog.json`
 
-需要完整模型列表、使用 Codex `0.160.0` 之前的版本，或需要避开远程响应的 1 MiB 限制时，使用本地目录文件。生成脚本携带 `x-full-model-catalog: true`，绕过大小和默认模型排除限制，仍遵守 provider 启停状态及 `agentsModels` 名单；该 header 不会转发给上游。Provider 名单设置详见[配置说明](configuration.md)。
+需要完整模型列表、使用 Codex `0.160.0` 之前的版本，或需要避开远程响应的 1 MiB 限制时，使用本地目录文件。生成脚本携带 `x-full-model-catalog: true`，绕过大小和默认模型排除限制，仍遵守 provider 启停状态、`agentsModels` 名单和仅输出图片模型的过滤规则；该 header 不会转发给上游。Provider 名单设置详见[配置说明](configuration.md)。
 
 启动网关，安装 `curl` 及 Bun 或 Node.js，然后在仓库根目录运行[生成脚本](../../generate-model-catalog.sh)：
 
@@ -120,6 +153,8 @@ Codex 模型选择界面会展示网关已配置 provider 提供的模型：
 
 ### Codex provider 价格估算
 
-内置 `codex` provider 展示的费用为按 [OpenAI API 价格](https://developers.openai.com/api/docs/pricing)计算的价格估算，不代表 Codex 套餐的实际扣费或额度消耗。倍率根据请求中的 `service_tier` 统一计算，不按模型过滤：`fast` / `priority` 使用 2×，`ultrafast` 使用 6×，其余 tier 使用标准价格。上游响应返回 `default` 不会覆盖请求中的 tier。
+内置 `codex` provider 展示的是按照 [ChatGPT Enterprise Token 美元费率表](https://help.openai.com/en/articles/20001415-chatgpt-rate-card-enterprise-token-based-pricing)计算的 **USD 费用估算**，不代表订阅套餐实际扣费、Credit 扣减或额度消耗。**使用 ChatGPT 账号登录的 Codex**，即使输入超过 272K tokens，也按相同的输入、缓存输入和输出标准费率计算，**不会因长上下文加价**；Codex 也不单独收取缓存写入费用。[Enterprise Credit 费率表](https://help.openai.com/en/articles/11481834-chatgpt-rate-card-business-enterpriseedu-credit-based-pricing) 同样明确了该长上下文例外。使用 API Key 的 Codex 则适用 [OpenAI API 定价](https://developers.openai.com/api/docs/pricing)，可能产生长上下文附加费用。
+
+上述 USD 估算根据请求中的 `service_tier` 统一计算：`fast` / `priority` 使用 2×，`ultrafast` 使用 6×，其余 tier 使用标准价格，不按模型过滤。订阅内含额度和 Credit 消耗可能采用不同的倍率。上游响应返回 `default` 不会覆盖请求中的 tier。
 
 ---
