@@ -116,6 +116,7 @@ await mock.module('../electron/server-manager', () => ({
   getHost: () => '127.0.0.1',
   getServerBaseUrl: () => 'http://127.0.0.1:4141',
   getLogs: () => [],
+  clearLogs: () => 0,
 }))
 
 const { registerIpcHandlers } = await import('../electron/ipc-handlers')
@@ -225,6 +226,74 @@ beforeEach(async () => {
 })
 
 afterEach(() => mock.restore())
+
+describe('desktop provider management IPC', () => {
+  const config = {
+    configPath: 'config.json',
+    providers: [
+      { name: 'github-copilot', type: 'github-copilot', enabled: true },
+      { name: 'codex', type: 'openai-responses', enabled: true },
+    ],
+  }
+
+  test.each([
+    ['without GitHub credentials', null, ['codex']],
+    [
+      'with GitHub credentials',
+      'github-test-token',
+      ['github-copilot', 'codex'],
+    ],
+  ] satisfies Array<[string, string | null, string[]]>)(
+    'returns the same provider list on read and save %s',
+    async (_label, token, names) => {
+      spyOn(auth, 'readToken').mockResolvedValue(token)
+      spyOn(providerManagement, 'getProviderManagementConfig').mockReturnValue(
+        config,
+      )
+      spyOn(providerManagement, 'saveProviderManagementConfig').mockReturnValue(
+        config,
+      )
+
+      const expected = {
+        ...config,
+        providers: config.providers.filter((provider) =>
+          names.includes(provider.name),
+        ),
+      }
+      expect(await invoke('config:get-provider-management')).toEqual(expected)
+      expect(await invoke('config:save-provider-management', {})).toEqual(
+        expected,
+      )
+      expect(fetch).toHaveBeenCalledTimes(1)
+    },
+  )
+})
+
+describe('desktop model discovery IPC', () => {
+  test('requests image models for the Dashboard with gateway auth and preserves the catalog', async () => {
+    spyOn(fs.promises, 'readFile').mockResolvedValue(
+      JSON.stringify({ auth: { apiKeys: ['models-key'] } }),
+    )
+    const catalog = {
+      object: 'list',
+      data: [
+        { id: 'codex/gpt-image-2', type: 'image' },
+        { id: 'xai/grok-imagine-image-2.0', type: 'image' },
+      ],
+    }
+    const fetcher = spyOn(globalThis, 'fetch').mockResolvedValueOnce(
+      Response.json(catalog),
+    )
+    expect(await invoke('server:fetch-models')).toEqual(catalog)
+    expect(fetcher).toHaveBeenLastCalledWith(
+      'http://127.0.0.1:4141/models',
+      expect.objectContaining({
+        headers: { 'x-api-key': 'models-key' },
+      }),
+    )
+    expect(fetcher.mock.calls.at(-1)?.[1]?.signal).toBeInstanceOf(AbortSignal)
+  })
+})
 
 describe('desktop subscription quota IPC', () => {
   test('requests CLI server quotas with gateway auth', async () => {

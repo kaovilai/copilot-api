@@ -1,9 +1,11 @@
 /**
- * Stream ID Synchronization for @ai-sdk/openai compatibility
+ * Stream ID Synchronization for Responses client compatibility
  *
  * Problem: GitHub Copilot's Responses API returns different IDs for the same
- * item in 'added' vs 'done' events. This breaks @ai-sdk/openai which expects
- * consistent IDs across the stream lifecycle.
+ * response and output item across lifecycle events and response snapshots.
+ * Responses clients, including OpenCode compaction, require consistent IDs.
+ * Apply this only to downstream JSON: WebSocket continuation keeps the original
+ * upstream response.completed ID for previous_response_id.
  *
  * Errors without this fix:
  * - "activeReasoningPart.summaryParts" undefined
@@ -15,95 +17,156 @@
 
 import { randomUUID } from "node:crypto"
 
+import type { ResponsesStreamChunk } from "~/lib/responses-stream-event"
 import type {
+  ResponseOutputItem,
   ResponseOutputItemAddedEvent,
   ResponseOutputItemDoneEvent,
+  ResponsesResult,
   ResponseStreamEvent,
 } from "~/lib/types/responses"
 
 interface StreamIdTracker {
+  responseId?: string
   outputItems: Map<number, string>
+  completedCompactions: Map<number, string>
 }
 
 export const createStreamIdTracker = (): StreamIdTracker => ({
   outputItems: new Map(),
+  completedCompactions: new Map(),
 })
 
+export const createCopilotResponsesSseMessage = (
+  { data: rawData, event, id: chunkId }: ResponsesStreamChunk,
+  parsed: ResponseStreamEvent | null,
+  tracker: StreamIdTracker,
+) => {
+  const data = rawData ?? ""
+  const id = typeof chunkId === "number" ? String(chunkId) : chunkId
+  if (!data || data === "[DONE]") return { data, event, id }
+  if (parsed === null) throw new TypeError("Invalid Copilot Responses event")
+
+  const normalized = fixStreamIds(parsed, event, tracker)
+  return {
+    data: normalized === parsed ? data : JSON.stringify(normalized),
+    event,
+    id,
+  }
+}
+
+const fixStreamIds = (
+  parsed: ResponseStreamEvent,
+  event: string | undefined,
+  tracker: StreamIdTracker,
+): ResponseStreamEvent => {
+  let normalized = parsed
+  if ("response" in parsed) {
+    const response = synchronizeResponse(parsed.response, tracker)
+    if (response !== parsed.response) {
+      normalized = { ...parsed, response }
+    }
+  }
+
+  switch (event ?? normalized.type) {
+    case "response.output_item.added":
+    case "response.output_item.done": {
+      const itemEvent = normalized as
+        | ResponseOutputItemAddedEvent
+        | ResponseOutputItemDoneEvent
+      const item = synchronizeOutputItem(
+        itemEvent.item,
+        itemEvent.output_index,
+        tracker,
+        itemEvent.type === "response.output_item.done",
+      )
+      return item === itemEvent.item ? itemEvent : { ...itemEvent, item }
+    }
+    default: {
+      return synchronizeItemId(normalized, tracker)
+    }
+  }
+}
+
+const synchronizeResponse = (
+  response: ResponsesResult,
+  tracker: StreamIdTracker,
+): ResponsesResult => {
+  const id = tracker.responseId || response.id
+  if (id) tracker.responseId = id
+
+  let output: Array<ResponseOutputItem> | undefined
+  for (const [outputIndex, item] of (response.output ?? []).entries()) {
+    const normalized = synchronizeOutputItem(item, outputIndex, tracker)
+    if (normalized !== item) {
+      output ??= response.output.slice()
+      output[outputIndex] = normalized
+    }
+  }
+
+  return id === response.id && output === undefined ?
+      response
+    : { ...response, id, output: output ?? response.output }
+}
+
+const synchronizeOutputItem = (
+  item: ResponseOutputItem,
+  outputIndex: number,
+  tracker: StreamIdTracker,
+  isDone = false,
+): ResponseOutputItem => {
+  let itemId = tracker.outputItems.get(outputIndex) ?? item.id
+  if (!itemId) {
+    const randomSuffix = randomUUID().replaceAll("-", "").slice(0, 16)
+    itemId = `oi_${outputIndex}_${randomSuffix}`
+  }
+
+  tracker.outputItems.set(outputIndex, itemId)
+
+  if (item.type === "compaction") {
+    // Copilot can rewrap the same checkpoint in the completed snapshot.
+    // Clients have already accepted item.done, so preserve its ciphertext.
+    const encryptedContent = tracker.completedCompactions.get(outputIndex)
+    if (encryptedContent !== undefined) {
+      if (encryptedContent !== item.encrypted_content) {
+        return { ...item, id: itemId, encrypted_content: encryptedContent }
+      }
+    } else if (isDone) {
+      tracker.completedCompactions.set(outputIndex, item.encrypted_content)
+    }
+  }
+
+  return item.id === itemId ? item : { ...item, id: itemId }
+}
+
+const synchronizeItemId = (
+  parsed: ResponseStreamEvent & { output_index?: number; item_id?: string },
+  tracker: StreamIdTracker,
+): typeof parsed => {
+  const { output_index: outputIndex } = parsed
+  const itemId =
+    outputIndex === undefined ? undefined : tracker.outputItems.get(outputIndex)
+  return itemId && itemId !== parsed.item_id ?
+      { ...parsed, item_id: itemId }
+    : parsed
+}
+
 /**
- * Applies the ID fix in place on an already-parsed event and reports whether
- * the event was actually mutated. Callers should only re-serialize the event
- * (JSON.stringify) when this returns true, and can forward the original raw
- * string unchanged otherwise -- avoids a parse+stringify round-trip on every
- * streamed token when the upstream IDs already happen to match.
+ * In-place variant of the normalization `fixStreamIds` applies: mutates
+ * `parsed` when the IDs need fixing and reports whether anything actually
+ * changed. Callers can forward the original raw string unchanged when this
+ * returns false, skipping a JSON.stringify round-trip on every streamed
+ * token when the upstream IDs already match.
  */
 export const applyStreamIdFix = (
   parsed: ResponseStreamEvent,
   event: string | undefined,
   tracker: StreamIdTracker,
 ): boolean => {
-  switch (event) {
-    case "response.output_item.added": {
-      return handleOutputItemAdded(
-        parsed as ResponseOutputItemAddedEvent,
-        tracker,
-      )
-    }
-    case "response.output_item.done": {
-      return handleOutputItemDone(
-        parsed as ResponseOutputItemDoneEvent,
-        tracker,
-      )
-    }
-    default: {
-      return handleItemId(
-        parsed as ResponseStreamEvent & {
-          output_index?: number
-          item_id?: string
-        },
-        tracker,
-      )
-    }
+  const normalized = fixStreamIds(parsed, event, tracker)
+  if (normalized === parsed) {
+    return false
   }
-}
-
-const handleOutputItemAdded = (
-  parsed: ResponseOutputItemAddedEvent,
-  tracker: StreamIdTracker,
-): boolean => {
-  let changed = false
-  if (!parsed.item.id) {
-    const randomSuffix = randomUUID().replaceAll("-", "").slice(0, 16)
-    parsed.item.id = `oi_${parsed.output_index}_${randomSuffix}`
-    changed = true
-  }
-
-  tracker.outputItems.set(parsed.output_index, parsed.item.id)
-  return changed
-}
-
-const handleOutputItemDone = (
-  parsed: ResponseOutputItemDoneEvent,
-  tracker: StreamIdTracker,
-): boolean => {
-  const originalId = tracker.outputItems.get(parsed.output_index)
-  if (originalId && parsed.item.id !== originalId) {
-    parsed.item.id = originalId
-    return true
-  }
-  return false
-}
-
-const handleItemId = (
-  parsed: ResponseStreamEvent & { output_index?: number; item_id?: string },
-  tracker: StreamIdTracker,
-): boolean => {
-  const outputIndex = parsed.output_index
-  if (outputIndex !== undefined) {
-    const itemId = tracker.outputItems.get(outputIndex)
-    if (itemId && parsed.item_id !== itemId) {
-      parsed.item_id = itemId
-      return true
-    }
-  }
-  return false
+  Object.assign(parsed, normalized)
+  return true
 }

@@ -28,7 +28,7 @@ import {
   type TokenUsageEndpoint,
   type UsageTokens,
 } from "~/lib/token-usage"
-import { isAsyncIterable, parseUserIdMetadata } from "~/lib/utils"
+import { isAsyncIterable } from "~/lib/utils"
 import {
   buildErrorEvent,
   createResponsesStreamState,
@@ -140,7 +140,6 @@ export const handleWithChatCompletions = async (
     endpoint: options.usageEndpoint ?? "chat_completions",
     fallbackSessionId: sessionId,
     model: openAIPayload.model,
-    payload: anthropicPayload,
   })
   debugJson(logger, "Translated OpenAI request payload:", openAIPayload)
 
@@ -253,7 +252,6 @@ export const handleWithResponsesApi = async (
     endpoint: options.usageEndpoint ?? "responses",
     fallbackSessionId: requestOptions.sessionId,
     model: responsesPayload.model,
-    payload: anthropicPayload,
   })
 
   const shouldCompactInput = applyResponsesApiContextManagement(
@@ -294,68 +292,77 @@ export const handleWithResponsesApi = async (
       })
       let usage: UsageTokens = {}
 
-      for await (const chunk of response) {
-        const eventName = chunk.event
-        if (eventName === "ping") {
-          await writeSSEIfConnected(stream, {
-            event: "ping",
-            data: '{"type":"ping"}',
-          })
-          continue
-        }
+      try {
+        for await (const chunk of response) {
+          const eventName = chunk.event
+          if (eventName === "ping") {
+            await writeSSEIfConnected(stream, {
+              event: "ping",
+              data: '{"type":"ping"}',
+            })
+            continue
+          }
 
-        const data = chunk.data
-        if (!data) {
-          continue
-        }
+          const data = chunk.data
+          if (!data || data === "[DONE]") {
+            continue
+          }
 
-        debugLazy(logger, () => ["Responses raw stream event:", data])
+          debugLazy(logger, () => ["Responses raw stream event:", data])
 
-        const responseEvent = JSON.parse(data) as ResponseStreamEvent
-        recordResponsesFirstToken(responseEvent)
-        if (
-          responseEvent.type === "response.completed"
-          || responseEvent.type === "response.failed"
-          || responseEvent.type === "response.incomplete"
-        ) {
-          usage = {
-            ...normalizeResponsesUsage(responseEvent.response.usage),
-            total_nano_aiu: normalizeOptionalToken(
-              responseEvent.copilot_usage?.total_nano_aiu,
-            ),
+          let responseEvent: ResponseStreamEvent
+          try {
+            responseEvent = JSON.parse(data) as ResponseStreamEvent
+          } catch (error) {
+            logger.warn(
+              "Responses stream event is not valid JSON; stopping translation",
+              error,
+            )
+            break
+          }
+
+          recordResponsesFirstToken(responseEvent)
+          const nextUsage = usageFromResponsesStreamEvent(responseEvent)
+          if (nextUsage) {
+            usage = nextUsage
+          }
+
+          const events = translateResponsesStreamEvent(
+            responseEvent,
+            streamState,
+          )
+          for (const event of events) {
+            const eventData = JSON.stringify(event)
+            debugLazy(logger, () => ["Translated Anthropic event:", eventData])
+            await writeSSEIfConnected(stream, {
+              event: event.type,
+              data: eventData,
+            })
+          }
+
+          if (streamState.messageCompleted) {
+            logger.debug("Message completed, ending stream")
+            break
           }
         }
-
-        const events = translateResponsesStreamEvent(responseEvent, streamState)
-        for (const event of events) {
-          const eventData = JSON.stringify(event)
-          debugLazy(logger, () => ["Translated Anthropic event:", eventData])
-          await writeSSEIfConnected(stream, {
-            event: event.type,
-            data: eventData,
-          })
-        }
-
-        if (streamState.messageCompleted) {
-          logger.debug("Message completed, ending stream")
-          break
+      } finally {
+        try {
+          if (!streamState.messageCompleted) {
+            logger.warn(
+              "Responses stream ended without completion; sending error event",
+            )
+            const errorEvent = buildErrorEvent(
+              "Responses stream ended without completion, retry your request.",
+            )
+            await writeSSEIfConnected(stream, {
+              event: errorEvent.type,
+              data: JSON.stringify(errorEvent),
+            })
+          }
+        } finally {
+          recordUsage(usage)
         }
       }
-
-      if (!streamState.messageCompleted) {
-        logger.warn(
-          "Responses stream ended without completion; sending error event",
-        )
-        const errorEvent = buildErrorEvent(
-          "Responses stream ended without completion, retry your request.",
-        )
-        await writeSSEIfConnected(stream, {
-          event: errorEvent.type,
-          data: JSON.stringify(errorEvent),
-        })
-      }
-
-      recordUsage(usage)
     })
   }
 
@@ -397,7 +404,6 @@ export const handleWithMessagesApi = async (
     endpoint: options.usageEndpoint ?? "messages",
     fallbackSessionId: sessionId,
     model: anthropicPayload.model,
-    payload: anthropicPayload,
   })
 
   debugJson(logger, "Translated Messages payload:", anthropicPayload)
@@ -454,10 +460,14 @@ export const handleWithMessagesApi = async (
           } else if (parsedEvent?.type === "error" || eventName === "error") {
             errorSeen = true
           }
-          await writeSSEIfConnected(stream, {
-            event: eventName,
-            data,
-          })
+          await writeSSEIfConnected(
+            stream,
+            {
+              event: eventName,
+              data,
+            },
+            parsedEvent?.type,
+          )
         }
       } catch (error) {
         logger.warn("Messages stream interrupted:", error)
@@ -549,18 +559,12 @@ const createCopilotUsageRecorder = (options: {
   endpoint: TokenUsageEndpoint
   fallbackSessionId?: string
   model: string
-  payload: AnthropicMessagesPayload
 }): ((usage: UsageTokens) => void) =>
   createCopilotTokenUsageRecorder({
     endpoint: options.endpoint,
     fallbackSessionId: options.fallbackSessionId,
     model: options.model,
-    sessionId: getMetadataSessionId(options.payload),
   })
-
-const getMetadataSessionId = (
-  payload: AnthropicMessagesPayload,
-): string | null => parseUserIdMetadata(payload.metadata?.user_id).sessionId
 
 const normalizeCopilotUsage = (
   copilotUsage: CopilotUsage | null | undefined,
@@ -576,4 +580,35 @@ const parseAnthropicStreamEvent = (
   } catch {
     return null
   }
+}
+
+const usageFromResponsesStreamEvent = (
+  event: ResponseStreamEvent,
+): UsageTokens | null => {
+  if (!("response" in event)) {
+    return null
+  }
+
+  const copilotUsage =
+    "copilot_usage" in event ? event.copilot_usage : undefined
+  if (!event.response.usage && !copilotUsage) {
+    return null
+  }
+
+  const usage: UsageTokens = {
+    ...normalizeResponsesUsage(event.response.usage),
+    total_nano_aiu: normalizeOptionalToken(copilotUsage?.total_nano_aiu),
+  }
+  if (
+    !usage.input_tokens
+    && !usage.output_tokens
+    && !usage.total_tokens
+    && !usage.cache_read_input_tokens
+    && !usage.cache_creation_input_tokens
+    && usage.total_nano_aiu === undefined
+  ) {
+    return null
+  }
+
+  return usage
 }

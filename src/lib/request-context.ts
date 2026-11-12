@@ -1,11 +1,13 @@
 import { AsyncLocalStorage } from "node:async_hooks"
 import type { RequestEventObserver } from "./types/gateway-plugins"
+import type { SubagentMarker } from "./subagent"
 
 export interface RequestTiming {
   id: string
   firstTokenMs: number | null
   durationMs: number | null
   outcome: "completed" | "cancelled" | "error" | null
+  protocolFailed?: boolean
   hasUsage: boolean
   recordFirstToken: () => void
 }
@@ -16,7 +18,9 @@ export interface RequestContext {
   userAgent: string
   sessionAffinity: string | undefined
   rootSessionId?: string
+  isClaudeCode?: boolean
   parentSessionId: string | undefined
+  subagent?: SubagentMarker | null
   pluginRequest?: RequestEventObserver
   requestTiming?: RequestTiming
 }
@@ -33,8 +37,22 @@ export const requestContext = {
 }
 
 // Observe the final target at upstream dispatch, after mapping and overrides.
-export function setPluginRequestActualModel(model: string): void {
-  requestContext.getStore()?.pluginRequest?.setActualModel(model)
+export function formatPluginActualModel(
+  model: string,
+  provider?: string | null,
+): string {
+  return !model || !provider || provider === "github-copilot" ?
+      model
+    : `${provider}/${model}`
+}
+
+export function setPluginRequestActualModel(
+  model: string,
+  provider?: string,
+): void {
+  requestContext
+    .getStore()
+    ?.pluginRequest?.setActualModel(formatPluginActualModel(model, provider))
 }
 
 export function generateTraceId(): string {

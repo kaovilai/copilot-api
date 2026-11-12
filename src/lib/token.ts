@@ -21,7 +21,7 @@ import {
   refreshCodexCredentials,
   type CodexCredentials,
 } from "~/lib/oauth/codex"
-import { CODEX_API_BASE_URL } from "~/services/codex/create-responses"
+import { CODEX_API_BASE_URL } from "~/services/codex/constants"
 import {
   getCopilotToken,
   type GetCopilotTokenResponse,
@@ -543,6 +543,28 @@ export const getRetryAfterDelayMs = (
     Math.min(Math.max(retryAfterMs, retryDelayMs), MAX_RETRY_REFRESH_DELAY_MS)
   )
 
+export const scheduleRefreshRetry = (
+  retryDelayMs: number,
+  nowMs: number = Date.now(),
+  randomUnit: number = Math.random(),
+): {
+  delayMs: number
+  nextRetryDelayMs: number
+  refreshAtMs: number
+} => {
+  const jitterUnit = Math.min(Math.max(randomUnit, 0), 0.999999)
+  const delayMs = Math.min(
+    retryDelayMs + Math.floor(jitterUnit * RETRY_REFRESH_JITTER_MS),
+    MAX_RETRY_REFRESH_DELAY_MS,
+  )
+
+  return {
+    delayMs,
+    nextRetryDelayMs: Math.min(retryDelayMs * 2, MAX_RETRY_REFRESH_DELAY_MS),
+    refreshAtMs: nowMs + delayMs,
+  }
+}
+
 const runCopilotRefreshLoop = async (
   refreshIn: number,
   signal: AbortSignal,
@@ -586,14 +608,11 @@ const runCopilotRefreshLoop = async (
         error instanceof HTTPError ?
           parseRetryAfterMs(error.response.headers)
         : null
+      const retry = scheduleRefreshRetry(retryDelayMs)
       const delayMs =
-        getRetryAfterDelayMs(retryDelayMs, retryAfterMs)
-        ?? Math.min(
-          retryDelayMs + Math.floor(Math.random() * RETRY_REFRESH_JITTER_MS),
-          MAX_RETRY_REFRESH_DELAY_MS,
-        )
+        getRetryAfterDelayMs(retryDelayMs, retryAfterMs) ?? retry.delayMs
       refreshAtMs = Date.now() + delayMs
-      retryDelayMs = Math.min(retryDelayMs * 2, MAX_RETRY_REFRESH_DELAY_MS)
+      retryDelayMs = retry.nextRetryDelayMs
 
       // Only the first failure of a streak is logged -- an extended outage
       // would otherwise print this same error every retry (every 15s-10min).
@@ -615,6 +634,7 @@ const runCodexRefreshLoop = async (signal: AbortSignal) => {
     (state.codexExpiresAt ?? Date.now()) - EARLY_REFRESH_BUFFER_MS,
     Date.now(),
   )
+  let retryDelayMs = RETRY_REFRESH_DELAY_MS
 
   while (!signal.aborted) {
     const expiresAt = state.codexExpiresAt
@@ -642,12 +662,15 @@ const runCodexRefreshLoop = async (signal: AbortSignal) => {
         credentials.expiresAt - EARLY_REFRESH_BUFFER_MS,
         Date.now(),
       )
+      retryDelayMs = RETRY_REFRESH_DELAY_MS
       consola.debug("Codex credentials refreshed")
     } catch (error) {
       consola.error("Failed to refresh Codex credentials:", error)
-      refreshAtMs = Date.now() + RETRY_REFRESH_DELAY_MS
+      const retry = scheduleRefreshRetry(retryDelayMs)
+      refreshAtMs = retry.refreshAtMs
+      retryDelayMs = retry.nextRetryDelayMs
       consola.warn(
-        `Retrying Codex token refresh in ${RETRY_REFRESH_DELAY_MS / 1000}s`,
+        `Retrying Codex token refresh in ${Math.round(retry.delayMs / 1000)}s`,
       )
     }
   }

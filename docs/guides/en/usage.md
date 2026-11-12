@@ -15,7 +15,7 @@ After starting the server, a URL to the Copilot Usage Dashboard will be displaye
 
 The dashboard provides a user-friendly interface to view your Copilot usage data:
 
-> Token usage history requires Bun or Node.js >= 22.13.0. On older Node.js versions the server runs normally but token usage storage is disabled.
+> Token usage history requires Bun >= 1.4.4 or Node.js `^22.23.4 || ^24.22.1 || >=26.12.1`. Built-in `node:sqlite` has existed since 22.13.0; on older Node.js the server still runs, but token usage storage is disabled.
 
 - **API Endpoint URL**: The dashboard is pre-configured to fetch data from your local server endpoint via a URL query parameter. You can manually switch this to any other compatible API endpoint.
 - **API Key Authentication**: If API Key authentication is enabled, enter a raw API key (sent as the `x-api-key` header) or `Authorization: Bearer <key>`. Credentials are remembered in the browser's local storage per endpoint origin, and switching to a different endpoint origin does not automatically send the previous credential.
@@ -28,6 +28,22 @@ The dashboard provides a user-friendly interface to view your Copilot usage data
 - **Request Events (Paginated)**: A time-sorted list of request event records with pagination support, showing timestamps, models, request IDs, and token counts.
 - **URL-based Configuration**: You can also specify the API endpoint and period directly via `endpoint` and `period` query parameters. For example:
   `http://localhost:4141/usage-viewer?endpoint=http://your-api-server/usage&period=this_week`
+
+### Image usage and costs
+
+Image generations and edits appear in token usage events and model, daily, and session summaries under the actual forwarded model. Codex requests that omit `model` are recorded and priced under its default, `gpt-image-2`. Codex records upstream input, output, and total tokens and estimates USD costs using built-in official OpenAI API rates for image/text tokens. Built-in pricing supports only GPT Image 2 and 2.5, including named variants and dated snapshots. These are API price estimates, not additional Codex subscription charges. Without modality details, input is estimated as text and output as images; other models retain tokens without a price estimate.
+
+xAI uses the upstream `usage.cost_in_usd_ticks` amount (`10^10` ticks = 1 USD), with no built-in image prices. Cost-only responses still count toward request and cost totals; zero token counts mean no tokens were reported. Responses without valid tokens or a valid cost do not create events.
+
+Verbose logs include image response JSON metadata except `data` and streamed image base64. Edit request logs retain prompts, models, and parameters, replacing image base64 with placeholders; multipart files log only names, MIME types, and sizes.
+
+Image requests also include request IDs, total duration, and completion/cancellation outcomes in SQLite, without publishing gateway plugin events. Image TTFT remains unset. JSON requests with an early `model` stream upstream, including model rewrites. Late models and xAI format conversion use temporary files for large bodies/strings, with a 512 MiB staging limit and automatic cleanup; verbose JSON logging observes the forwarding stream without buffering the full body.
+
+### Video costs
+
+When an xAI video result query returns `status: "done"` with valid `usage.cost_in_usd_ticks`, the cost is saved in SQLite's `token_usage_events` under `videos_generations` and included in event, model, daily, and session summaries. The conversion is `10^10` ticks = 1 USD: `11300000000` ticks records 1.13 USD. Token fields remain zero when the upstream does not report tokens.
+
+SQLite deduplicates by provider, endpoint, and upstream task ID, so repeated queries and queries after a restart record the same task only once. Unfinished or failed jobs and results without a valid cost do not create cost events. With `--verbose`, the complete query response body is logged as `videos.result.response.body` in `videos-handler-YYYY-MM-DD.log`.
 
 ### Usage Viewer Screenshot
 
@@ -68,13 +84,16 @@ output_tokens_per_second = output_tokens / ((duration_ms - first_token_ms) / 100
 This is a request-side estimate using upstream-reported output tokens, including
 whatever reasoning tokens the upstream counts. It includes thinking after the
 observed start, delivery, and client backpressure. `request_outcome` describes
-HTTP/body completion: an SSE protocol error may still close normally and be
-classified as `completed`; it does not certify model success.
+HTTP/body completion and streaming protocol failures: an `error` or
+`response.failed` SSE event is recorded as `error` even when the response closes
+with HTTP 200. A cancellation remains `cancelled`. It does not certify model
+success.
 
 - Per-event speed requires a completed request with exactly one usage row,
   positive output tokens, and positive generation duration. Non-streaming,
   synthetic-from-complete-result, raw passthrough, and unobservable streams have
-  null TTFT/speed. Cancelled, errored, and unfinished requests have null speed.
+  null TTFT/speed. Cancelled, errored (including SSE protocol failures), and
+  unfinished requests have null speed.
 - Model average TTFT counts each valid completed request once. Model speed is
   the sum of eligible output tokens divided by the sum of their generation
   durations, rather than an average of individual rates. A request with multiple

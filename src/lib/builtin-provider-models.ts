@@ -1,4 +1,5 @@
 import type { TokenUsagePricingConfig } from "./token-usage/pricing"
+import { DEFAULT_IMAGE_MODELS } from "./image-models"
 import type { CodexReasoningEffort, ModelReasoningField } from "./config-store"
 import {
   getOpencodeGoModelConfig,
@@ -28,21 +29,10 @@ type BuiltinProviderModelCatalog = Record<
 >
 
 const CODEX_LUNA_PRICING: TokenUsagePricingConfig = {
-  tiers: [
-    {
-      cacheCreationInput: 0.125,
-      cachedInput: 0.01,
-      input: 0.1,
-      maxInputTokens: 272_000,
-      output: 0.5,
-    },
-    {
-      cacheCreationInput: 0.25,
-      cachedInput: 0.02,
-      input: 0.2,
-      output: 0.75,
-    },
-  ],
+  cacheCreationInput: 0.125,
+  cachedInput: 0.01,
+  input: 0.1,
+  output: 0.5,
 }
 
 export class BuiltinProviderModelRegistry {
@@ -54,83 +44,41 @@ export class BuiltinProviderModelRegistry {
   }
 
   private static readonly catalog: BuiltinProviderModelCatalog = {
+    // ChatGPT-signed-in Codex has no >272K long-context pricing multiplier.
+    // https://help.openai.com/en/articles/20001415-chatgpt-rate-card-enterprise-token-based-pricing
     codex: {
       "codex-auto-review": { pricing: CODEX_LUNA_PRICING },
       "gpt-reserve": { pricing: CODEX_LUNA_PRICING },
       "gpt-5.6-sol": {
         pricing: {
-          tiers: [
-            {
-              cacheCreationInput: 5,
-              cachedInput: 0.4,
-              input: 4,
-              maxInputTokens: 272_000,
-              output: 20,
-            },
-            {
-              cacheCreationInput: 10,
-              cachedInput: 0.8,
-              input: 8,
-              output: 30,
-            },
-          ],
+          cacheCreationInput: 5,
+          cachedInput: 0.4,
+          input: 4,
+          output: 20,
         },
       },
       "gpt-5.6-terra": {
         pricing: {
-          tiers: [
-            {
-              cacheCreationInput: 2.5,
-              cachedInput: 0.2,
-              input: 2,
-              maxInputTokens: 272_000,
-              output: 12,
-            },
-            {
-              cacheCreationInput: 5,
-              cachedInput: 0.4,
-              input: 4,
-              output: 18,
-            },
-          ],
+          cacheCreationInput: 2.5,
+          cachedInput: 0.2,
+          input: 2,
+          output: 12,
         },
       },
       "gpt-5.6-luna": {
         pricing: {
-          tiers: [
-            {
-              cacheCreationInput: 0.25,
-              cachedInput: 0.02,
-              input: 0.2,
-              maxInputTokens: 272_000,
-              output: 1.2,
-            },
-            {
-              cacheCreationInput: 0.5,
-              cachedInput: 0.04,
-              input: 0.4,
-              output: 1.8,
-            },
-          ],
+          cacheCreationInput: 0.25,
+          cachedInput: 0.02,
+          input: 0.2,
+          output: 1.2,
         },
       },
       "gpt-6-astra": {
         pricing: {
-          tiers: [
-            {
-              cacheCreationInput: 12.5,
-              cachedInput: 1,
-              input: 10,
-              maxInputTokens: 272_000,
-              output: 50,
-            },
-            {
-              cacheCreationInput: 25,
-              cachedInput: 2,
-              input: 20,
-              output: 75,
-            },
-          ],
+          cacheCreationInput: 12.5,
+          cachedInput: 1,
+          input: 10,
+          output: 50,
         },
       },
       "gpt-6-luna": {
@@ -138,59 +86,26 @@ export class BuiltinProviderModelRegistry {
       },
       "gpt-6-sol": {
         pricing: {
-          tiers: [
-            {
-              cacheCreationInput: 2.5,
-              cachedInput: 0.2,
-              input: 2,
-              maxInputTokens: 272_000,
-              output: 10,
-            },
-            {
-              cacheCreationInput: 5,
-              cachedInput: 0.4,
-              input: 4,
-              output: 15,
-            },
-          ],
+          cacheCreationInput: 2.5,
+          cachedInput: 0.2,
+          input: 2,
+          output: 10,
         },
       },
       "gpt-6.1-sol": {
         pricing: {
-          tiers: [
-            {
-              cacheCreationInput: 2.5,
-              cachedInput: 0.1,
-              input: 2,
-              maxInputTokens: 272_000,
-              output: 10,
-            },
-            {
-              cacheCreationInput: 5,
-              cachedInput: 0.2,
-              input: 4,
-              output: 15,
-            },
-          ],
+          cacheCreationInput: 2.5,
+          cachedInput: 0.1,
+          input: 2,
+          output: 10,
         },
       },
       "gpt-6.1-terra": {
         pricing: {
-          tiers: [
-            {
-              cacheCreationInput: 1.25,
-              cachedInput: 0.05,
-              input: 1,
-              maxInputTokens: 272_000,
-              output: 5,
-            },
-            {
-              cacheCreationInput: 2.5,
-              cachedInput: 0.1,
-              input: 2,
-              output: 7.5,
-            },
-          ],
+          cacheCreationInput: 1.25,
+          cachedInput: 0.05,
+          input: 1,
+          output: 5,
         },
       },
     },
@@ -232,6 +147,47 @@ export class BuiltinProviderModelRegistry {
 }
 
 export const builtinProviderModelRegistry = new BuiltinProviderModelRegistry()
+
+// Image endpoints support these models even when the upstream chat catalog
+// omits them. Keep them separate from models advertised to chat-only clients.
+const IMAGE_MODELS: Record<
+  string,
+  Array<{ id: string; name: string; family: string }>
+> = {
+  "github-copilot": [
+    {
+      id: DEFAULT_IMAGE_MODELS["github-copilot"],
+      name: "GPT Image 2.5 Flare",
+      family: "gpt-image",
+    },
+  ],
+  codex: [
+    {
+      id: DEFAULT_IMAGE_MODELS.codex,
+      name: "GPT Image 2",
+      family: "gpt-image",
+    },
+  ],
+  xai: [
+    {
+      id: DEFAULT_IMAGE_MODELS.xai,
+      name: "Grok Imagine Image 2.0",
+      family: "grok-imagine",
+    },
+  ],
+}
+
+export function getBuiltinProviderImageModelRecords(
+  provider: string,
+): Array<Record<string, unknown>> {
+  return (IMAGE_MODELS[provider] ?? []).map((model) => ({
+    ...model,
+    object: "model",
+    type: "image",
+    input_modalities: ["text", "image"],
+    output_modalities: ["image"],
+  }))
+}
 
 export function getBuiltinProviderModelRecords(
   provider: string,

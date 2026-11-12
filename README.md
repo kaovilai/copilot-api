@@ -68,9 +68,11 @@ curl http://localhost:4141/v1/models
 ```
 
 > [!NOTE]
-> Token usage storage requires Node.js >= 22.13.0 or Bun. See [Using with npx](docs/guides/en/getting-started.md#using-with-npx) for details.
+> Token usage storage requires Bun >= 1.4.4 or Node.js with built-in `node:sqlite` (22.13.0+). Use a patched Node.js release from the warning above. See [Using with npx](docs/guides/en/getting-started.md#using-with-npx) for details.
 
 From here, jump to the guide for your client: [Claude Code](docs/guides/en/claude-code.md#using-with-claude-code), [OpenCode](docs/guides/en/opencode.md#using-with-opencode), [Codex](docs/guides/en/codex.md#using-with-codex), [DeepSeek Harness](docs/guides/en/dsh.md#using-with-deepseek-harness), or run it with [Docker](docs/guides/en/docker.md#using-with-docker).
+
+**Codex Multi-Agent compatibility:** [`codexMultiAgentV1`](docs/guides/en/configuration.md#codex-multi-agent-compatibility) optionally advertises V1; V2 remains the default. Apply the gateway setting and start a **new Codex session**. Catalog refreshes do not switch an already-selected session version, and resumed sessions retain their recorded version. Explicit CLI overrides may take precedence.
 
 ## Compatibility
 
@@ -99,6 +101,8 @@ Prefer a GUI? The Electron desktop app in `desktop/` covers GitHub Copilot sign-
 </p>
 
 Windows x64 (`.exe`), macOS Apple Silicon (`.dmg`), and Linux x64 (`.AppImage`) packages are published in [GitHub Releases](https://github.com/caozhiyuan/copilot-api/releases). See [Electron Desktop App](docs/guides/en/desktop.md#electron-desktop-app) for full setup and advanced configuration.
+
+After the initial full-package installation, subsequent updates normally use differential downloads to reduce download size. On macOS, the first update may still download a complete DMG to establish the cache. If the cache is unavailable or differential downloading fails, the app falls back to a full download.
 
 ## Documentation
 

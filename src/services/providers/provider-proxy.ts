@@ -23,7 +23,6 @@ import type { ChatCompletionsPayload } from "~/lib/types/chat-completions"
 import type { ResponsesPayload } from "~/lib/types/responses"
 import { UpstreamHeadersTimeoutError } from "~/lib/error"
 import type { GoogleModelsResponse } from "~/lib/types/google"
-import { parseUserIdMetadata } from "~/lib/utils"
 import { fetchUpstreamWithLifecycle } from "~/services/upstream-http"
 
 const OPENCODE_GO_PROVIDER_NAME = "opencode-go"
@@ -116,9 +115,7 @@ export function buildProviderUpstreamHeaders(
   return headers
 }
 
-export const resolveOpencodeMessagesSession = (
-  payload: AnthropicMessagesPayload,
-): string | undefined => {
+export const resolveOpencodeMessagesSession = (): string | undefined => {
   const store = requestContext.getStore()
   // Keep sibling subagents on the root session so opencode-go routes them to the
   // same prompt cache group, matching the chat completions/responses flows.
@@ -132,13 +129,7 @@ export const resolveOpencodeMessagesSession = (
     return sessionAffinity
   }
 
-  const userId = payload.metadata?.user_id
-  if (!userId?.trim()) {
-    return undefined
-  }
-
-  const { sessionId } = parseUserIdMetadata(userId)
-  return sessionId ?? userId
+  return undefined
 }
 
 export const applyOpencodeSessionHeader = (
@@ -228,10 +219,10 @@ export async function forwardProviderMessages(
   applyOpencodeSessionHeader(
     providerConfig,
     headers,
-    resolveOpencodeMessagesSession(payload),
+    resolveOpencodeMessagesSession(),
   )
   const transportConfig = getUpstreamTransportConfig()
-  setPluginRequestActualModel(payload.model)
+  setPluginRequestActualModel(payload.model, providerConfig.name)
   return await retryPreResponseFailures(
     () =>
       fetchUpstreamWithLifecycle(
@@ -266,7 +257,7 @@ export async function forwardProviderChatCompletions(
     payload.prompt_cache_key?.trim() || undefined,
   )
   const transportConfig = getUpstreamTransportConfig()
-  setPluginRequestActualModel(payload.model)
+  setPluginRequestActualModel(payload.model, providerConfig.name)
   return await retryPreResponseFailures(
     () =>
       fetchUpstreamWithLifecycle(
@@ -302,7 +293,7 @@ export async function forwardProviderResponses(
     payload.prompt_cache_key?.trim() || undefined,
   )
   await applyXaiGrokBuildHeaders(providerConfig, headers, payload)
-  setPluginRequestActualModel(payload.model)
+  setPluginRequestActualModel(payload.model, providerConfig.name)
   return await retryPreResponseFailures(
     () =>
       fetchUpstreamWithLifecycle(

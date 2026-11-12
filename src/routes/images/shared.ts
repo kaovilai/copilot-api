@@ -1,269 +1,126 @@
 import consola from "consola"
-import type { Context } from "hono"
 
-import { resolveMappedModel, type ResolvedProviderConfig } from "~/lib/config"
-import { forwardError } from "~/lib/error"
-import { createHandlerLogger, debugJson, debugJsonAsync } from "~/lib/logger"
-import { parseProviderModelAlias } from "~/lib/provider-model"
+import { resolveMappedModel } from "~/lib/config"
+import { HTTPError } from "~/lib/error"
+import {
+  GITHUB_COPILOT_PROVIDER,
+  isGitHubCopilotAvailable,
+} from "~/lib/github-copilot-provider"
+import { createHandlerLogger } from "~/lib/logger"
+import type { ProviderModelAlias } from "~/lib/provider-model"
 import { resolveProviderConfig } from "~/lib/provider-resolver"
 import {
-  getImageEditModel,
-  getImageGenerationModel,
-} from "~/lib/xai-image-model"
-import { forwardProviderImagesWithLogging } from "~/routes/images/forward-provider-images"
-import {
-  forwardCodexImages,
-  type CodexImagesOperation,
-} from "~/services/codex/images"
-import { createProviderProxyResponse } from "~/services/providers/provider-proxy"
+  forwardCopilotImagesWithLogging,
+  forwardProviderImagesWithLogging,
+  forwardXaiImagesWithLogging,
+} from "~/routes/images/forward-provider-images"
+import type { CodexImagesOperation } from "~/services/codex/images"
+import { translateXaiImageJsonRequest } from "~/routes/images/xai-json-request"
+import { resolveImageRequestModel } from "~/routes/images/default-model"
 
 export const logger = createHandlerLogger("images-handler")
 
 export const imageRouteDependencies = {
-  debugJsonAsync,
-  getImageEditModel,
-  getImageGenerationModel,
+  isGitHubCopilotAvailable,
   resolveMappedModel,
   resolveProviderConfig,
 }
 
 export interface ParsedImagesRequest {
   /** Rebuilds the forwarding request with the resolved model in the body. */
-  createRequest: (model: string) => Request
-  model: string
+  createRequest: (
+    model: string,
+    provider?: string,
+  ) => Request | Promise<Request>
+  model: string | undefined
+  /** Disk-backed form retained for multipart request metadata logging. */
+  formData?: FormData
   /** Unchanged request, forwarded as-is when no rebuild is needed. */
   originalRequest?: Request
 }
 
-export function imageEditContentTypeErrorResponse(c: Context): Response | null {
-  const mediaType = c.req
-    .header("content-type")
-    ?.split(";", 1)[0]
-    ?.trim()
-    .toLowerCase()
-  if (mediaType === "application/json") return null
-
-  return c.json(
-    {
-      error: {
-        message:
-          "Image edits require application/json with images: [{ image_url }] or [{ file_id }]; multipart uploads are not supported",
-        type: "invalid_request_error",
-      },
-    },
-    415,
-  )
-}
-
-function getContentMetadata(headers: Headers) {
-  return {
-    contentType: headers.get("content-type"),
-    contentLength: headers.get("content-length"),
-  }
-}
-
 /**
- * Snapshots generated request headers before consuming the body.
- */
-export function snapshotRequestHeaders(request: Request): Headers {
-  return new Headers(request.headers)
-}
-
-/**
- * Rebuilds a request from primitives instead of cloning: under Node runtimes
- * srvx wraps incoming requests in a proxy class whose prototype chain
- * satisfies `instanceof Request` without the native internals, so
- * `new Request(request)` throws.
- */
-export function createForwardRequest(
-  request: Request,
-  requestHeaders: Headers,
-  body: Bun.BodyInit | null,
-): Request {
-  const init: RequestInit & { duplex: "half" } = {
-    body,
-    duplex: "half",
-    headers: requestHeaders,
-    method: request.method,
-    signal: request.signal,
-  }
-  return new Request(request.url, init)
-}
-
-function createJsonImagesRequest(
-  request: Request,
-  requestHeaders: Headers,
-  payload: Record<string, unknown>,
-  model: string,
-): Request {
-  const headers = new Headers(requestHeaders)
-  headers.delete("content-length")
-
-  return createForwardRequest(
-    request,
-    headers,
-    new TextEncoder().encode(JSON.stringify({ ...payload, model })),
-  )
-}
-
-/**
- * Parses an image request body as JSON, retaining the original bytes for
- * unchanged forwarding while allowing model mapping to rebuild the payload.
- * Rebuilt bodies stay binary so Node does not synthesize a text/plain content type.
- */
-export async function parseJsonImagesRequest(
-  request: Request,
-): Promise<ParsedImagesRequest | Request> {
-  const requestHeaders = snapshotRequestHeaders(request)
-  const body = new Uint8Array(await request.arrayBuffer())
-  const originalRequest = createForwardRequest(request, requestHeaders, body)
-
-  let payload: unknown
-  try {
-    const bodyText = new TextDecoder("utf-8", { fatal: true }).decode(body)
-    payload = JSON.parse(bodyText)
-  } catch {
-    return originalRequest
-  }
-
-  if (
-    payload === null
-    || typeof payload !== "object"
-    || Array.isArray(payload)
-    || typeof (payload as { model?: unknown }).model !== "string"
-  ) {
-    return originalRequest
-  }
-
-  const model = (payload as { model: string }).model
-  return {
-    createRequest: (mappedModel) =>
-      createJsonImagesRequest(
-        request,
-        requestHeaders,
-        payload as Record<string, unknown>,
-        mappedModel,
-      ),
-    model,
-    originalRequest,
-  }
-}
-
-/**
- * Handles Codex images proxying. Pass a resolvedProviderConfig when the
- * caller already resolved the codex provider to avoid a second resolve, and
- * pass a request when model mapping rebuilt the request body.
- */
-export async function handleCodexImages(
-  c: Context,
-  operation: CodexImagesOperation,
-  resolvedProviderConfig?: ResolvedProviderConfig,
-  request: Request = c.req.raw,
-): Promise<Response> {
-  try {
-    const codexProviderConfig =
-      resolvedProviderConfig
-      ?? (await imageRouteDependencies.resolveProviderConfig("codex"))
-    if (!codexProviderConfig) {
-      return c.json(
-        {
-          error: {
-            message: "Provider 'codex' not found or disabled",
-            type: "invalid_request_error",
-          },
-        },
-        404,
-      )
-    }
-
-    if (operation === "generations") {
-      await imageRouteDependencies.debugJsonAsync(
-        logger,
-        "images.generations.codex.request",
-        async () => ({
-          body: await request.clone().text(),
-        }),
-      )
-    } else {
-      debugJson(
-        logger,
-        "images.edits.codex.request",
-        getContentMetadata(request.headers),
-      )
-    }
-
-    const upstreamResponse = await forwardCodexImages(request, operation)
-    debugJson(logger, `images.${operation}.codex.response`, {
-      ...getContentMetadata(upstreamResponse.headers),
-      statusCode: upstreamResponse.status,
-    })
-    return createProviderProxyResponse(upstreamResponse)
-  } catch (error) {
-    logger.error(`images.${operation}.codex.error`, { error })
-    return await forwardError(c, error)
-  }
-}
-
-/**
- * Routes a parsed images request: applies the model mapping, forwards to a
- * mapped provider when configured, and otherwise falls back to Codex.
+ * Apply model mappings and resolve automatic defaults before dispatching.
+ * Explicit targets retain their model and never fall back to another provider.
  */
 export async function routeImagesRequest(
-  c: Context,
   operation: CodexImagesOperation,
   parsed: ParsedImagesRequest,
 ): Promise<Response> {
-  const requestedModel = parsed.model
-  const mappedModel = imageRouteDependencies.resolveMappedModel(requestedModel)
-  if (mappedModel !== requestedModel) {
-    consola.debug(`Resolved model mapping: ${requestedModel} -> ${mappedModel}`)
+  let alias: ProviderModelAlias
+  try {
+    alias = await resolveImageRequestModel(
+      parsed.model?.trim() ?
+        imageRouteDependencies.resolveMappedModel(parsed.model.trim())
+      : undefined,
+      {
+        resolveProviderConfig: imageRouteDependencies.resolveProviderConfig,
+        isGitHubCopilotAvailable:
+          imageRouteDependencies.isGitHubCopilotAvailable,
+      },
+    )
+  } catch (error) {
+    await parsed.originalRequest?.body?.cancel().catch(() => {})
+    throw error
   }
 
-  const providerModelAlias = parseProviderModelAlias(mappedModel)
-  if (providerModelAlias) {
-    const providerConfig = await imageRouteDependencies.resolveProviderConfig(
-      providerModelAlias.provider,
-    )
-    if (providerConfig) {
-      const request = parsed.createRequest(providerModelAlias.model)
-      if (providerConfig.name === "codex") {
-        return await handleCodexImages(c, operation, providerConfig, request)
-      }
+  consola.debug(
+    `Resolved image model: ${parsed.model ?? "(default)"} -> ${alias.provider}/${alias.model}`,
+  )
+  const request =
+    (
+      parsed.originalRequest
+      && (alias.provider === "xai" || parsed.model === alias.model)
+    ) ?
+      parsed.originalRequest
+    : await parsed.createRequest(alias.model, alias.provider)
 
-      return await forwardProviderImagesWithLogging(
-        providerConfig,
-        request,
-        operation,
-        { logger, provider: providerModelAlias.provider },
-      )
-    }
+  if (alias.provider === GITHUB_COPILOT_PROVIDER) {
+    return await forwardCopilotImagesWithLogging(request, operation, {
+      logger,
+      ...alias,
+      multipartForm: parsed.formData,
+    })
+  }
 
-    // The mapped provider is not configured: keep the pre-mapping behavior
-    // and forward the client-sent model to Codex, not the prefixed alias.
-    consola.debug(
-      `Provider '${providerModelAlias.provider}' not found or disabled; forwarding the original model to Codex`,
+  const providerConfig = await imageRouteDependencies.resolveProviderConfig(
+    alias.provider,
+  )
+  if (!providerConfig) {
+    await request.body?.cancel().catch(() => {})
+    throw new HTTPError(
+      `Provider '${alias.provider}' not found or disabled`,
+      Response.json(
+        {
+          error: {
+            message: `Provider '${alias.provider}' not found or disabled`,
+            type: "invalid_request_error",
+          },
+        },
+        { status: 404 },
+      ),
     )
-    return await handleCodexImages(
-      c,
+  }
+  if (alias.provider !== "xai") {
+    return await forwardProviderImagesWithLogging(
+      providerConfig,
+      request,
       operation,
-      undefined,
-      parsed.originalRequest ?? parsed.createRequest(requestedModel),
+      { logger, ...alias, multipartForm: parsed.formData },
     )
   }
 
-  if (parsed.originalRequest && mappedModel === requestedModel) {
-    return await handleCodexImages(
-      c,
-      operation,
-      undefined,
-      parsed.originalRequest,
-    )
-  }
-
-  return await handleCodexImages(
-    c,
+  const translated = await translateXaiImageJsonRequest(
+    request,
     operation,
-    undefined,
-    parsed.createRequest(mappedModel),
+    alias.model,
+  )
+  return await forwardXaiImagesWithLogging(
+    providerConfig,
+    request,
+    operation,
+    translated.payload,
+    { logger, ...alias, multipartForm: parsed.formData },
+    translated.body,
   )
 }
