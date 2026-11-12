@@ -14,6 +14,8 @@
     "../src/lib/fetch-timeout.ts",
     "../src/lib/github-copilot-provider.ts",
     "../src/lib/image-models.ts",
+    "../src/lib/internal-headers.ts",
+    "../src/lib/logger.ts",
     "../src/lib/model-policy.ts",
     "../src/lib/models-dev-cache.ts",
     "../src/lib/oauth-accounts.ts",
@@ -27,11 +29,14 @@
     "../src/lib/quick-providers.ts",
     "../src/lib/request-auth.ts",
     "../src/lib/request-context.ts",
+    "../src/lib/responses-continuation/**/*.ts",
+    "../src/lib/responses-stream-event.ts",
     "../src/lib/server-host-shared.ts",
     "../src/lib/server-host.ts",
     "../src/lib/sqlite.ts",
     "../src/lib/state.ts",
     "../src/lib/subagent.ts",
+    "../src/lib/timeout-dispatcher.ts",
     "../src/lib/token-usage/image-pricing.ts",
     "../src/lib/token-usage/peak-windows.ts",
     "../src/lib/token-usage/pricing.ts",
@@ -52,6 +57,12 @@
     "../src/services/copilot/get-models.ts",
     "../src/services/get-vscode-version.ts",
     "../src/services/github/**/*.ts",
+    "../src/services/responses-http.ts",
+    "../src/services/responses-websocket-continuation.ts",
+    "../src/services/responses-websocket-helpers.ts",
+    "../src/services/responses-websocket-interrupt.ts",
+    "../src/services/responses-websocket.ts",
+    "../src/services/upstream-http.ts",
     "../src/services/xai/images.ts",
     "../tests/fixtures/models-dev-catalog.ts",
     "electron.vite.config.*",
@@ -100,8 +111,14 @@
   "compilerOptions": {
     "composite": true,
     "paths": {
-      "~/*": ["../src/*"]
+      "~/*": [
+        "../src/*"
+      ]
     },
-    "types": ["electron-vite/node", "node", "bun"]
+    "types": [
+      "electron-vite/node",
+      "node",
+      "bun"
+    ]
   }
 }
