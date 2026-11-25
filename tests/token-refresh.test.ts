@@ -4,14 +4,15 @@ import os from "node:os"
 import path from "node:path"
 import { fileURLToPath } from "node:url"
 
-import type { CodexCredentials } from "~/lib/oauth/codex"
+import type { CodexCredentials } from "~/lib/auth/oauth/codex"
 import {
   getRefreshDeadlineMs,
   getRefreshPollDelayMs,
   getRetryAfterDelayMs,
   refreshCodexCredentialsOnce,
+  scheduleRefreshRetry,
   type CodexRefreshDependencies,
-} from "~/lib/token"
+} from "~/lib/auth/token"
 
 const repoRoot = fileURLToPath(new URL("../", import.meta.url))
 const decoder = new TextDecoder()
@@ -72,6 +73,26 @@ test("returns zero when refresh is already due", () => {
   const nowMs = 1_000_000
 
   expect(getRefreshPollDelayMs(nowMs - 1, nowMs)).toBe(0)
+})
+
+test("Codex and Copilot refresh failures share exponential backoff with jitter", () => {
+  const nowMs = 1_000_000
+  const first = scheduleRefreshRetry(15_000, nowMs, 0)
+  expect(first).toEqual({
+    delayMs: 15_000,
+    nextRetryDelayMs: 30_000,
+    refreshAtMs: nowMs + 15_000,
+  })
+
+  const jittered = scheduleRefreshRetry(first.nextRetryDelayMs, nowMs, 0.5)
+  expect(jittered.delayMs).toBe(30_000 + 7_500)
+  expect(jittered.nextRetryDelayMs).toBe(60_000)
+  expect(jittered.refreshAtMs).toBe(nowMs + jittered.delayMs)
+
+  const capped = scheduleRefreshRetry(600_000, nowMs, 0.9)
+  expect(capped.delayMs).toBe(600_000)
+  expect(capped.nextRetryDelayMs).toBe(600_000)
+  expect(capped.refreshAtMs).toBe(nowMs + 600_000)
 })
 
 test("returns null when there's no Retry-After, falling back to jittered backoff", () => {
@@ -325,11 +346,11 @@ test("refreshes expired Codex credentials once for concurrent Codex requests", (
       )
     }
 
-    const { resolveProviderConfig } = await import("./src/lib/provider-resolver")
+    const { resolveProviderConfig } = await import("./src/lib/providers/provider-resolver")
     const resolved = await Promise.all(
       [0, 1, 2].map(() => resolveProviderConfig("codex")),
     )
-    const { stopCodexRefreshLoop } = await import("./src/lib/token")
+    const { stopCodexRefreshLoop } = await import("./src/lib/auth/token")
 
     console.log(
       JSON.stringify({
@@ -410,11 +431,11 @@ test("refreshes only the selected Codex account and preserves the selection", ()
       }),
     )
 
-    const { resolveProviderConfig } = await import("./src/lib/provider-resolver")
+    const { resolveProviderConfig } = await import("./src/lib/providers/provider-resolver")
     await resolveProviderConfig("codex")
-    const { readCodexCredentialStore } = await import("./src/lib/credential-store")
+    const { readCodexCredentialStore } = await import("./src/lib/auth/credential-store")
     const { getRawProviderConfig } = await import("./src/lib/config")
-    const { stopCodexRefreshLoop } = await import("./src/lib/token")
+    const { stopCodexRefreshLoop } = await import("./src/lib/auth/token")
     console.log(JSON.stringify({
       accountId: getRawProviderConfig("codex")?.accountId,
       store: await readCodexCredentialStore(),
@@ -482,8 +503,8 @@ test("does not write a removed Codex account back when refreshing it", () => {
       }),
     )
 
-    const { readCodexCredentialStore } = await import("./src/lib/credential-store")
-    const { refreshCodexCredentialsOnce, stopCodexRefreshLoop } = await import("./src/lib/token")
+    const { readCodexCredentialStore } = await import("./src/lib/auth/credential-store")
+    const { refreshCodexCredentialsOnce, stopCodexRefreshLoop } = await import("./src/lib/auth/token")
     const refreshed = await refreshCodexCredentialsOnce({
       accessToken: "removed-access",
       refreshToken: "removed-refresh",

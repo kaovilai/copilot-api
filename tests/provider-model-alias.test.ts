@@ -15,14 +15,15 @@ import type {
   FilePart,
 } from "~/lib/types/chat-completions"
 
-import { installModelsDevCatalog } from "~/lib/models-dev-cache"
-import { createFallbackModel } from "~/lib/provider-model"
+import { installModelsDevCatalog } from "~/lib/catalog/models-dev-cache"
+import { createFallbackModel } from "~/lib/catalog/provider-model"
 import { RICH_TOOL_RESULT_MOVED_TEXT } from "~/routes/messages/completions-translation"
 
 import { modelsDevCatalogFixture } from "./fixtures/models-dev-catalog"
 
 const actualConfigModule = await import("~/lib/config")
 const actualTokenUsageModule = await import("~/lib/token-usage")
+const actualTokenizerModule = await import("~/lib/catalog/tokenizer")
 
 let providerConfig: ResolvedProviderConfig | null = null
 let modelMappings: Record<string, string> = {}
@@ -41,6 +42,8 @@ const getTokenCount = mock(
     Promise.resolve({ input: 40, output: 2 }),
 )
 const noopTokenUsageRecorder = () => {}
+let restoreTokenUsageRecorder = () => {}
+let restoreTokenizer = () => {}
 
 await mock.module("~/lib/config", () => ({
   ...actualConfigModule,
@@ -49,15 +52,6 @@ await mock.module("~/lib/config", () => ({
   getRawProviderConfig: (name: string) =>
     providerConfig && name === providerConfig.name ? providerConfig : null,
   resolveMappedModel: (model: string) => modelMappings[model] ?? model,
-}))
-
-await mock.module("~/lib/tokenizer", () => ({
-  getTokenCount,
-}))
-
-await mock.module("~/lib/token-usage", () => ({
-  ...actualTokenUsageModule,
-  createProviderTokenUsageRecorder: () => noopTokenUsageRecorder,
 }))
 
 const { messageRoutes } = await import("~/routes/messages/route")
@@ -116,6 +110,16 @@ const createApp = () => {
 }
 
 beforeEach(() => {
+  const tokenizer = spyOn(
+    actualTokenizerModule,
+    "getTokenCount",
+  ).mockImplementation(getTokenCount)
+  restoreTokenizer = () => tokenizer.mockRestore()
+  const recorder = spyOn(
+    actualTokenUsageModule,
+    "createProviderTokenUsageRecorder",
+  ).mockImplementation(() => noopTokenUsageRecorder)
+  restoreTokenUsageRecorder = () => recorder.mockRestore()
   providerConfig = {
     apiKey: "provider-key",
     authType: "authorization",
@@ -138,6 +142,8 @@ beforeEach(() => {
 })
 
 afterEach(() => {
+  restoreTokenizer()
+  restoreTokenUsageRecorder()
   ;(globalThis as unknown as { fetch: typeof fetch }).fetch = originalFetch
   providerConfig = null
 })
@@ -638,6 +644,57 @@ describe("provider/model aliases on top-level messages routes", () => {
     }
     expect(upstreamBody.model).toBe("qwen-plus")
   })
+
+  test.each([
+    { model: "gpt-6.1-sol", nativeSearch: true },
+    { model: "grok-4.7", nativeSearch: false },
+  ])(
+    "chooses native tool search from the resolved model $model",
+    async ({ model, nativeSearch }) => {
+      providerConfig = {
+        apiKey: "provider-key",
+        authType: "authorization",
+        baseUrl: "https://responses.example",
+        models: { [model]: {} },
+        name: "dash",
+        type: "openai-responses",
+      }
+      modelMappings = { friendly: `dash/${model}` }
+      fetchMock.mockImplementationOnce(() =>
+        Promise.resolve(
+          Response.json({
+            id: "resp-search-model",
+            model,
+            output: [],
+            output_text: "",
+            status: "completed",
+            usage: null,
+          }),
+        ),
+      )
+      const response = await createApp().request("/v1/messages", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          model: "friendly",
+          max_tokens: 128,
+          messages: [{ role: "user", content: "hello" }],
+          tools: [{ name: "ToolSearch", input_schema: { type: "object" } }],
+        }),
+      })
+      expect(response.status).toBe(200)
+      const body = fetchMock.mock.calls[0][1]?.body
+      if (typeof body !== "string") throw new Error("Expected a JSON body")
+      const upstream = JSON.parse(body) as {
+        model: string
+        tools: Array<{ type: string }>
+      }
+      expect(upstream.model).toBe(model)
+      expect(upstream.tools.some((tool) => tool.type === "tool_search")).toBe(
+        nativeSearch,
+      )
+    },
+  )
 
   test("routes /v1/messages to the provider and strips the provider prefix", async () => {
     const app = createApp()

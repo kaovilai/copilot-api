@@ -1,4 +1,4 @@
-import { describe, expect, test } from "bun:test"
+import { describe, expect, spyOn, test } from "bun:test"
 
 import type {
   AnthropicMessagesPayload,
@@ -9,7 +9,7 @@ import type {
   ResponsesPayload,
   ResponseStreamEvent,
 } from "~/lib/types/responses"
-import { requestContext } from "~/lib/request-context"
+import { requestContext } from "~/lib/http/request-context"
 import {
   buildOutputFormatInstruction,
   createMessagesBackedResponsesResult,
@@ -647,6 +647,44 @@ describe("Responses Lite to Messages translation", () => {
     expect(decodeMessagesCompaction("not base64")).toBeNull()
   })
 
+  test.each(["A", "0", "中文", "🙂"])(
+    "recognizes the Base64 prefix with summary %s",
+    (summary) => {
+      expect(decodeMessagesCompaction(encodeMessagesCompaction(summary))).toBe(
+        summary,
+      )
+    },
+  )
+
+  test("skips decoding content without a Messages compaction prefix", () => {
+    const values = [
+      "",
+      "native-ciphertext",
+      Buffer.from("native encrypted content").toString("base64"),
+    ]
+    const fromSpy = spyOn(Buffer, "from")
+
+    try {
+      for (const value of values) {
+        expect(decodeMessagesCompaction(value)).toBeNull()
+      }
+      expect(fromSpy).not.toHaveBeenCalled()
+    } finally {
+      fromSpy.mockRestore()
+    }
+  })
+
+  test("still validates the complete decoded prefix and canonical Base64", () => {
+    const wrongPrefix = MESSAGES_COMPACTION_PREFIX.replace(":v1:", ":v2:")
+    const wrongPayload = Buffer.from(`${wrongPrefix}QQ`).toString("base64")
+
+    expect(decodeMessagesCompaction(wrongPayload)).toBeNull()
+    expect(
+      decodeMessagesCompaction(`${encodeMessagesCompaction("handoff")}\n`),
+    ).toBeNull()
+    expect(decodeMessagesCompaction(encodeMessagesCompaction(""))).toBeNull()
+  })
+
   test("removes built-in web search while preserving other top-level tools", () => {
     const tools: NonNullable<ResponsesPayload["tools"]> = [
       { type: "function", name: "web_search", parameters: null, strict: null },
@@ -991,6 +1029,215 @@ describe("Responses Lite to Messages translation", () => {
     ])
   })
 
+  test.each<[string, Record<string, unknown>, Record<string, unknown>]>([
+    [
+      "oneOf",
+      {
+        type: "object",
+        properties: {
+          code: { type: "string" },
+          completion_summary: { type: "string" },
+          timeout_ms: { type: "integer" },
+        },
+        additionalProperties: false,
+        oneOf: [
+          {
+            type: "object",
+            properties: {
+              code: { type: "string" },
+              timeout_ms: { type: "integer" },
+            },
+            required: ["code"],
+            additionalProperties: false,
+          },
+          {
+            type: "object",
+            properties: { completion_summary: { type: "string" } },
+            required: ["completion_summary"],
+            additionalProperties: false,
+          },
+        ],
+      },
+      {
+        type: "object",
+        properties: {
+          code: { type: "string" },
+          completion_summary: { type: "string" },
+          timeout_ms: { type: "integer" },
+        },
+        additionalProperties: false,
+      },
+    ],
+    [
+      "anyOf",
+      {
+        anyOf: [
+          {
+            type: "object",
+            properties: {
+              kind: { const: "file" },
+              path: { type: "string" },
+            },
+            required: ["kind", "path"],
+          },
+          {
+            type: "object",
+            properties: { kind: { const: "url" }, url: { type: "string" } },
+            required: ["kind", "url"],
+          },
+        ],
+      },
+      { type: "object" },
+    ],
+    [
+      "allOf",
+      {
+        type: "object",
+        properties: { path: { type: "string" } },
+        required: ["path"],
+        allOf: [
+          {
+            properties: { encoding: { type: "string" } },
+            required: ["encoding"],
+          },
+          { properties: { limit: { type: "integer" } } },
+        ],
+      },
+      {
+        type: "object",
+        properties: { path: { type: "string" } },
+        required: ["path"],
+      },
+    ],
+  ])(
+    "moves a top-level %s into the function tool description",
+    (key, parameters, inputSchema) => {
+      Object.freeze(parameters)
+      const result = translate({
+        input: "Run it",
+        tools: [
+          {
+            type: "function",
+            name: "js",
+            description: "Run JavaScript.",
+            parameters,
+            strict: false,
+          },
+        ],
+      })
+
+      expect(result.messagesPayload.tools?.[0]?.input_schema).toEqual(
+        inputSchema,
+      )
+      const description = result.messagesPayload.tools?.[0]?.description
+      const requirement =
+        key === "oneOf" ? "exactly one"
+        : key === "anyOf" ? "at least one"
+        : "all"
+      expect(description?.startsWith("Run JavaScript.\n\n")).toBe(true)
+      expect(description).toContain(`satisfy ${requirement} of`)
+      expect(description).toContain(`(${key})`)
+      expect(description).toContain(JSON.stringify(parameters[key]))
+    },
+  )
+
+  test("keeps $defs for $ref variants of a union-only schema", () => {
+    const $defs = {
+      FileTarget: {
+        type: "object",
+        properties: { path: { type: "string" } },
+        required: ["path"],
+      },
+      UrlTarget: {
+        type: "object",
+        properties: { url: { type: "string" } },
+        required: ["url"],
+      },
+    }
+    const anyOf = [
+      { $ref: "#/$defs/FileTarget" },
+      { $ref: "#/$defs/UrlTarget" },
+    ]
+    const result = translate({
+      input: "Run it",
+      tools: [
+        {
+          type: "function",
+          name: "open",
+          parameters: { $defs, anyOf },
+          strict: false,
+        },
+      ],
+    })
+
+    expect(result.messagesPayload.tools?.[0]?.input_schema).toEqual({
+      type: "object",
+      $defs,
+    })
+    expect(result.messagesPayload.tools?.[0]?.description).toContain(
+      JSON.stringify(anyOf),
+    )
+  })
+
+  test("preserves nested schema unions without adding a description", () => {
+    const parameters = {
+      type: "object",
+      properties: {
+        value: { oneOf: [{ type: "string" }, { type: "integer" }] },
+      },
+    }
+    const result = translate({
+      input: "Run it",
+      tools: [{ type: "function", name: "js", parameters }],
+    })
+
+    expect(result.messagesPayload.tools?.[0]?.input_schema).toBe(parameters)
+    expect(result.messagesPayload.tools?.[0]).not.toHaveProperty("description")
+  })
+
+  test.each([
+    { model: "custom/CLAUDE-sonnet-4.6", describeUnions: true },
+    { model: "openrouter/anthropic/claude-sonnet-4.6", describeUnions: true },
+    { model: "custom/ANTHROPIC/CLAUDE-sonnet-4.6", describeUnions: true },
+    { model: "openrouter/anthropic/glm-5.3-flash", describeUnions: false },
+    { model: "claude-relay/glm-5.3-flash", describeUnions: false },
+    { model: "custom/vendor-Claude-model", describeUnions: false },
+  ])(
+    "limits schema union descriptions to Claude-prefixed target $model",
+    ({ model, describeUnions }) => {
+      const parameters = {
+        oneOf: [
+          {
+            type: "object",
+            properties: { value: { type: "string" } },
+            required: ["value"],
+          },
+        ],
+      }
+      const result = translateResponsesToMessages(
+        {
+          model: describeUnions ? "public-alias" : "claude-sonnet-4.6",
+          input: "Run it",
+          tools: [{ type: "function", name: "js", parameters, strict: false }],
+        },
+        { model },
+      )
+
+      expect(result.messagesPayload.tools?.[0]?.input_schema).toEqual(
+        describeUnions ? { type: "object" } : parameters,
+      )
+      const description = result.messagesPayload.tools?.[0]?.description
+      if (describeUnions) {
+        expect(description?.startsWith("The complete arguments object")).toBe(
+          true,
+        )
+        expect(description).toContain("satisfy exactly one of")
+      } else {
+        expect(description).toBeUndefined()
+      }
+    },
+  )
+
   test.each([undefined, null, ""])(
     "reuses default tool aliases for historical namespace %j",
     (namespace) => {
@@ -1241,7 +1488,18 @@ describe("Responses Lite to Messages translation", () => {
     ])
   })
 
-  test("restores namespace on Responses function calls", () => {
+  test.each<[string, string, Record<string, unknown>]>([
+    ["workspace", "read_file", { path: "README.md" }],
+    ["multi_agent_v1", "spawn_agent", { message: "Review the code" }],
+    [
+      "multi_agent_v1",
+      "send_input",
+      { target: "agent-1", message: "Continue" },
+    ],
+    ["multi_agent_v1", "wait_agent", { targets: ["agent-1"] }],
+    ["multi_agent_v1", "close_agent", { target: "agent-1" }],
+    ["multi_agent_v1", "resume_agent", { id: "agent-1" }],
+  ])("restores Responses function %s.%s", (namespace, name, args) => {
     const translation = translate({
       input: [
         {
@@ -1249,15 +1507,15 @@ describe("Responses Lite to Messages translation", () => {
           tools: [
             {
               type: "namespace",
-              name: "workspace",
+              name: namespace,
               tools: [
                 {
                   type: "function",
-                  name: "read_file",
-                  description: "Read a workspace file",
+                  name,
+                  description: `Run ${namespace}.${name}`,
                   parameters: {
                     type: "object",
-                    properties: { path: { type: "string" } },
+                    additionalProperties: true,
                   },
                   strict: false,
                 },
@@ -1270,7 +1528,7 @@ describe("Responses Lite to Messages translation", () => {
       ],
     })
     expect(translation.messagesPayload.tools?.[0]?.name).toBe(
-      "workspace__read_file",
+      `${namespace}__${name}`,
     )
 
     const response: AnthropicResponse = {
@@ -1278,8 +1536,8 @@ describe("Responses Lite to Messages translation", () => {
         {
           type: "tool_use",
           id: "call-read",
-          name: "workspace__read_file",
-          input: { path: "README.md" },
+          name: `${namespace}__${name}`,
+          input: args,
         },
       ],
       id: "msg_namespace",
@@ -1295,9 +1553,9 @@ describe("Responses Lite to Messages translation", () => {
     expect(result.output[0]).toMatchObject({
       type: "function_call",
       call_id: "call-read",
-      name: "read_file",
-      namespace: "workspace",
-      arguments: JSON.stringify({ path: "README.md" }),
+      name,
+      namespace,
+      arguments: JSON.stringify(args),
     })
   })
 

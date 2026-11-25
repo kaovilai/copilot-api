@@ -1,17 +1,33 @@
-import { afterEach, beforeEach, describe, expect, mock, test } from "bun:test"
+import {
+  afterEach,
+  beforeEach,
+  describe,
+  expect,
+  mock,
+  spyOn,
+  test,
+} from "bun:test"
 import { Hono } from "hono"
 
 import type { ResolvedProviderConfig } from "~/lib/config"
 import type { ResponsesPayload, ResponsesResult } from "~/lib/types/responses"
+import { supportsNativeDeepSeekAlphaSearch } from "~/services/providers/provider-proxy"
+import { traceIdMiddleware } from "~/lib/http/trace"
+import { requestEventsMiddleware } from "~/lib/http/request-events"
+import { requestContext } from "~/lib/http/request-context"
 
 let codexProviderConfig: ResolvedProviderConfig | null = null
 let openrouterProviderConfig: ResolvedProviderConfig | null = null
+let deepseekProviderConfig: ResolvedProviderConfig | null = null
+let googleProviderConfig: ResolvedProviderConfig | null = null
 let alphaSearchCodexPriorityEnabled = true
 let modelMappings: Record<string, string> = {}
 
 const { state } = await import("~/lib/state")
-const { HTTPError } = await import("~/lib/error")
-const { closeUsageStore } = await import("~/lib/token-usage")
+const { HTTPError } = await import("~/lib/http/error")
+const { closeUsageStore, getTokenUsageEventsPage } = await import(
+  "~/lib/token-usage"
+)
 const { forwardCodexAlphaSearch, resolveCodexAlphaSearchUrl } = await import(
   "~/services/codex/alpha-search"
 )
@@ -27,6 +43,7 @@ const { providerAlphaSearchRouteDependencies, providerAlphaSearchRoutes } =
   await import("~/routes/provider/alpha-search/route")
 
 const DB_PATH_ENV = "COPILOT_API_SQLITE_DB_PATH"
+const originalDbPath = process.env[DB_PATH_ENV]
 
 const originalFetch = globalThis.fetch
 const originalResponsesDependencies = { ...alphaSearchResponsesDependencies }
@@ -186,8 +203,12 @@ const fetchMock = mock(
     ),
 )
 
-function createApp() {
+function createApp(trackUsage = false) {
   const app = new Hono()
+  if (trackUsage) {
+    app.use(traceIdMiddleware)
+    app.use(requestEventsMiddleware(undefined, 4141))
+  }
   app.route("/alpha/search", alphaSearchRoutes)
   app.route("/v1/alpha/search", alphaSearchRoutes)
   app.route("/:provider/v1/alpha/search", providerAlphaSearchRoutes)
@@ -214,6 +235,8 @@ const resolveTestProviderConfig = (
   if (provider === "codex") return Promise.resolve(codexProviderConfig)
   if (provider === "openrouter")
     return Promise.resolve(openrouterProviderConfig)
+  if (provider === "deepseek") return Promise.resolve(deepseekProviderConfig)
+  if (provider === "google") return Promise.resolve(googleProviderConfig)
   return Promise.resolve(null)
 }
 
@@ -241,6 +264,20 @@ beforeEach(async () => {
     baseUrl: "https://openrouter.example",
     name: "openrouter",
     type: "openai-compatible",
+  }
+  deepseekProviderConfig = {
+    apiKey: "deepseek-key",
+    authType: "x-api-key",
+    baseUrl: "https://api.deepseek.com/anthropic",
+    name: "deepseek",
+    type: "anthropic",
+  }
+  googleProviderConfig = {
+    apiKey: "google-key",
+    authType: "x-goog-api-key",
+    baseUrl: "https://generativelanguage.googleapis.com",
+    name: "google",
+    type: "google",
   }
   state.codexAccessToken = "codex-access-token"
   state.codexAccountId = "account-123"
@@ -297,7 +334,9 @@ beforeEach(async () => {
 
 afterEach(async () => {
   await closeUsageStore()
-  Reflect.deleteProperty(process.env, DB_PATH_ENV)
+  if (originalDbPath === undefined)
+    Reflect.deleteProperty(process.env, DB_PATH_ENV)
+  else process.env[DB_PATH_ENV] = originalDbPath
   ;(globalThis as unknown as { fetch: typeof fetch }).fetch = originalFetch
   state.codexAccessToken = undefined
   state.codexAccountId = undefined
@@ -306,6 +345,8 @@ afterEach(async () => {
   state.models = originalModels
   state.verbose = false
   openrouterProviderConfig = null
+  deepseekProviderConfig = null
+  googleProviderConfig = null
   Object.assign(alphaSearchResponsesDependencies, originalResponsesDependencies)
   Object.assign(alphaSearchRouteDependencies, originalRouteDependencies)
   Object.assign(
@@ -424,13 +465,25 @@ describe("Codex alpha search forwarding", () => {
     expect(url).toBe("https://chatgpt.com/backend-api/codex/alpha/search?q=bun")
   })
 
-  test("supports the provider-scoped alpha search route", async () => {
-    const response = await createApp().request(
-      "/codex/v1/alpha/search?q=provider",
+  test("checks the actual model on the provider-scoped alpha search route", async () => {
+    const response = await requestContext.run(
       {
-        method: "POST",
-        body: JSON.stringify(alphaSearchPayload),
+        apiKey: {
+          id: "search-client",
+          key: "test-key",
+          allowedModels: [`codex/${alphaSearchPayload.model}`],
+        },
+        traceId: "scoped-alpha-search",
+        startTime: Date.now(),
+        userAgent: "",
+        sessionAffinity: undefined,
+        parentSessionId: undefined,
       },
+      () =>
+        createApp().request("/codex/v1/alpha/search?q=provider", {
+          method: "POST",
+          body: JSON.stringify(alphaSearchPayload),
+        }),
     )
 
     expect(response.status).toBe(200)
@@ -578,6 +631,348 @@ describe("Codex alpha search forwarding", () => {
   })
 })
 
+describe("native Alpha Search usage integration", () => {
+  test.each([
+    { provider: "codex", scoped: false, model: "gpt-6-luna", cost: 0 },
+    { provider: "codex", scoped: true, model: "gpt-6-luna", cost: 0 },
+    {
+      provider: "deepseek",
+      scoped: false,
+      model: "deepseek-flash",
+      cost: 5_000_000,
+    },
+    {
+      provider: "deepseek",
+      scoped: true,
+      model: "deepseek-flash",
+      cost: 5_000_000,
+    },
+  ])(
+    "records $provider native search (scoped=$scoped)",
+    async ({ provider, scoped, model, cost }) => {
+      alphaSearchCodexPriorityEnabled = false
+      fetchMock.mockImplementationOnce(() =>
+        Promise.resolve(
+          Response.json({
+            output: "Native answer",
+            results: [{ url: "https://example.com/result" }],
+          }),
+        ),
+      )
+      const userAgent =
+        "codex-tui/0.169.0 (Windows 10.0.26200; x86_64) vscode/1.145.2"
+      const response = await createApp(true).request(
+        scoped ? `/${provider}/v1/alpha/search` : "/v1/alpha/search",
+        {
+          method: "POST",
+          headers: {
+            "user-agent": userAgent,
+            "x-codex-turn-metadata": JSON.stringify({
+              session_id: "01a1da09-1ea6-7d40-a65d-d908e9344454",
+              thread_id: "01a1da09-1ea6-7d40-a65d-d908e9344454",
+            }),
+          },
+          body: JSON.stringify(
+            createFallbackPayload(
+              { search_query: [{ q: "native usage" }] },
+              { model: scoped ? model : `${provider}/${model}` },
+            ),
+          ),
+        },
+      )
+      expect(response.status).toBe(200)
+      await response.text()
+      const page = await getTokenUsageEventsPage({
+        period: "today",
+        page: 1,
+        pageSize: 20,
+      })
+      expect(page.items).toHaveLength(1)
+      expect(page.items[0]).toMatchObject({
+        endpoint: "alpha_search",
+        source: "provider",
+        provider_name: provider,
+        model: `${model}_search`,
+        session_id: "01a1da09-1ea6-7d40-a65d-d908e9344454",
+        user_agent: userAgent.slice(0, 64),
+        total_tokens: 0,
+        request_outcome: "completed",
+        cost: {
+          currency: provider === "deepseek" ? "CNY" : "USD",
+          total_cost_nanos: cost,
+        },
+      })
+      expect(page.items[0].duration_ms).toBeNumber()
+    },
+  )
+
+  test("keeps Responses-backed alpha search as one Responses usage record", async () => {
+    alphaSearchCodexPriorityEnabled = false
+    openrouterProviderConfig!.type = "openai-responses"
+    fetchMock.mockImplementationOnce(() =>
+      Promise.resolve(Response.json(createResponsesResult())),
+    )
+    const response = await createApp(true).request("/v1/alpha/search", {
+      method: "POST",
+      body: JSON.stringify(
+        createFallbackPayload(
+          { search_query: [{ q: "Responses backend" }] },
+          { model: "openrouter/gpt-6-luna" },
+        ),
+      ),
+    })
+    expect(response.status).toBe(200)
+    await response.text()
+    const page = await getTokenUsageEventsPage({
+      period: "today",
+      page: 1,
+      pageSize: 20,
+    })
+    expect(page.items).toHaveLength(1)
+    expect(page.items[0].endpoint).toBe("responses")
+    expect(page.items[0].model).toBe("gpt-6-luna")
+    expect(page.items[0].total_tokens).toBe(150)
+  })
+
+  test("does not apply official DeepSeek prices to a custom native endpoint", async () => {
+    deepseekProviderConfig!.baseUrl = "https://deepseek.example"
+    const response = await createApp(true).request(
+      "/deepseek/v1/alpha/search",
+      {
+        method: "POST",
+        body: JSON.stringify(
+          createFallbackPayload(
+            { search_query: [{ q: "custom" }] },
+            { model: "deepseek-flash" },
+          ),
+        ),
+      },
+    )
+    await response.text()
+    const page = await getTokenUsageEventsPage({
+      period: "today",
+      page: 1,
+      pageSize: 20,
+    })
+    expect(page.items).toHaveLength(1)
+    expect(page.items[0]).toMatchObject({
+      endpoint: "alpha_search",
+      cost: null,
+    })
+  })
+})
+
+describe("DeepSeek native alpha search", () => {
+  test.each([
+    {
+      verbose: true,
+      status: 200,
+      body: '{"output":"native search result","results":[]}',
+    },
+    { verbose: true, status: 502, body: "upstream failed" },
+    {
+      verbose: false,
+      status: 200,
+      body: '{"output":"native search result","results":[]}',
+    },
+  ])(
+    "logs native responses lazily without consuming them: %j",
+    async ({ verbose, status, body }) => {
+      state.verbose = verbose
+      fetchMock.mockImplementationOnce(() =>
+        Promise.resolve(new Response(body, { status })),
+      )
+      const clone = spyOn(Response.prototype, "clone")
+      try {
+        const response = await requestFallback(
+          createFallbackPayload(
+            { search_query: [{ q: "native logging" }] },
+            { model: "deepseek/deepseek-flash" },
+          ),
+        )
+
+        expect(response.status).toBe(status)
+        expect(await response.text()).toBe(body)
+        expect(clone).toHaveBeenCalledTimes(
+          (verbose ? 1 : 0) + (status === 200 ? 1 : 0),
+        )
+      } finally {
+        clone.mockRestore()
+      }
+    },
+  )
+
+  test.each([
+    "https://api.deepseek.com",
+    "https://api.deepseek.com/v1",
+    "https://api.deepseek.com/anthropic",
+    "https://api.deepseek.com/anthropic/v1/",
+  ])(
+    "forwards mapped models with the official base URL %s",
+    async (baseUrl) => {
+      deepseekProviderConfig!.baseUrl = baseUrl
+      modelMappings = { "search-model": "deepseek/deepseek-flash" }
+      const payload = createFallbackPayload(
+        { open: [{ ref_id: "native-ref" }], future_command: [{ value: 1 }] },
+        {
+          model: "search-model",
+          settings: { external_web_access: "cached" },
+          future_field: "preserved",
+        },
+      )
+      const response = await requestFallback(payload, "/v1/alpha/search?q=kept")
+
+      expect(response.status).toBe(200)
+      expect(createResponsesMock).not.toHaveBeenCalled()
+      expect(fetchMock).toHaveBeenCalledTimes(1)
+      const [url, init] = fetchMock.mock.calls[0] ?? []
+      expect(url).toBe("https://api.deepseek.com/alpha/search?q=kept")
+      expect(new Headers(init?.headers).get("authorization")).toBe(
+        "Bearer deepseek-key",
+      )
+      expect(new Headers(init?.headers).has("x-api-key")).toBe(false)
+      expect(await new Response(init?.body).json()).toEqual({
+        ...payload,
+        model: "deepseek-flash",
+      })
+      expect(await response.json()).toEqual({ results: [{ title: "result" }] })
+    },
+  )
+
+  test("keeps the explicit provider route on DeepSeek with Codex enabled", async () => {
+    const payload = { ...alphaSearchPayload, model: "deepseek-v4-pro" }
+    const body = JSON.stringify(payload, null, 2)
+    const response = await createApp().request(
+      "/deepseek/v1/alpha/search?q=kept",
+      {
+        method: "POST",
+        headers: { authorization: "Bearer client-key" },
+        body,
+      },
+    )
+
+    expect(response.status).toBe(200)
+    const [url, init] = fetchMock.mock.calls[0] ?? []
+    expect(url).toBe("https://api.deepseek.com/alpha/search?q=kept")
+    expect(new Headers(init?.headers).get("authorization")).toBe(
+      "Bearer deepseek-key",
+    )
+    expect(await new Response(init?.body).text()).toBe(body)
+    expect(createResponsesMock).not.toHaveBeenCalled()
+  })
+
+  test("preserves Codex priority for top-level DeepSeek aliases", async () => {
+    const response = await createApp().request("/alpha/search", {
+      method: "POST",
+      body: JSON.stringify(
+        createFallbackPayload(
+          { search_query: [{ q: "priority" }] },
+          { model: "deepseek/deepseek-flash" },
+        ),
+      ),
+    })
+
+    expect(response.status).toBe(200)
+    expect(fetchMock.mock.calls[0]?.[0]).toBe(
+      "https://chatgpt.com/backend-api/codex/alpha/search",
+    )
+  })
+
+  test("uses native DeepSeek when Codex priority is disabled", async () => {
+    alphaSearchCodexPriorityEnabled = false
+    const response = await createApp().request("/alpha/search", {
+      method: "POST",
+      body: JSON.stringify(
+        createFallbackPayload(
+          { search_query: [{ q: "native" }] },
+          { model: "deepseek/deepseek-flash" },
+        ),
+      ),
+    })
+
+    expect(response.status).toBe(200)
+    expect(fetchMock.mock.calls[0]?.[0]).toBe(
+      "https://api.deepseek.com/alpha/search",
+    )
+    expect(createResponsesMock).not.toHaveBeenCalled()
+  })
+
+  test("allows native DeepSeek as the fallback alphaSearchModel", async () => {
+    state.models!.data[0].supported_endpoints = ["/chat/completions"]
+    alphaSearchRouteDependencies.getAlphaSearchModel = () =>
+      "deepseek/deepseek-v4-pro"
+    const response = await requestFallback(
+      createFallbackPayload({ search_query: [{ q: "fallback" }] }),
+    )
+
+    expect(response.status).toBe(200)
+    expect(fetchMock.mock.calls[0]?.[0]).toBe(
+      "https://api.deepseek.com/alpha/search",
+    )
+    const [, init] = fetchMock.mock.calls[0] ?? []
+    expect(await new Response(init?.body).json()).toMatchObject({
+      model: "deepseek-v4-pro",
+    })
+    expect(createResponsesMock).not.toHaveBeenCalled()
+  })
+
+  test.each([
+    "https://deepseek.example",
+    "https://api.deepseek.com.evil.example",
+    "https://api.deepseek.com@evil.example",
+    "http://api.deepseek.com",
+    "https://api.deepseek.com/custom",
+  ])("does not select native DeepSeek for %s", (baseUrl) => {
+    expect(
+      supportsNativeDeepSeekAlphaSearch({
+        ...deepseekProviderConfig!,
+        baseUrl,
+      }),
+    ).toBe(false)
+  })
+
+  test("keeps custom DeepSeek provider addresses on their configured route", async () => {
+    deepseekProviderConfig = {
+      ...deepseekProviderConfig!,
+      baseUrl: "https://deepseek.example",
+      type: "openai-responses",
+      authType: "authorization",
+    }
+    fetchMock.mockImplementationOnce(() =>
+      Promise.resolve(Response.json(createResponsesResult())),
+    )
+    const response = await requestFallback(
+      createFallbackPayload(
+        { search_query: [{ q: "custom" }] },
+        { model: "deepseek/deepseek-flash" },
+      ),
+    )
+
+    expect(response.status).toBe(200)
+    expect(fetchMock.mock.calls[0]?.[0]).toBe(
+      "https://deepseek.example/v1/responses",
+    )
+  })
+
+  test("preserves native error status and body", async () => {
+    const error = {
+      error: { message: "Search rate limit", type: "rate_limit_error" },
+    }
+    fetchMock.mockImplementationOnce(() =>
+      Promise.resolve(Response.json(error, { status: 429 })),
+    )
+    const response = await requestFallback(
+      createFallbackPayload(
+        { search_query: [{ q: "limited" }] },
+        { model: "deepseek/deepseek-flash" },
+      ),
+    )
+
+    expect(response.status).toBe(429)
+    expect(await response.json()).toEqual(error)
+  })
+})
+
 describe("Alpha search Responses adapter", () => {
   test("prefers Codex for unqualified models when Codex priority is enabled", async () => {
     const response = await createApp().request("/alpha/search", {
@@ -596,7 +991,7 @@ describe("Alpha search Responses adapter", () => {
     })
   })
 
-  test("rewrites non-gpt models to gpt-5.6-luna when prioritizing Codex", async () => {
+  test("rewrites non-gpt models to gpt-6-luna when prioritizing Codex", async () => {
     const response = await createApp().request("/alpha/search", {
       method: "POST",
       body: JSON.stringify(
@@ -612,7 +1007,7 @@ describe("Alpha search Responses adapter", () => {
     expect(fetchMock).toHaveBeenCalledTimes(1)
     const [, init] = fetchMock.mock.calls[0] ?? []
     expect(await new Response(init?.body).json()).toMatchObject({
-      model: "gpt-5.6-luna",
+      model: "gpt-6-luna",
     })
   })
 
@@ -998,6 +1393,36 @@ describe("Alpha search Responses adapter", () => {
     expect(createResponsesMock).not.toHaveBeenCalled()
   })
 
+  test.each([false, "cached", "indexed"])(
+    "keeps cached URL opens readable with external_web_access=%s",
+    async (mode) => {
+      const url = "https://example.com/cached"
+      createResponsesMock.mockImplementation(() =>
+        Promise.resolve(
+          createResponsesResult({
+            answer: "zero\nCached page text\ntwo",
+            sources: [],
+            citations: false,
+          }),
+        ),
+      )
+      await requestFallback(createFallbackPayload({ open: [{ ref_id: url }] }))
+
+      const response = await requestFallback(
+        createFallbackPayload(
+          { open: [{ ref_id: url, lineno: 1 }] },
+          { settings: { external_web_access: mode } },
+        ),
+      )
+      const body = (await response.json()) as { output: string }
+      expect(response.status).toBe(200)
+      expect(body.output).toContain("Open turn0view0")
+      expect(body.output).toContain("L1: Cached page text")
+      expect(body.output).not.toContain("supports live retrieval only")
+      expect(createResponsesMock).toHaveBeenCalledTimes(1)
+    },
+  )
+
   test("computes time locally with the injected clock", async () => {
     const response = await requestFallback(
       createFallbackPayload({
@@ -1059,6 +1484,120 @@ describe("Alpha search Responses adapter", () => {
     expect(response.status).toBe(200)
     expect(createResponsesMock).toHaveBeenCalledTimes(1)
     expect(createResponsesMock.mock.calls[0]?.[0].model).toBe("gpt-5-mini")
+  })
+
+  test.each([
+    { label: "Codex is unavailable", disableCodexPriority: false },
+    { label: "Codex priority is disabled", disableCodexPriority: true },
+  ])(
+    "redirects Google provider alpha search to alphaSearchModel when $label",
+    async ({ disableCodexPriority }) => {
+      state.models = {
+        object: "list",
+        data: [
+          {
+            capabilities: { limits: {} },
+            id: "gpt-5-mini",
+            supported_endpoints: ["/responses"],
+          },
+        ],
+      } as typeof state.models
+
+      const payload = createFallbackPayload(
+        { search_query: [{ q: "google redirect search" }] },
+        { model: "google/gemini-2.5-pro" },
+      )
+      let response: Response
+      if (disableCodexPriority) {
+        alphaSearchCodexPriorityEnabled = false
+        response = await createApp().request("/alpha/search", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify(payload),
+        })
+      } else {
+        response = await requestFallback(payload)
+      }
+
+      expect(response.status).toBe(200)
+      expect(fetchMock).not.toHaveBeenCalled()
+      expect(createResponsesMock).toHaveBeenCalledTimes(1)
+      expect(createResponsesMock.mock.calls[0]?.[0].model).toBe("gpt-5-mini")
+    },
+  )
+
+  test("redirects per-model google type override alpha search to alphaSearchModel", async () => {
+    alphaSearchCodexPriorityEnabled = false
+    openrouterProviderConfig = {
+      ...openrouterProviderConfig!,
+      type: "openai-responses",
+      models: {
+        "gemini-2.5-pro": { type: "google" },
+      },
+    }
+    state.models = {
+      object: "list",
+      data: [
+        {
+          capabilities: { limits: {} },
+          id: "gpt-5-mini",
+          supported_endpoints: ["/responses"],
+        },
+      ],
+    } as typeof state.models
+
+    const response = await createApp().request("/alpha/search", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(
+        createFallbackPayload(
+          { search_query: [{ q: "google override search" }] },
+          { model: "openrouter/gemini-2.5-pro" },
+        ),
+      ),
+    })
+
+    expect(response.status).toBe(200)
+    expect(fetchMock).not.toHaveBeenCalled()
+    expect(createResponsesMock).toHaveBeenCalledTimes(1)
+    expect(createResponsesMock.mock.calls[0]?.[0].model).toBe("gpt-5-mini")
+  })
+
+  test("rejects Google provider alpha search when alphaSearchModel is disabled or non-Responses", async () => {
+    alphaSearchRouteDependencies.getAlphaSearchModel = () => undefined
+    const disabledResponse = await requestFallback(
+      createFallbackPayload(
+        { search_query: [{ q: "disabled search model" }] },
+        { model: "google/gemini-2.5-pro" },
+      ),
+    )
+
+    expect(disabledResponse.status).toBe(400)
+    const disabledBody = (await disabledResponse.json()) as {
+      error: { message: string }
+    }
+    expect(disabledBody.error.message).toContain(
+      "alphaSearchModel is disabled; Messages-backed Codex models require a native Responses search model",
+    )
+
+    alphaSearchRouteDependencies.getAlphaSearchModel = () =>
+      "google/gemini-2.5-flash"
+    const invalidSearchModelResponse = await requestFallback(
+      createFallbackPayload(
+        { search_query: [{ q: "invalid google search model" }] },
+        { model: "google/gemini-2.5-pro" },
+      ),
+    )
+
+    expect(invalidSearchModelResponse.status).toBe(400)
+    const invalidBody = (await invalidSearchModelResponse.json()) as {
+      error: { message: string }
+    }
+    expect(invalidBody.error.message).toContain(
+      "Configured alphaSearchModel 'google/gemini-2.5-flash' does not support the Responses endpoint",
+    )
+    expect(createResponsesMock).not.toHaveBeenCalled()
+    expect(fetchMock).not.toHaveBeenCalled()
   })
 
   test("keeps stable deduplicated search references across turns", async () => {
@@ -1163,6 +1702,68 @@ describe("Alpha search Responses adapter", () => {
     )
     expect(createResponsesMock).toHaveBeenCalledTimes(3)
   })
+
+  test.each(["URL", "search reference"])(
+    "retries a failed %s open with an explicit URL and refreshes cached references",
+    async (initialReference) => {
+      const url = "https://example.com/retry"
+      if (initialReference === "search reference") {
+        createResponsesMock.mockImplementation(() =>
+          Promise.resolve(createResponsesResult({ sources: [{ url }] })),
+        )
+        await requestFallback(
+          createFallbackPayload({ search_query: [{ q: "retry page" }] }),
+        )
+      }
+
+      createResponsesMock.mockImplementation(() =>
+        Promise.resolve(
+          createResponsesResult({
+            answer: "ClientConnectorDNSError",
+            sources: [],
+            citations: false,
+          }),
+        ),
+      )
+      const failed = await requestFallback(
+        createFallbackPayload({
+          open: [{ ref_id: initialReference === "URL" ? url : "turn0search0" }],
+        }),
+      )
+      const failedBody = (await failed.json()) as { output: string }
+      expect(failedBody.output).toContain("ClientConnectorDNSError")
+      const callsBeforeRetry = createResponsesMock.mock.calls.length
+
+      createResponsesMock.mockImplementation(() =>
+        Promise.resolve(
+          createResponsesResult({
+            answer: "Recovered page text",
+            sources: [],
+            citations: false,
+          }),
+        ),
+      )
+      const retried = await requestFallback(
+        createFallbackPayload({ open: [{ ref_id: url }] }),
+      )
+      const retriedBody = (await retried.json()) as { output: string }
+      expect(retriedBody.output).toContain("Recovered page text")
+      expect(retriedBody.output).not.toContain("ClientConnectorDNSError")
+      expect(createResponsesMock).toHaveBeenCalledTimes(callsBeforeRetry + 1)
+
+      const viewRef = initialReference === "URL" ? "turn0view0" : "turn1view0"
+      for (const refId of ["turn0search0", viewRef]) {
+        const cached = await requestFallback(
+          createFallbackPayload({ open: [{ ref_id: refId, lineno: 0 }] }),
+        )
+        const cachedBody = (await cached.json()) as { output: string }
+        expect(cachedBody.output).toContain(`Open ${viewRef}`)
+        expect(cachedBody.output).toContain("L0: Recovered page text")
+        expect(cachedBody.output).not.toContain("ClientConnectorDNSError")
+      }
+      expect(createResponsesMock).toHaveBeenCalledTimes(callsBeforeRetry + 1)
+    },
+  )
 
   test("uses Copilot find only when opened text cannot satisfy it locally", async () => {
     const results = [

@@ -8,23 +8,24 @@ import {
   resolveMappedModel,
   type ResolvedProviderConfig,
 } from "~/lib/config"
-import { forwardError } from "~/lib/error"
-import { setPluginRequestModel } from "~/lib/request-events"
-import { setPluginRequestActualModel } from "~/lib/request-context"
-import { createHandlerLogger, debugJsonAsync } from "~/lib/logger"
-import { findEndpointModel } from "~/lib/models"
-import { parseProviderModelAlias } from "~/lib/provider-model"
-import {
-  ensureConfiguredProviderModelAlias,
-  resolveProviderConfig,
-} from "~/lib/provider-resolver"
+import { forwardError } from "~/lib/http/error"
+import { setPluginRequestModel } from "~/lib/http/request-events"
+import { setPluginRequestActualModel } from "~/lib/http/request-context"
+import { createHandlerLogger, debugJson, debugJsonAsync } from "~/lib/logger"
+import { findEndpointModel } from "~/lib/catalog/models"
+import { parseProviderModelAlias } from "~/lib/catalog/provider-model"
+import { resolveProviderConfig } from "~/lib/providers/provider-resolver"
 import type {
   AlphaSearchRequest,
   AlphaSearchResponse,
 } from "~/routes/alpha-search/alpha-search-types"
 import { handleAlphaSearchResponses } from "~/routes/alpha-search/alpha-search-responses"
 import { forwardCodexAlphaSearch } from "~/services/codex/alpha-search"
-import { createProviderProxyResponse } from "~/services/providers/provider-proxy"
+import {
+  createProviderProxyResponse,
+  forwardProviderAlphaSearch,
+  supportsNativeDeepSeekAlphaSearch,
+} from "~/services/providers/provider-proxy"
 
 const logger = createHandlerLogger("alpha-search-handler")
 
@@ -33,6 +34,7 @@ export const alphaSearchRoutes = new Hono()
 export const alphaSearchRouteDependencies = {
   findEndpointModel,
   forwardCodexAlphaSearch,
+  forwardProviderAlphaSearch,
   getAlphaSearchModel,
   handleAlphaSearchResponses,
   isAlphaSearchCodexPriorityEnabled,
@@ -51,13 +53,13 @@ function parseDebugBody<T>(body: string): T | string {
 
 async function forwardCodexAlphaSearchRequest(
   request: Request,
-  model?: string,
+  model: string,
 ): Promise<Response> {
   await debugJsonAsync(logger, "alpha_search.codex.request", async () => ({
     body: parseDebugBody<AlphaSearchRequest>(await request.clone().text()),
   }))
 
-  if (model) setPluginRequestActualModel(model)
+  setPluginRequestActualModel(model, "codex", "alpha_search")
   const upstreamResponse =
     await alphaSearchRouteDependencies.forwardCodexAlphaSearch(request)
   await debugJsonAsync(logger, "alpha_search.codex.response", async () => ({
@@ -88,8 +90,8 @@ function createAlphaSearchRequest(
 async function handleCodexRequest(
   c: Context,
   request: Request,
+  model: string,
   resolvedProviderConfig?: ResolvedProviderConfig,
-  model?: string,
 ): Promise<Response> {
   const codexProviderConfig =
     resolvedProviderConfig
@@ -151,12 +153,16 @@ export async function handleAlphaSearchRequest(
   c: Context,
   resolvedProviderConfig?: ResolvedProviderConfig,
 ): Promise<Response> {
-  if (resolvedProviderConfig) {
-    return await handleCodexRequest(c, c.req.raw, resolvedProviderConfig)
-  }
-
   const payload = await parseAlphaSearchBody(c)
   if (payload instanceof Response) return payload
+  if (resolvedProviderConfig) {
+    return await handleCodexRequest(
+      c,
+      c.req.raw,
+      payload.model,
+      resolvedProviderConfig,
+    )
+  }
 
   const requestedModel = payload.model
 
@@ -176,7 +182,6 @@ export async function handleAlphaSearchRequest(
       return await handleCodexRequest(
         c,
         createAlphaSearchRequest(c.req.raw, payload),
-        undefined,
         payload.model,
       )
     }
@@ -187,7 +192,7 @@ export async function handleAlphaSearchRequest(
       await alphaSearchRouteDependencies.resolveProviderConfig("codex")
     if (codexProviderConfig) {
       if (!payload.model.startsWith("gpt")) {
-        payload.model = "gpt-5.6-luna"
+        payload.model = "gpt-6-luna"
       }
       return await forwardCodexAlphaSearchRequest(
         createAlphaSearchRequest(c.req.raw, payload),
@@ -209,7 +214,7 @@ export async function handleAlphaSearchRequest(
     }
     const resolvedSearchModel =
       alphaSearchRouteDependencies.resolveMappedModel(searchModel)
-    if (!(await isNativeResponsesModel(resolvedSearchModel))) {
+    if (!(await isNativeSearchModel(resolvedSearchModel))) {
       return invalidRequest(
         c,
         `Configured alphaSearchModel '${searchModel}' does not support the Responses endpoint required for alpha search`,
@@ -226,7 +231,6 @@ export async function handleAlphaSearchRequest(
         return await handleCodexRequest(
           c,
           createAlphaSearchRequest(c.req.raw, payload),
-          undefined,
           payload.model,
         )
       }
@@ -236,12 +240,40 @@ export async function handleAlphaSearchRequest(
     messagesBackedModel ? payload.model : requestedModel
 
   if (providerModelAlias) {
-    const configuredProviderModelAlias =
-      await ensureConfiguredProviderModelAlias(
-        providerModelAlias,
-        alphaSearchRouteDependencies.resolveProviderConfig,
+    const providerConfig =
+      await alphaSearchRouteDependencies.resolveProviderConfig(
+        providerModelAlias.provider,
       )
-    if (configuredProviderModelAlias) {
+    if (providerConfig) {
+      if (supportsNativeDeepSeekAlphaSearch(providerConfig)) {
+        setPluginRequestActualModel(
+          payload.model,
+          providerConfig,
+          "alpha_search",
+        )
+        debugJson(logger, "alpha_search.provider.request", {
+          body: payload,
+          provider: providerConfig.name,
+        })
+        const upstreamResponse =
+          await alphaSearchRouteDependencies.forwardProviderAlphaSearch(
+            providerConfig,
+            createAlphaSearchRequest(c.req.raw, payload),
+            { clientSignal: c.req.raw.signal },
+          )
+        await debugJsonAsync(
+          logger,
+          "alpha_search.provider.response",
+          async () => ({
+            body: parseDebugBody<AlphaSearchResponse>(
+              await upstreamResponse.clone().text(),
+            ),
+            provider: providerConfig.name,
+            statusCode: upstreamResponse.status,
+          }),
+        )
+        return createProviderProxyResponse(upstreamResponse)
+      }
       return await alphaSearchRouteDependencies.handleAlphaSearchResponses(c, {
         provider: providerModelAlias.provider,
         request: payload,
@@ -265,13 +297,16 @@ async function isMessagesBackedModel(model: string): Promise<boolean> {
         providerAlias.provider,
       )
     if (!providerConfig) return false
+    if (supportsNativeDeepSeekAlphaSearch(providerConfig)) return false
     const effectiveType =
       alphaSearchRouteDependencies.resolveEffectiveProviderType(
         providerConfig,
         providerAlias.model,
       )
     return (
-      effectiveType === "anthropic" || effectiveType === "openai-compatible"
+      effectiveType === "anthropic"
+      || effectiveType === "openai-compatible"
+      || effectiveType === "google"
     )
   }
 
@@ -286,7 +321,7 @@ async function isMessagesBackedModel(model: string): Promise<boolean> {
   )
 }
 
-async function isNativeResponsesModel(model: string): Promise<boolean> {
+async function isNativeSearchModel(model: string): Promise<boolean> {
   const providerAlias = parseProviderModelAlias(model)
   if (providerAlias) {
     const providerConfig =
@@ -295,10 +330,11 @@ async function isNativeResponsesModel(model: string): Promise<boolean> {
       )
     return (
       providerConfig !== null
-      && alphaSearchRouteDependencies.resolveEffectiveProviderType(
-        providerConfig,
-        providerAlias.model,
-      ) === "openai-responses"
+      && (supportsNativeDeepSeekAlphaSearch(providerConfig)
+        || alphaSearchRouteDependencies.resolveEffectiveProviderType(
+          providerConfig,
+          providerAlias.model,
+        ) === "openai-responses")
     )
   }
 

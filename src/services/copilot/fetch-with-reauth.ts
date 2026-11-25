@@ -1,9 +1,9 @@
 import consola from "consola"
 
-import { UpstreamHeadersTimeoutError } from "~/lib/error"
+import { UpstreamHeadersTimeoutError } from "~/lib/http/http-error"
 import { retryPreResponseFailures } from "~/lib/fetch-timeout"
 import { state } from "~/lib/state"
-import { setupCopilotToken } from "~/lib/token"
+import { setupCopilotToken } from "~/lib/auth/token"
 import {
   fetchUpstreamWithLifecycle,
   type UpstreamHttpLifecycleOptions,

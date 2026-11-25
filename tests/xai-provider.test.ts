@@ -8,13 +8,14 @@ import {
   test,
 } from "bun:test"
 import fs from "node:fs"
+import fsPromises from "node:fs/promises"
 import os from "node:os"
 import path from "node:path"
 import { fileURLToPath } from "node:url"
 
 import type { ResolvedProviderConfig } from "~/lib/config"
 import type { ResponsesPayload } from "~/lib/types/responses"
-import { installModelsDevCatalog } from "~/lib/models-dev-cache"
+import { installModelsDevCatalog } from "~/lib/catalog/models-dev-cache"
 
 import { modelsDevProviderCatalogFixture } from "./fixtures/models-dev-catalog"
 
@@ -48,9 +49,13 @@ if (process.env.COPILOT_API_XAI_TEST_PROCESS !== "1") {
     invalidateConfigCache,
     listEnabledProviders,
   } = await import("~/lib/config")
-  const { PATHS } = await import("~/lib/paths")
-  const { resolveProviderConfig } = await import("~/lib/provider-resolver")
-  const { requestContext } = await import("~/lib/request-context")
+  const { PATHS } = await import("~/lib/storage/paths")
+  const { closeUsageStore } = await import("~/lib/token-usage")
+  const { resolveProviderConfig } = await import(
+    "~/lib/providers/provider-resolver"
+  )
+  const { requestContext } = await import("~/lib/http/request-context")
+  const { traceIdMiddleware } = await import("~/lib/http/trace")
   const {
     getXaiAccessToken,
     persistXaiCredentials,
@@ -58,7 +63,7 @@ if (process.env.COPILOT_API_XAI_TEST_PROCESS !== "1") {
     getXaiAccounts,
     selectXaiAccount,
     removeXaiAccount,
-  } = await import("~/lib/xai-token")
+  } = await import("~/lib/auth/xai-token")
   const {
     buildProviderUpstreamHeaders,
     resolveProviderEndpointUrl,
@@ -66,6 +71,7 @@ if (process.env.COPILOT_API_XAI_TEST_PROCESS !== "1") {
   } = await import("~/services/providers/provider-proxy")
 
   const savedPaths = { ...PATHS }
+  const originalDbPath = process.env.COPILOT_API_SQLITE_DB_PATH
   const originalFetch = globalThis.fetch
   const credentials = {
     accountId: "xai-account",
@@ -82,6 +88,10 @@ if (process.env.COPILOT_API_XAI_TEST_PROCESS !== "1") {
     PATHS.CONFIG_PATH = path.join(taskDir, "config.json")
     PATHS.GITHUB_TOKEN_PATH = path.join(taskDir, "github_token")
     PATHS.XAI_CREDENTIAL_PATH = path.join(taskDir, "xai_credentials.json")
+    process.env.COPILOT_API_SQLITE_DB_PATH = path.join(
+      taskDir,
+      "copilot-api.sqlite",
+    )
     fs.writeFileSync(PATHS.CONFIG_PATH, "{}")
     invalidateConfigCache()
     for (const level of ["info", "success", "log"] as const)
@@ -90,10 +100,14 @@ if (process.env.COPILOT_API_XAI_TEST_PROCESS !== "1") {
       )
   })
 
-  afterEach(() => {
+  afterEach(async () => {
+    await closeUsageStore()
     mock.restore()
     globalThis.fetch = originalFetch
     Object.assign(PATHS, savedPaths)
+    if (originalDbPath === undefined)
+      delete process.env.COPILOT_API_SQLITE_DB_PATH
+    else process.env.COPILOT_API_SQLITE_DB_PATH = originalDbPath
     invalidateConfigCache()
     if (!taskDir.startsWith(path.join(os.tmpdir(), "copilot-api-xai-")))
       throw new Error("Invalid test directory")
@@ -164,6 +178,48 @@ if (process.env.COPILOT_API_XAI_TEST_PROCESS !== "1") {
       expect(await getXaiAccessToken()).toBe(credentials.accessToken)
     })
 
+    test("reads xAI OAuth credentials once per request", async () => {
+      await persistXaiCredentials(credentials)
+      const readFile = spyOn(fsPromises, "readFile")
+      const app = new Hono().use(traceIdMiddleware).get("/", async (c) => {
+        const providers = await Promise.all([
+          resolveProviderConfig("xai"),
+          resolveProviderConfig("xai"),
+        ])
+        providers.push(await resolveProviderConfig("xai"))
+        return c.json(providers.map((provider) => provider?.apiKey))
+      })
+      for (let request = 0; request < 2; request++) {
+        readFile.mockClear()
+        const response = await app.request("/", {
+          headers: { "x-trace-id": "same-trace" },
+        })
+        expect(await response.json()).toEqual(
+          Array<string>(3).fill(credentials.accessToken),
+        )
+        expect(
+          readFile.mock.calls.filter(
+            ([file]) => file === PATHS.XAI_CREDENTIAL_PATH,
+          ),
+        ).toHaveLength(1)
+      }
+    })
+
+    test("retries a failed xAI credential lookup in the same request", async () => {
+      await persistXaiCredentials(credentials)
+      const lookupError = new Error("credential lookup failed")
+      spyOn(fsPromises, "readFile").mockRejectedValueOnce(lookupError)
+      const app = new Hono().use(traceIdMiddleware).get("/", async (c) => {
+        expect(await getXaiAccessToken().catch((error: unknown) => error)).toBe(
+          lookupError,
+        )
+        return c.json(await getXaiAccessToken())
+      })
+
+      const response = await app.request("/")
+      expect(await response.json()).toBe(credentials.accessToken)
+    })
+
     test("returns null for missing credentials or a disabled OAuth provider", async () => {
       expect(await readXaiCredentials()).toBeNull()
       expect(await getXaiAccessToken()).toBeNull()
@@ -196,13 +252,15 @@ if (process.env.COPILOT_API_XAI_TEST_PROCESS !== "1") {
     })
 
     test.each(["oauth2", "authorization"] as const)(
-      "routes configured image generation with real %s provider resolution",
+      "routes image model mappings with real %s provider resolution and ignores retired overrides",
       async (authType) => {
         if (authType === "oauth2") await persistXaiCredentials(credentials)
         fs.writeFileSync(
           PATHS.CONFIG_PATH,
           JSON.stringify({
-            imageGenerationModel: "xai/grok-imagine-image-2.0",
+            imageGenerationModel: "xai/retired-override",
+            imageEditModel: "xai/retired-edit-override",
+            modelMappings: { "gpt-image-1": "xai/grok-imagine-image-2.0" },
             providers: {
               xai: {
                 apiKey:
@@ -536,7 +594,7 @@ if (process.env.COPILOT_API_XAI_TEST_PROCESS !== "1") {
       expect(consola.log).not.toHaveBeenCalledWith("cli-access")
     })
 
-    test("lists cached models.dev xAI models in provider and aggregated endpoints without upstream discovery", async () => {
+    test("combines cached xAI chat models and built-in images in aggregated discovery without upstream requests", async () => {
       await persistXaiCredentials(credentials)
       const upstream = mock(() =>
         Promise.reject(new Error("Model listing must stay local")),
@@ -562,7 +620,15 @@ if (process.env.COPILOT_API_XAI_TEST_PROCESS !== "1") {
       expect(models.data.map((model) => model.id)).toEqual([
         "xai/grok-4.7",
         "xai/grok-catalog-only",
+        "xai/grok-imagine-image-2.0",
       ])
+      expect(
+        models.data.find((model) => model.id === "xai/grok-imagine-image-2.0"),
+      ).toMatchObject({
+        type: "image",
+        input_modalities: ["text", "image"],
+        output_modalities: ["image"],
+      })
       expect(upstream).not.toHaveBeenCalled()
       const codex = await app.request("/v1/models", {
         headers: { "user-agent": "codex/1.0" },

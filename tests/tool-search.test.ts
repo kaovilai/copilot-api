@@ -2,13 +2,12 @@ import { describe, expect, test } from "bun:test"
 
 import {
   createMcpToolSearchSentinel,
-  hasDeferredMcpNamespaceTool,
   parseMcpToolSearchSentinel,
   resolveBridgeToolSearchName,
   selectDeferredToolsByNames,
   shouldEnableResponsesToolSearch,
-} from "~/lib/tool-search"
-import { runMcpServer } from "~/lib/mcp-server"
+} from "~/lib/cli/tool-search"
+import { runMcpServer } from "~/lib/cli/mcp-server"
 
 describe("tool search helpers", () => {
   test("detects eligible Responses tool search requests", () => {
@@ -150,40 +149,6 @@ describe("tool search helpers", () => {
       "TaskList",
       "mcp__fetch__fetch",
     ])
-  })
-
-  test("detects translated deferred namespaces", () => {
-    expect(
-      hasDeferredMcpNamespaceTool([
-        {
-          type: "namespace",
-          name: "mcp__fetch__fetch",
-          tools: [
-            {
-              type: "function",
-              name: "mcp__fetch__fetch",
-              defer_loading: true,
-            },
-          ],
-        },
-      ]),
-    ).toBe(true)
-
-    expect(
-      hasDeferredMcpNamespaceTool([
-        {
-          type: "namespace",
-          name: "chrome-devtools_click",
-          tools: [
-            {
-              type: "function",
-              name: "chrome-devtools_click",
-              defer_loading: true,
-            },
-          ],
-        },
-      ]),
-    ).toBe(true)
   })
 
   test("exports an mcp CLI command", () => {

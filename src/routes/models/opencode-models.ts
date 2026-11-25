@@ -1,13 +1,13 @@
 import type { Cost, CostTier, Limit, ModelCost } from "@opencode-ai/models"
 import type { Context } from "hono"
 
-import { builtinProviderModelRegistry } from "~/lib/builtin-provider-models"
+import { builtinProviderModelRegistry } from "~/lib/catalog/builtin-provider-models"
 import { getRawProviderConfig } from "~/lib/config"
-import { getOpencodeModelContextWindow } from "~/lib/config-store"
-import { GITHUB_COPILOT_PROVIDER } from "~/lib/github-copilot-provider"
-import { stripInternalRequestHeaders } from "~/lib/internal-headers"
-import { resolveModelPdfSupport } from "~/lib/model-pdf-support"
-import { findEndpointModel } from "~/lib/models"
+import { getOpencodeModelContextWindow } from "~/lib/config/config-store"
+import { GITHUB_COPILOT_PROVIDER } from "~/lib/providers/github-copilot-provider"
+import { stripInternalRequestHeaders } from "~/lib/http/internal-headers"
+import { resolveModelPdfSupport } from "~/lib/catalog/model-pdf-support"
+import { findEndpointModel } from "~/lib/catalog/models"
 import type { Reasoning } from "~/lib/types/responses"
 import {
   resolveProviderCurrency,
@@ -22,11 +22,10 @@ import {
   type ClientModel,
 } from "~/routes/models/model-discovery"
 import { getModelMetadata } from "~/routes/models/model-metadata"
+import { resolveUsdRate } from "~/lib/token-usage/currency"
 
 const RESPONSES_PACKAGE = "@opencode/ai/providers/openai/responses"
-// OpenCode's cost schema is USD per million tokens. Configured CNY prices
-// are converted with this fixed rate; other currencies are not returned as USD.
-const CNY_PER_USD = 6.7
+const IMAGES_PACKAGE = "@opencode/ai/providers/openai/images"
 const COST_DECIMALS = 6
 
 // OpenCode's v2 branch: packages/schema/src/model.ts (Model.Info).
@@ -34,9 +33,10 @@ export interface OpencodeModel {
   id: string
   modelID: string
   providerID: string
+  type?: "chat" | "image" | "decision"
   name: string
   family?: string
-  package: typeof RESPONSES_PACKAGE
+  package: string
   capabilities: { tools: boolean; input: Array<string>; output: Array<string> }
   variants: Array<{ id: string; body: Record<string, unknown> }>
   time: { released: number }
@@ -53,15 +53,6 @@ type OpencodeModelCost = Pick<Cost, "input" | "output"> & {
 
 export function isOpencodeUserAgent(userAgent: string | undefined): boolean {
   return /opencode/iu.test(userAgent ?? "")
-}
-
-// OpenCode only understands USD; convert the provider's currency into a
-// multiplier applied to every mapped price. Unsupported currencies return
-// undefined so the USD catalog can be used instead.
-function resolveUsdRate(currency: string | null): number | undefined {
-  if (currency === "USD") return 1
-  if (currency === "CNY") return 1 / CNY_PER_USD
-  return undefined
 }
 
 // Converted prices are rounded to six decimals.
@@ -157,26 +148,34 @@ function toOpencodeModel(
   const metadata = getModelMetadata(provider, rawId, model, config)
   const { modelConfig, defaults, catalog, capabilities, supports, limits } =
     metadata
+  const output =
+    getStringList(model.output_modalities)
+    ?? getStringList(catalog?.modalities?.output)
+    ?? (model.type === "image" ? ["image"] : ["text"])
+  const isImage = output.includes("image") && !output.includes("text")
   const context = metadata.contextWindow ?? 256_000
   const inputLimit = metadata.inputLimit ?? 0
   const supportedMediaTypes = getStringList(
     getRecordField(limits, "vision")?.supported_media_types,
   )
-  const supportPdf = resolveModelPdfSupport(provider, {
-    supportPdf: modelConfig?.supportPdf,
-    supportedMediaTypes,
-    catalogInputModalities: catalog?.modalities?.input,
-    builtinSupportPdf:
-      defaults?.supportPdf
-      ?? builtinProviderModelRegistry.getProviderDefaults(provider)?.supportPdf,
-  })
+  const supportPdf =
+    !isImage
+    && resolveModelPdfSupport(provider, {
+      supportPdf: modelConfig?.supportPdf,
+      supportedMediaTypes,
+      catalogInputModalities: catalog?.modalities?.input,
+      builtinSupportPdf:
+        defaults?.supportPdf
+        ?? builtinProviderModelRegistry.getProviderDefaults(provider)
+          ?.supportPdf,
+    })
   const input = metadata.inputModalities.filter(
     (modality) => modality !== "pdf" || supportPdf,
   )
   if (supportPdf && !input.includes("pdf")) input.push("pdf")
   const efforts = normalizeEffortValues(metadata.reasoningEfforts)
   // OpenCode's cost schema is USD-only; CNY prices are converted at the fixed
-  // CNY_PER_USD rate, while unsupported currencies fall through to the USD
+  // shared currency rate, while unsupported currencies fall through to the USD
   // models.dev catalog.
   const configuredRate = resolveUsdRate(
     resolveProviderCurrency(provider, config?.pricingCurrency),
@@ -196,38 +195,49 @@ function toOpencodeModel(
     id: model.id,
     modelID: model.id,
     providerID: "local",
+    ...(isImage && { type: "image" }),
     name: getStringField(model, "display_name") ?? catalog?.name ?? model.id,
-    family: catalog?.family ?? getStringField(capabilities ?? {}, "family"),
-    package: RESPONSES_PACKAGE,
+    family:
+      catalog?.family
+      ?? getStringField(model, "family")
+      ?? getStringField(capabilities ?? {}, "family"),
+    package: isImage ? IMAGES_PACKAGE : RESPONSES_PACKAGE,
     capabilities: {
       tools:
-        typeof supports?.tool_calls === "boolean" ?
-          supports.tool_calls
+        isImage ? false
+        : typeof supports?.tool_calls === "boolean" ? supports.tool_calls
         : (catalog?.tool_call ?? true),
       input: [...input],
-      output: [...(catalog?.modalities?.output ?? ["text"])],
+      output,
     },
-    variants: efforts.map((effort) => ({
-      id: effort,
-      body: { reasoning: { effort } },
-    })),
+    variants:
+      isImage ?
+        []
+      : efforts.map((effort) => ({
+          id: effort,
+          body: { reasoning: { effort } },
+        })),
     time: { released: Number.isFinite(released) ? released : 0 },
     cost,
     status: catalog?.status ?? (model.preview ? "beta" : "active"),
     enabled: true,
-    limit: {
-      context: Math.min(context, contextWindow),
-      ...(inputLimit > 0 && {
-        input: Math.min(inputLimit, context, contextWindow),
-      }),
-      output: Math.min(context, metadata.maxOutputTokens ?? 32_000),
-    },
+    limit:
+      isImage ?
+        { context: 0, output: 0 }
+      : {
+          context: Math.min(context, contextWindow),
+          ...(inputLimit > 0 && {
+            input: Math.min(inputLimit, context, contextWindow),
+          }),
+          output: Math.min(context, metadata.maxOutputTokens ?? 32_000),
+        },
   }
 }
 
 export async function handleOpencodeModels(c: Context): Promise<Response> {
   const models = await getAgentModels(
     stripInternalRequestHeaders(c.req.raw.headers),
+    { includeImageModels: true },
   )
   const contextWindow = getOpencodeModelContextWindow()
   c.header("Cache-Control", "private, no-store")

@@ -18,7 +18,7 @@ await mock.module("~/services/github/get-copilot-token", () => ({
 }))
 
 const { setupCopilotToken, stopCopilotRefreshLoop } = await import(
-  "../src/lib/token"
+  "../src/lib/auth/token"
 )
 const { state } = await import("../src/lib/state")
 

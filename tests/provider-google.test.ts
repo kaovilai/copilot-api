@@ -15,13 +15,13 @@ import {
   resolveProviderConfigForModel,
   type ResolvedProviderConfig,
 } from "~/lib/config"
-import { forwardError } from "~/lib/error"
+import { forwardError } from "~/lib/http/error"
 import {
   getModelsDevProviderOptions,
   installModelsDevCatalog,
-} from "~/lib/models-dev-cache"
-import { QUICK_PROVIDER_CONFIGS } from "~/lib/quick-providers"
-import { requestContext } from "~/lib/request-context"
+} from "~/lib/catalog/models-dev-cache"
+import { QUICK_PROVIDER_CONFIGS } from "~/lib/config/quick-providers"
+import { requestContext } from "~/lib/http/request-context"
 import * as tokenUsage from "~/lib/token-usage"
 import type {
   AnthropicMessagesPayload,
@@ -357,13 +357,21 @@ describe("OpenCode Go Google forwarding", () => {
           stream ? sse([googleResponse]) : Response.json(googleResponse),
         ),
       )
-      const response = await send(
-        {
-          model,
-          stream,
-          metadata: { user_id: JSON.stringify({ session_id: "go-session" }) },
-        },
-        "/opencode-go/v1/messages",
+      const response = await runWithSession(
+        { rootSessionId: "go-session" },
+        () =>
+          send(
+            {
+              model,
+              stream,
+              metadata: {
+                user_id: JSON.stringify({
+                  session_id: "stale-metadata-session",
+                }),
+              },
+            },
+            "/opencode-go/v1/messages",
+          ),
       )
       expect(response.status).toBe(200)
       if (stream) {
@@ -426,25 +434,25 @@ describe("OpenCode Go Google forwarding", () => {
       rootSessionId: "  ",
       affinity: undefined,
       userId: JSON.stringify({ session_id: "json-session" }),
-      expected: "json-session",
+      expected: undefined,
     },
     {
       rootSessionId: undefined,
       affinity: undefined,
       userId: JSON.stringify({ session_id: "json-session" }),
-      expected: "json-session",
+      expected: undefined,
     },
     {
       rootSessionId: undefined,
       affinity: " ",
       userId: "user_abc_account_def_session_legacy-session",
-      expected: "legacy-session",
+      expected: undefined,
     },
     {
       rootSessionId: undefined,
       affinity: undefined,
       userId: "plain-user",
-      expected: "plain-user",
+      expected: undefined,
     },
     {
       rootSessionId: undefined,
@@ -459,7 +467,7 @@ describe("OpenCode Go Google forwarding", () => {
       expected: undefined,
     },
   ])(
-    "resolves the Go session from $rootSessionId, $affinity and $userId",
+    "uses trace session $rootSessionId or $affinity and ignores metadata $userId",
     async ({ rootSessionId, affinity, userId, expected }) => {
       const response = await runWithSession(
         { rootSessionId, sessionAffinity: affinity },

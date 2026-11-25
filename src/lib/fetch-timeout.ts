@@ -2,7 +2,7 @@ import { setTimeout as delay } from "node:timers/promises"
 
 import consola from "consola"
 
-import { HTTPError } from "~/lib/error"
+import { HTTPError } from "~/lib/http/http-error"
 
 // Pre-response-only retry: safe because nothing has been sent-and-processed
 // yet from the server's perspective, unlike a body stall (already handled by

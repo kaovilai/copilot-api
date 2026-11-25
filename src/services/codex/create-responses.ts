@@ -1,7 +1,5 @@
 import { createHash } from "node:crypto"
 
-import type { ServerSentEventMessage } from "fetch-event-stream"
-
 import type {
   CreateResponsesReturn,
   ResponseInputContent,
@@ -11,23 +9,32 @@ import type {
   ResponsesResult,
   ResponsesStream,
   ResponsesTransport,
+  ResponseStreamEvent,
 } from "~/lib/types/responses"
 
+import { isAntigravityUserAgent } from "~/lib/cli/antigravity"
 import {
   getUpstreamTransportConfig,
   isResponsesApiWebSocketEnabled as isConfiguredResponsesApiWebSocketEnabled,
 } from "~/lib/config"
-import { HTTPError, UpstreamHeadersTimeoutError } from "~/lib/error"
+import { HTTPError, UpstreamHeadersTimeoutError } from "~/lib/http/error"
 import { retryPreResponseFailures } from "~/lib/fetch-timeout"
-import { FULL_MODEL_CATALOG_HEADER } from "~/lib/internal-headers"
+import { getResponsesContinuationSession } from "~/lib/responses-continuation"
+import {
+  readResponsesStreamEvent,
+  type ResponsesStreamChunk,
+} from "~/lib/http/responses-stream-event"
+import { FULL_MODEL_CATALOG_HEADER } from "~/lib/http/internal-headers"
 import { state } from "~/lib/state"
 import {
-  createPooledWebSocketStream,
   createWebSocketUrl,
   type PooledWebSocketRequest,
 } from "~/services/responses-websocket"
+import { CODEX_API_BASE_URL } from "~/services/codex/constants"
+import { createContinuableResponsesWebSocketStream } from "~/services/responses-websocket-continuation"
 import {
   createResponsesSafeStream,
+  decodeResponsesWebSocketChunk,
   encodePoolKeyPart,
   getResponsesStreamTerminalDisposition,
 } from "~/services/responses-websocket-helpers"
@@ -36,23 +43,22 @@ import { fetchUpstreamWithLifecycle } from "~/services/upstream-http"
 import {
   requestContext,
   setPluginRequestActualModel,
-} from "~/lib/request-context"
+} from "~/lib/http/request-context"
 import consola from "consola"
 
-export const CODEX_API_BASE_URL = "https://chatgpt.com/backend-api"
+export { CODEX_API_BASE_URL }
 
 const CODEX_RESPONSE_METADATA_EVENT = "codex.response.metadata"
 const RESPONSE_CREATED_EVENT = "response.created"
 const CODEX_USER_AGENT_VERSION_PATTERN =
   /\bcodex(?:[-_ ][a-z0-9]+)*\/(\d+\.\d+\.\d+)(?:-[a-z0-9.-]+)?(?:\+[a-z0-9.-]+)?(?=$|[\s;)])/iu
+const CODEX_RESPONSES_LITE_HEADER = "x-openai-internal-codex-responses-lite"
 const CODEX_RESPONSES_LITE_METADATA_KEY =
   "ws_request_header_x_openai_internal_codex_responses_lite"
 
 type CodexResponsesWebSocketPayload = ResponsesPayload & {
   type: "response.create"
 }
-
-type ServerSentEventChunk = ServerSentEventMessage
 
 type CodexResponsesWebSocketRequest =
   PooledWebSocketRequest<CodexResponsesWebSocketPayload>
@@ -81,12 +87,13 @@ const STRIPPED_CODEX_REQUEST_HEADERS = new Set([
   "x-api-key",
   "x-forwarded-for",
   "x-forwarded-proto",
+  "x-goog-api-key",
 ])
 
 const STRIPPED_CODEX_WEBSOCKET_HEADERS = new Set([
   "accept",
   "content-type",
-  "x-openai-internal-codex-responses-lite",
+  CODEX_RESPONSES_LITE_HEADER,
   "x-codex-turn-state",
 ])
 
@@ -281,9 +288,7 @@ export function prepareCodexResponsesWebSocketRequest(
         ...websocketPayload.client_metadata,
         "x-codex-ws-stream-request-start-ms": Date.now().toString(),
       }
-      const responsesLite = requestHeaders.get(
-        "x-openai-internal-codex-responses-lite",
-      )
+      const responsesLite = requestHeaders.get(CODEX_RESPONSES_LITE_HEADER)
       if (responsesLite) {
         clientMetadata[CODEX_RESPONSES_LITE_METADATA_KEY] = responsesLite
       } else {
@@ -308,7 +313,7 @@ export async function forwardCodexResponses(
 ): Promise<CreateResponsesReturn> {
   consola.log(`<-- model: ${payload.model}`)
   options.clientSignal?.throwIfAborted()
-  setPluginRequestActualModel(payload.model)
+  setPluginRequestActualModel(payload.model, "codex")
   const transport = resolveCodexResponsesTransport(options.transport)
   if (payload.stream && transport === "websocket") {
     return forwardCodexResponsesOverWebSocket(
@@ -489,6 +494,20 @@ const getTextBlock = (
   return typeof text === "string" ? text : undefined
 }
 
+const resolveCodexResponsesWebSocketAffinity = (
+  headers: Record<string, string>,
+): string | undefined => {
+  const userAgent = headers["user-agent"] ?? ""
+  if (isAntigravityUserAgent(userAgent)) {
+    const sessionId = getResponsesContinuationSession()
+    if (sessionId) return `antigravity:${sessionId}`
+  } else if (/codex/iu.test(userAgent)) {
+    const threadId = headers["thread-id"]?.trim()
+    if (threadId) return `thread:${threadId}`
+  }
+  return undefined
+}
+
 const buildCodexResponsesWebSocketPoolKey = (
   payload: ResponsesPayload,
   headers: Record<string, string>,
@@ -500,23 +519,25 @@ const buildCodexResponsesWebSocketPoolKey = (
     )
     .digest("hex")
     .slice(0, 16)
-  const headerFingerprint = createHash("sha256")
-    .update(
-      JSON.stringify(
-        Object.entries(headers)
-          .filter(([headerName]) => shouldIncludeHeader(headerName))
-          .sort(([left], [right]) => left.localeCompare(right)),
-      ),
-    )
-    .digest("hex")
-    .slice(0, 16)
+  const affinityKey =
+    resolveCodexResponsesWebSocketAffinity(headers)
+    ?? createHash("sha256")
+      .update(
+        JSON.stringify(
+          Object.entries(headers)
+            .filter(([headerName]) => shouldIncludeHeader(headerName))
+            .sort(([left], [right]) => left.localeCompare(right)),
+        ),
+      )
+      .digest("hex")
+      .slice(0, 16)
 
   return [
     "codex",
     resolveCodexResponsesUrl(baseUrl),
     payload.model,
     authFingerprint,
-    headerFingerprint,
+    affinityKey,
   ]
     .map(encodePoolKeyPart)
     .join("|")
@@ -529,16 +550,25 @@ const forwardCodexResponsesOverWebSocket = (
   clientSignal?: AbortSignal,
   onResponseHeaders?: (headers: Headers) => void,
 ): ResponsesStream => {
+  const continuationSession = getResponsesContinuationSession()
   const websocketRequest = prepareCodexResponsesWebSocketRequest(
     payload,
     requestHeaders,
     baseUrl,
   )
+  // The Codex client uses the interrupt frame with Responses Lite.
+  if (
+    continuationSession
+    && requestHeaders.get(CODEX_RESPONSES_LITE_HEADER) === "true"
+  ) {
+    websocketRequest.interruptSignal = clientSignal
+  }
 
   return createCodexResponsesWebSocketStream(
     websocketRequest,
     clientSignal,
     onResponseHeaders,
+    continuationSession,
   )
 }
 
@@ -546,25 +576,34 @@ const createCodexResponsesWebSocketStream = (
   request: CodexResponsesWebSocketRequest,
   clientSignal?: AbortSignal,
   onResponseHeaders?: (headers: Headers) => void,
+  continuationSession?: string,
 ): ResponsesStream => {
   const transportConfig = getUpstreamTransportConfig()
   return createResponsesSafeStream(
     createClientPreflightStream(
       filterCodexResponsesWebSocketMetadata(
-        createPooledWebSocketStream(request, {
-          createChunk: createCodexResponsesWebSocketStreamChunk,
-          maxBufferedBytes: transportConfig.websocketMaxBufferedBytes,
-          maxBufferedMessages: transportConfig.websocketMaxBufferedMessages,
-          getTerminalDisposition: getResponsesStreamTerminalDisposition,
-          openErrorMessage: "Failed to create codex responses websocket",
-          openTimeoutMs: transportConfig.websocketOpenTimeoutMs,
-          poolIdleTimeoutMs: transportConfig.websocketPoolIdleTimeoutMs,
-          streamInactivityTimeoutMs: transportConfig.streamInactivityTimeoutMs,
-          streamErrorMessage:
-            "Upstream connection lost, Codex responses websocket stream error",
-          terminalChunkMissingMessage:
-            "Codex responses websocket ended without a terminal response, retry your request.",
-        }),
+        createContinuableResponsesWebSocketStream(
+          request,
+          {
+            createChunk: createCodexResponsesWebSocketStreamChunk,
+            maxBufferedBytes: transportConfig.websocketMaxBufferedBytes,
+            maxBufferedMessages: transportConfig.websocketMaxBufferedMessages,
+            getTerminalDisposition: getResponsesStreamTerminalDisposition,
+            openErrorMessage: "Failed to create codex responses websocket",
+            openTimeoutMs: transportConfig.websocketOpenTimeoutMs,
+            poolIdleTimeoutMs: transportConfig.websocketPoolIdleTimeoutMs,
+            streamInactivityTimeoutMs:
+              transportConfig.streamInactivityTimeoutMs,
+            streamErrorMessage:
+              "Upstream connection lost, Codex responses websocket stream error",
+            terminalChunkMissingMessage:
+              "Codex responses websocket ended without a terminal response, retry your request.",
+          },
+          {
+            sessionId: continuationSession,
+            clientSignal,
+          },
+        ),
         onResponseHeaders,
       ),
       clientSignal,
@@ -573,10 +612,10 @@ const createCodexResponsesWebSocketStream = (
 }
 
 const filterCodexResponsesWebSocketMetadata = async function* (
-  source: AsyncIterable<ServerSentEventChunk>,
+  source: AsyncIterable<ResponsesStreamChunk>,
   onResponseHeaders?: (headers: Headers) => void,
-): AsyncGenerator<ServerSentEventChunk, void, unknown> {
-  const pendingChunks: Array<ServerSentEventChunk> = []
+): AsyncGenerator<ResponsesStreamChunk, void, unknown> {
+  const pendingChunks: Array<ResponsesStreamChunk> = []
   let responseStarted = false
 
   for await (const chunk of source) {
@@ -610,24 +649,18 @@ const filterCodexResponsesWebSocketMetadata = async function* (
 }
 
 const getCodexResponseMetadataHeaders = (
-  chunk: ServerSentEventChunk,
+  chunk: ResponsesStreamChunk,
 ): Headers | undefined => {
   if (chunk.event !== CODEX_RESPONSE_METADATA_EVENT) return undefined
-  if (!chunk.data || chunk.data === "[DONE]") return new Headers()
 
-  let parsed: { headers?: unknown }
-  try {
-    parsed = JSON.parse(chunk.data) as typeof parsed
-  } catch {
-    return new Headers()
-  }
-
+  const parsed = readResponsesStreamEvent(chunk) as { headers?: unknown } | null
+  const metadataHeaders = parsed?.headers
   const headers = new Headers()
-  if (typeof parsed.headers !== "object" || parsed.headers === null) {
+  if (typeof metadataHeaders !== "object" || metadataHeaders === null) {
     return headers
   }
 
-  for (const [headerName, headerValue] of Object.entries(parsed.headers)) {
+  for (const [headerName, headerValue] of Object.entries(metadataHeaders)) {
     if (typeof headerValue === "string") {
       try {
         headers.set(headerName, headerValue)
@@ -649,41 +682,24 @@ const createClientPreflightStream = async function* <T>(
 
 export const createCodexResponsesWebSocketStreamChunk = (
   data: string,
-): ServerSentEventChunk => {
-  if (data === "[DONE]") {
-    return { data }
-  }
+): ResponsesStreamChunk =>
+  decodeResponsesWebSocketChunk(data, normalizeCodexWebSocketEvent)
 
-  try {
-    const parsed = JSON.parse(data) as {
-      id?: unknown
-      type?: unknown
-      error?: {
-        message: string
-      }
-      message?: string
-    }
+const normalizeCodexWebSocketEvent = (event: ResponseStreamEvent): boolean => {
+  if (event.type !== "error" || !event.error) return false
 
-    // Preserve upstream JSON for normal events; error messages retain the
-    // top-level field expected by existing Responses clients.
-    let forwardedData = data
-    if (parsed.type === "error" && parsed.error) {
-      consola.warn("Codex responses websocket stream error:", parsed.error)
-      parsed.message = parsed.error.message
-      forwardedData = JSON.stringify(parsed)
-    }
-
-    return {
-      event: typeof parsed.type === "string" ? parsed.type : undefined,
-      data: forwardedData,
-      id: typeof parsed.id === "string" ? parsed.id : undefined,
-    }
-  } catch {
-    return { data }
-  }
+  consola.warn("Codex responses websocket stream error:", event.error)
+  event.message = event.error.message
+  return true
 }
 
 function shouldIncludeHeader(headerName: string): boolean {
   const header = headerName.toLowerCase()
-  return !header.includes("trace") && !header.startsWith("x-codex-turn")
+  return (
+    header !== "b3"
+    && header !== "baggage"
+    && !header.startsWith("x-b3-")
+    && !header.includes("trace")
+    && !header.startsWith("x-codex-turn")
+  )
 }

@@ -1,7 +1,8 @@
 import { afterEach, beforeEach, describe, expect, mock, test } from 'bun:test'
-import { Window } from 'happy-dom'
+import type { Window } from 'happy-dom'
 import { act, createElement } from 'react'
 import type { Root } from 'react-dom/client'
+import { createTestDom } from './helpers/dom'
 
 import SettingsModal from '../src/components/SettingsModal'
 import Header from '../src/components/Header'
@@ -52,7 +53,7 @@ let saveServerKeys: ReturnType<
 >
 let alert: ReturnType<typeof mock<(message: string) => void>>
 let onClose: ReturnType<typeof mock<() => void>>
-const previousGlobals = new Map<string, PropertyDescriptor | undefined>()
+let cleanupDom: () => Promise<void>
 
 function persistKeys(update: ServerKeysConfigUpdate): ServerKeysConfig {
   keys = {
@@ -65,25 +66,7 @@ function persistKeys(update: ServerKeysConfigUpdate): ServerKeysConfig {
 beforeEach(async () => {
   settings = structuredClone(initialSettings)
   keys = { apiKeys: ['old-api'], adminApiKey: 'old-admin' }
-  win = new Window({ url: 'http://localhost' })
-  const globals: Record<string, unknown> = {
-    window: win,
-    document: win.document,
-    navigator: win.navigator,
-    HTMLElement: win.HTMLElement,
-    HTMLInputElement: win.HTMLInputElement,
-    HTMLTextAreaElement: win.HTMLTextAreaElement,
-    Event: win.Event,
-    IS_REACT_ACT_ENVIRONMENT: true,
-  }
-  for (const [name, value] of Object.entries(globals)) {
-    previousGlobals.set(name, Object.getOwnPropertyDescriptor(globalThis, name))
-    Object.defineProperty(globalThis, name, {
-      configurable: true,
-      writable: true,
-      value,
-    })
-  }
+  ;({ win, root, container, cleanup: cleanupDom } = await createTestDom())
   saveSettings = mock((update: DesktopSettings) => {
     settings = structuredClone(update)
     return Promise.resolve()
@@ -101,7 +84,7 @@ beforeEach(async () => {
       getBunRuntime: () =>
         Promise.resolve({
           available: true,
-          version: '1.4.0',
+          version: '1.4.4',
           path: '/usr/local/bin/bun',
         }),
       getServerKeys: () => Promise.resolve(structuredClone(keys)),
@@ -110,20 +93,11 @@ beforeEach(async () => {
     },
   })
   Object.defineProperty(win, 'alert', { configurable: true, value: alert })
-  container = document.createElement('div')
-  document.body.append(container)
-  const { createRoot } = await import('react-dom/client')
-  root = createRoot(container)
 })
 
 afterEach(async () => {
   await act(async () => root.unmount())
-  await win.happyDOM.close()
-  for (const [name, descriptor] of previousGlobals) {
-    if (descriptor) Object.defineProperty(globalThis, name, descriptor)
-    else Reflect.deleteProperty(globalThis, name)
-  }
-  previousGlobals.clear()
+  await cleanupDom()
 })
 
 async function render() {
@@ -280,7 +254,7 @@ describe('settings modal partial saves', () => {
     const select = container.querySelector<HTMLSelectElement>('#server-runtime')
     expect(select?.value).toBe('bun')
     expect(container.querySelector('[role="status"]')?.textContent).toContain(
-      'Bun 1.4.0 detected',
+      'Bun 1.4.4 detected',
     )
     if (!select) throw new Error('Missing runtime selector')
     await act(async () => {
@@ -311,7 +285,7 @@ describe('settings modal partial saves', () => {
     await render()
     await click('Startup')
     expect(container.querySelector('[role="status"]')?.textContent).toContain(
-      'Bun >= 1.4.0 was not found',
+      'Bun >= 1.4.4 was not found',
     )
   })
 
@@ -460,15 +434,17 @@ describe('settings modal partial saves', () => {
     expect(alert).not.toHaveBeenCalled()
   })
 
-  test('leaves the admin key out of an API-key-only update', async () => {
+  test('keeps client keys outside security settings and preserves them when saving the admin key', async () => {
     await render()
     await click('Security')
-    const textarea = container.querySelector('textarea')
-    if (!textarea) throw new Error('Missing API key input')
-    await changeText(textarea, 'new-api')
+    expect(container.querySelector('[aria-label="API Keys"]')).toBeNull()
+    expect(container.querySelector('input[aria-label="Key"]')).toBeNull()
+    expect(container.textContent).toContain('API Keys tab')
+    await changeAdminKey()
     await click('Save')
-    expect(saveServerKeys).toHaveBeenCalledWith({ apiKeys: ['new-api'] })
-    expect(keys.adminApiKey).toBe('old-admin')
+    expect(saveServerKeys).toHaveBeenCalledWith({ adminApiKey: 'new-admin' })
+    expect(keys.apiKeys).toEqual(['old-api'])
+    expect(keys.adminApiKey).toBe('new-admin')
     expect(onClose).toHaveBeenCalledTimes(1)
   })
 

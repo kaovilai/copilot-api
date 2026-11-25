@@ -1,5 +1,7 @@
 import { afterEach, beforeEach, expect, mock, test } from "bun:test"
 import { Hono } from "hono"
+import { HTTPError } from "~/lib/http/error"
+import { requestContext } from "~/lib/http/request-context"
 
 import type {
   AnthropicMessagesPayload,
@@ -18,16 +20,16 @@ import type {
 import type {
   CreateResponsesReturn,
   ResponsesPayload,
-  ResponsesResult,
   ResponsesTransport,
 } from "~/lib/types/responses"
 
-import { COMPACT_REQUEST } from "~/lib/compact"
-import { installModelsDevCatalog } from "~/lib/models-dev-cache"
-import { requestContext } from "~/lib/request-context"
+import { COMPACT_REQUEST } from "~/lib/http/compact"
+import { installModelsDevCatalog } from "~/lib/catalog/models-dev-cache"
 import { closeUsageStore, getTokenUsageEventsPage } from "~/lib/token-usage"
 
 import { modelsDevCatalogFixture } from "./fixtures/models-dev-catalog"
+
+import { createResponsesResult } from "./fixtures/responses"
 
 const DB_PATH_ENV = "COPILOT_API_SQLITE_DB_PATH"
 
@@ -171,24 +173,35 @@ test("Messages flow passes the inbound anthropic-version to the Copilot request"
   )
 })
 
-test("messages Chat Completions flow shares the main cache key with dispatched subagents", async () => {
-  const response = await handleWithChatCompletions(
-    createContext(),
+test("messages Chat Completions flow shares the trace root cache key with dispatched subagents", async () => {
+  const response = await requestContext.run(
     {
-      model: "gpt-test",
-      max_tokens: 128,
-      metadata: { user_id: JSON.stringify({ session_id: "root" }) },
-      messages: [{ role: "user", content: "hello" }],
+      traceId: "test-cache",
+      startTime: Date.now(),
+      userAgent: "test",
+      rootSessionId: "root",
+      sessionAffinity: "child",
+      parentSessionId: undefined,
     },
-    {
-      logger,
-      requestId: "request-subagent",
-      subagentMarker: {
-        session_id: "child",
-        agent_id: "agent-a",
-        agent_type: "collab_spawn",
-      },
-    },
+    () =>
+      handleWithChatCompletions(
+        createContext(),
+        {
+          model: "gpt-test",
+          max_tokens: 128,
+          metadata: { user_id: JSON.stringify({ session_id: "root" }) },
+          messages: [{ role: "user", content: "hello" }],
+        },
+        {
+          logger,
+          requestId: "request-subagent",
+          subagentMarker: {
+            session_id: "child",
+            agent_id: "agent-a",
+            agent_type: "subagent",
+          },
+        },
+      ),
   )
 
   expect(response.status).toBe(200)
@@ -1353,9 +1366,459 @@ test("messages Responses flow preserves the configured tool_search alias in non-
   })
 })
 
+test.each([false, true])(
+  "messages Responses flow returns native ToolSearch with stream=%s",
+  async (stream) => {
+    const argumentsValue = {
+      query: "select:mcp__probe__get_issue",
+      max_results: 5,
+    }
+    const call = {
+      type: "tool_search_call" as const,
+      call_id: "call-native-search",
+      arguments: argumentsValue,
+      status: "completed" as const,
+    }
+    createResponses.mockImplementationOnce((payload, options) => {
+      capturedResponsesPayload = payload
+      capturedResponsesOptions = options
+      const result = { ...createResponsesResult(payload.model), output: [call] }
+      if (!stream) return Promise.resolve(result)
+
+      return Promise.resolve(
+        createResponsesStream([
+          {
+            data: JSON.stringify({
+              type: "response.created",
+              response: { ...result, status: "in_progress" },
+            }),
+          },
+          {
+            data: JSON.stringify({
+              type: "response.output_item.added",
+              output_index: 0,
+              item: { ...call, arguments: {} },
+            }),
+          },
+          {
+            data: JSON.stringify({
+              type: "response.output_item.done",
+              output_index: 0,
+              item: call,
+            }),
+          },
+          {
+            data: JSON.stringify({
+              type: "response.completed",
+              response: result,
+            }),
+          },
+        ]) as unknown as CreateResponsesReturn,
+      )
+    })
+
+    const payload: AnthropicMessagesPayload = {
+      model: "gpt-6.1-sol",
+      max_tokens: 128,
+      stream,
+      messages: [{ role: "user", content: "find an issue" }],
+      tools: [
+        { name: "Read", input_schema: { type: "object" } },
+        {
+          name: "ToolSearch",
+          input_schema: {
+            type: "object",
+            properties: {
+              query: { type: "string" },
+              max_results: { type: "number" },
+            },
+            required: ["query", "max_results"],
+          },
+        },
+        {
+          name: "DeferredToolPlaceholder",
+          input_schema: { type: "object" },
+          defer_loading: true,
+        },
+      ],
+    }
+    const app = new Hono()
+    app.post("/", (c) =>
+      handleWithResponsesApi(c, payload, {
+        logger,
+        requestId: "request-native-search",
+        selectedModel: createModel(["/responses"]),
+      }),
+    )
+
+    const response = await app.request("/", { method: "POST" })
+    expect(response.status).toBe(200)
+    expect(capturedResponsesPayload?.tools).toHaveLength(2)
+    expect(
+      capturedResponsesPayload?.tools?.find(
+        (tool) => tool.type === "tool_search",
+      ),
+    ).toMatchObject({ type: "tool_search", execution: "client" })
+    if (!stream) {
+      const body = (await response.json()) as AnthropicResponse
+      expect(body.content).toEqual([
+        {
+          type: "tool_use",
+          id: call.call_id,
+          name: "ToolSearch",
+          input: argumentsValue,
+        },
+      ])
+    } else {
+      const events = parseSseEvents(await response.text())
+      const start = events.find(
+        (event) => event.event === "content_block_start",
+      )
+      const delta = events.find(
+        (event) => event.event === "content_block_delta",
+      )
+      expect(JSON.parse(start?.data ?? "{}") as unknown).toMatchObject({
+        type: "content_block_start",
+        content_block: {
+          type: "tool_use",
+          id: call.call_id,
+          name: "ToolSearch",
+          input: {},
+        },
+      })
+      expect(JSON.parse(delta?.data ?? "{}") as unknown).toMatchObject({
+        type: "content_block_delta",
+        delta: {
+          type: "input_json_delta",
+          partial_json: JSON.stringify(argumentsValue),
+        },
+      })
+      expect(events.at(-1)?.event).toBe("message_stop")
+    }
+  },
+)
+
+test("messages Responses flow stops on invalid JSON, emits an error, and records usage", async () => {
+  const warnings: Array<Array<unknown>> = []
+  createResponses.mockImplementationOnce(() =>
+    Promise.resolve(
+      createResponsesStream([
+        {
+          event: "response.created",
+          data: JSON.stringify({
+            response: {
+              ...createResponsesResult("gpt-test"),
+              status: "in_progress",
+              usage: {
+                input_tokens: 11,
+                output_tokens: 4,
+                total_tokens: 15,
+              },
+            },
+            sequence_number: 1,
+            type: "response.created",
+          }),
+        },
+        { data: "not-json", event: "response.output_text.delta" },
+        {
+          data: JSON.stringify({
+            response: {
+              ...createResponsesResult("gpt-test"),
+              output_text: "should-not-appear",
+              usage: {
+                input_tokens: 99,
+                output_tokens: 99,
+                total_tokens: 198,
+              },
+            },
+            sequence_number: 3,
+            type: "response.completed",
+          }),
+          event: "response.completed",
+        },
+      ]) as unknown as CreateResponsesReturn,
+    ),
+  )
+
+  const payload: AnthropicMessagesPayload = {
+    max_tokens: 128,
+    messages: [{ role: "user", content: "hello" }],
+    model: "gpt-test",
+    stream: true,
+  }
+  const app = new Hono()
+  app.post("/", (c) =>
+    handleWithResponsesApi(c, payload, {
+      logger: {
+        ...logger,
+        warn: (...args: Array<unknown>) => {
+          warnings.push(args)
+        },
+      } as unknown as typeof logger,
+      requestId: "request-invalid-json",
+    }),
+  )
+
+  const response = await app.request("/", { method: "POST" })
+  expect(response.status).toBe(200)
+  const events = parseSseEvents(await response.text())
+
+  expect(events.some((event) => event.event === "message_start")).toBe(true)
+  expect(events.some((event) => event.data.includes("should-not-appear"))).toBe(
+    false,
+  )
+  expect(events.at(-1)?.event).toBe("error")
+  expect(JSON.parse(events.at(-1)?.data ?? "{}")).toEqual({
+    error: {
+      message: "Responses stream ended without completion, retry your request.",
+      type: "api_error",
+    },
+    type: "error",
+  })
+  expect(
+    warnings.some((warning) => String(warning[0]).includes("not valid JSON")),
+  ).toBe(true)
+
+  const usageEvents = await getTokenUsageEventsPage({
+    page: 1,
+    pageSize: 10,
+    period: "today",
+  })
+  expect(usageEvents.items).toHaveLength(1)
+  expect(usageEvents.items[0]).toMatchObject({
+    endpoint: "responses",
+    input_tokens: 11,
+    model: "gpt-test",
+    output_tokens: 4,
+    total_tokens: 15,
+  })
+})
+
+test("messages Responses flow skips a [DONE] sentinel and keeps translating", async () => {
+  createResponses.mockImplementationOnce(() =>
+    Promise.resolve(
+      createResponsesStream([
+        {
+          data: JSON.stringify({
+            response: createResponsesResult("gpt-test"),
+            sequence_number: 1,
+            type: "response.created",
+          }),
+          event: "response.created",
+        },
+        { data: "[DONE]" },
+        {
+          data: JSON.stringify({
+            content_index: 0,
+            delta: "kept",
+            item_id: "item-1",
+            output_index: 0,
+            sequence_number: 2,
+            type: "response.output_text.delta",
+          }),
+          event: "response.output_text.delta",
+        },
+      ]) as unknown as CreateResponsesReturn,
+    ),
+  )
+
+  const payload: AnthropicMessagesPayload = {
+    max_tokens: 128,
+    messages: [{ role: "user", content: "hello" }],
+    model: "gpt-test",
+    stream: true,
+  }
+  const app = new Hono()
+  app.post("/", (c) =>
+    handleWithResponsesApi(c, payload, {
+      logger,
+      requestId: "request-done",
+    }),
+  )
+
+  const response = await app.request("/", { method: "POST" })
+  expect(response.status).toBe(200)
+  const events = parseSseEvents(await response.text())
+  const text = events
+    .filter((event) => event.event === "content_block_delta")
+    .map((event) => event.data)
+    .join("\n")
+
+  expect(text).toContain("kept")
+  expect(events.at(-1)?.event).toBe("error")
+  expect(events.some((event) => event.data.includes("not valid JSON"))).toBe(
+    false,
+  )
+})
+
+test("messages Responses flow enables vision option for tool_result images", async () => {
+  const payload: AnthropicMessagesPayload = {
+    max_tokens: 128,
+    messages: [
+      { role: "user", content: "capture screenshot" },
+      {
+        role: "assistant",
+        content: [
+          {
+            id: "toolu_shot_1",
+            input: {},
+            name: "take_screenshot",
+            type: "tool_use",
+          },
+        ],
+      },
+      {
+        role: "user",
+        content: [
+          {
+            content: [
+              {
+                source: {
+                  data: "AAAA",
+                  media_type: "image/png",
+                  type: "base64",
+                },
+                type: "image",
+              },
+            ],
+            tool_use_id: "toolu_shot_1",
+            type: "tool_result",
+          },
+        ],
+      },
+    ],
+    model: "gpt-test",
+    stream: false,
+  }
+
+  const response = await handleWithResponsesApi(createContext(), payload, {
+    logger,
+    requestId: "request-tool-result-image",
+  })
+
+  expect(response.status).toBe(200)
+  expect(createResponses).toHaveBeenCalledTimes(1)
+  expect(createResponses.mock.calls[0][1]).toMatchObject({
+    vision: true,
+  })
+})
+
+test("messages API flows only apply schema conversion and capability checks when enabled", async () => {
+  const schemaPayload: AnthropicMessagesPayload = {
+    model: "gpt-test",
+    max_tokens: 128,
+    messages: [{ role: "user", content: "return json" }],
+    output_config: {
+      format: {
+        type: "json_schema",
+        schema: {
+          type: "object",
+          properties: { ok: { type: "boolean" } },
+        },
+      },
+    },
+  }
+
+  const chatRes = await handleWithChatCompletions(
+    createContext(),
+    schemaPayload,
+    {
+      logger,
+      requestId: "req-so-chat",
+      selectedModel: createModel([], { structuredOutputs: true }),
+      forwardStructuredOutput: true,
+    },
+  )
+  expect(chatRes.status).toBe(200)
+  expect(capturedPayload?.response_format).toEqual({
+    type: "json_schema",
+    json_schema: {
+      name: "response",
+      schema: {
+        type: "object",
+        properties: { ok: { type: "boolean" } },
+      },
+    },
+  })
+
+  const legacyOptions = {
+    logger,
+    requestId: "req-so-messages",
+    selectedModel: createModel([], { structuredOutputs: false }),
+  }
+  const legacyChat = await handleWithChatCompletions(
+    createContext(),
+    schemaPayload,
+    legacyOptions,
+  )
+  expect(legacyChat.status).toBe(200)
+  expect(capturedPayload?.response_format).toBeUndefined()
+
+  const legacyResponses = await handleWithResponsesApi(
+    createContext(),
+    schemaPayload,
+    legacyOptions,
+  )
+  expect(legacyResponses.status).toBe(200)
+  expect(capturedResponsesPayload?.text).toBeUndefined()
+
+  const legacyMessages = await handleWithMessagesApi(
+    createContext(),
+    schemaPayload,
+    legacyOptions,
+  )
+  expect(legacyMessages.status).toBe(200)
+  expect(capturedMessagesPayload?.output_config?.format).toEqual(
+    schemaPayload.output_config?.format,
+  )
+
+  const expectBadRequest = async (run: () => Promise<Response>) => {
+    let caught: unknown
+    try {
+      await run()
+    } catch (error) {
+      caught = error
+    }
+    expect(caught).toBeInstanceOf(HTTPError)
+    expect((caught as HTTPError).response.status).toBe(400)
+  }
+
+  await expectBadRequest(() =>
+    handleWithChatCompletions(createContext(), schemaPayload, {
+      logger,
+      requestId: "req-so-chat-unsupported",
+      selectedModel: createModel([], { structuredOutputs: false }),
+      forwardStructuredOutput: true,
+    }),
+  )
+
+  await expectBadRequest(() =>
+    handleWithResponsesApi(createContext(), schemaPayload, {
+      logger,
+      requestId: "req-so-resp-unsupported",
+      selectedModel: createModel(["/responses"], { structuredOutputs: false }),
+      forwardStructuredOutput: true,
+    }),
+  )
+
+  await expectBadRequest(() =>
+    handleWithMessagesApi(createContext(), schemaPayload, {
+      logger,
+      requestId: "req-so-msg-unsupported",
+      selectedModel: createModel(["/v1/messages"], {
+        structuredOutputs: false,
+      }),
+      forwardStructuredOutput: true,
+    }),
+  )
+})
+
 const createModel = (
   supportedEndpoints: Array<string>,
-  options: { reasoningEffort?: Array<string> } = {},
+  options: {
+    reasoningEffort?: Array<string>
+    structuredOutputs?: boolean
+  } = {},
 ): Model => ({
   capabilities: {
     family: "gpt",
@@ -1363,10 +1826,14 @@ const createModel = (
       max_prompt_tokens: 128000,
     },
     object: "model_capabilities",
-    supports:
-      options.reasoningEffort === undefined ?
+    supports: {
+      ...(options.reasoningEffort === undefined ?
         {}
-      : { reasoning_effort: options.reasoningEffort },
+      : { reasoning_effort: options.reasoningEffort }),
+      ...(options.structuredOutputs === undefined ?
+        {}
+      : { structured_outputs: options.structuredOutputs }),
+    },
     tokenizer: "o200k_base",
     type: "chat",
   },
@@ -1403,6 +1870,15 @@ async function* createMessagesStream(
   }
 }
 
+async function* createResponsesStream(
+  chunks: Array<{ data?: string; event?: string }>,
+): AsyncGenerator<{ data?: string; event?: string }> {
+  for (const chunk of chunks) {
+    await Promise.resolve()
+    yield chunk
+  }
+}
+
 async function* createChatCompletionsStream(
   chunks: Array<ChatCompletionChunk | string>,
 ): AsyncGenerator<{ data: string }> {
@@ -1426,23 +1902,3 @@ const parseSseEvents = (
   }
   return events
 }
-
-const createResponsesResult = (model: string): ResponsesResult => ({
-  created_at: 0,
-  error: null,
-  id: "resp-test",
-  incomplete_details: null,
-  instructions: null,
-  metadata: null,
-  model,
-  object: "response",
-  output: [],
-  output_text: "",
-  parallel_tool_calls: false,
-  status: "completed",
-  temperature: null,
-  tool_choice: "auto",
-  tools: [],
-  top_p: null,
-  usage: null,
-})

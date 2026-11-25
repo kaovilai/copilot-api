@@ -7,7 +7,7 @@
 <p align="center">
   <strong>Universal AI Gateway</strong><br />
   One Gateway. Any Client. Multiple AI Providers.<br />
-  Chat Completions &middot; OpenAI Responses &middot; Anthropic Messages
+  Chat Completions &middot; OpenAI Responses &middot; Anthropic Messages &middot; Gemini REST
 </p>
 
 <p align="center">
@@ -22,14 +22,14 @@
   English | <a href="README.zh-CN.md">简体中文</a>
 </p>
 
-Copilot API is a local AI gateway that connects Claude Code, OpenCode, Codex, and other clients to GitHub Copilot, the built-in Codex and xAI providers, and third-party model providers through a unified API.
+Copilot API is a local AI gateway that connects Claude Code, OpenCode, Codex, Antigravity CLI (`agy`), and other clients to GitHub Copilot, the built-in Codex and xAI providers, and third-party model providers through a unified API.
 
 ## Highlights
 
-- **Unified API Gateway**: Serve OpenAI-compatible Chat Completions (`/v1/chat/completions`), the OpenAI Responses API (`/v1/responses`), and Anthropic-compatible Messages (`/v1/messages`) from one local endpoint.
+- **Unified API Gateway** serving OpenAI-compatible Chat Completions (`/v1/chat/completions`), OpenAI Responses (`/v1/responses`), Anthropic-compatible Messages (`/v1/messages`), and Gemini REST (under `/v1beta/models`) from one local address.
 - **Multi-Provider**: Route GitHub Copilot, the built-in `codex` and `xai` providers, and third-party providers (Kimi, DeepSeek, DashScope, OpenRouter, OpenCode Go, Google Gemini, or a custom provider from models.dev) behind the same gateway. GitHub Copilot is optional — with at least one enabled provider, the server starts in provider-only mode without a GitHub token.
-- **Coding Agent Ready**: First-class setups for Claude Code, OpenCode, and Codex, including settings.json gateway model discovery and a merged model catalog for Codex.
-- **Streaming & WebSocket**: SSE streaming on all three client-facing protocols. Upstream Copilot Responses traffic selects WebSocket or HTTP from each model's advertised endpoints; streamed Responses traffic for the built-in `codex` provider uses WebSocket by default and uses HTTP when `useResponsesApiWebSocket` is disabled.
+- **Coding Agent Ready** with setups for Claude Code, OpenCode, Codex, and Antigravity CLI, including model discovery in Claude Code and a merged model catalog for Codex.
+- **Streaming & WebSocket** support includes SSE for all four client-facing protocols. Upstream Copilot Responses traffic selects WebSocket or HTTP from each model's advertised endpoints. The built-in `codex` provider streams Responses over WebSocket by default and uses HTTP when `useResponsesApiWebSocket` is disabled.
 - **Desktop App**: Electron GUI with GitHub Copilot sign-in, Codex and xAI OAuth, provider configuration, token usage, logs, and one-click start/stop.
 
 ## Quick Start
@@ -68,26 +68,29 @@ curl http://localhost:4141/v1/models
 ```
 
 > [!NOTE]
-> Token usage storage requires Node.js >= 22.13.0 or Bun. See [Using with npx](docs/guides/en/getting-started.md#using-with-npx) for details.
+> Token usage storage requires Bun >= 1.4.4 or Node.js with built-in `node:sqlite` (22.13.0+). Use a patched Node.js release from the warning above. See [Using with npx](docs/guides/en/getting-started.md#using-with-npx) for details.
 
-From here, jump to the guide for your client: [Claude Code](docs/guides/en/claude-code.md#using-with-claude-code), [OpenCode](docs/guides/en/opencode.md#using-with-opencode), [Codex](docs/guides/en/codex.md#using-with-codex), [DeepSeek Harness](docs/guides/en/dsh.md#using-with-deepseek-harness), or run it with [Docker](docs/guides/en/docker.md#using-with-docker).
+Continue with [Claude Code](docs/guides/en/claude-code.md#using-with-claude-code), [OpenCode](docs/guides/en/opencode.md#using-with-opencode), [Codex](docs/guides/en/codex.md#using-with-codex), [Antigravity CLI](docs/guides/en/agy-cli.md#connect-to-copilot-api), [DeepSeek Harness](docs/guides/en/dsh.md#using-with-deepseek-harness), or [Docker](docs/guides/en/docker.md#using-with-docker).
+
+**Codex Multi-Agent compatibility:** [`codexMultiAgentV1`](docs/guides/en/configuration.md#codex-multi-agent-compatibility) optionally advertises V1; V2 remains the default. Apply the gateway setting and start a **new Codex session**. Catalog refreshes do not switch an already-selected session version, and resumed sessions retain their recorded version. Explicit CLI overrides may take precedence.
 
 ## Compatibility
 
 Every client talks to the same local endpoint. The gateway routes each request to GitHub Copilot, the built-in `codex` or `xai` provider, or a configured third-party provider, translating between protocols when the provider speaks a different one.
 
-**Client / Protocol Matrix**
+**Client / Protocol Matrix** (documented setups)
 
-| Client | Chat Completions | Responses | Anthropic Messages | Recommended |
-|---|:---:|:---:|:---:|---|
-| Claude Code | — | — | ✅ Native / Adapter | Anthropic Messages |
-| OpenCode | ✅ Native | ✅ Native / Adapter | ✅ Native / Adapter | Anthropic Messages |
-| Codex | — | ✅ Native / Adapter | — | Responses |
-| DeepSeek Harness | — | ✅ Native / Adapter | ✅ Native / Adapter | Responses |
-| OpenAI-compatible clients | ✅ Native | ✅ Native / Adapter | — | Chat Completions |
-| Anthropic-compatible clients | — | — | ✅ Native / Adapter | Anthropic Messages |
+| Client | Chat Completions | Responses | Anthropic Messages | Gemini REST | Recommended |
+|---|:---:|:---:|:---:|:---:|---|
+| Claude Code | — | — | ✅ Native / Adapter | — | Anthropic Messages |
+| OpenCode | ✅ Native | ✅ Native / Adapter | ✅ Native / Adapter | — | v2: Responses; v1: Messages |
+| Codex | — | ✅ Native / Adapter | — | — | Responses |
+| [Antigravity CLI (agy)](docs/guides/en/agy-cli.md#connect-to-copilot-api) | — | — | — | ✅ Native / Adapter | Gemini REST |
+| DeepSeek Harness | — | ✅ Native / Adapter | ✅ Native / Adapter | — | Responses |
+| OpenAI-compatible clients | ✅ Native | ✅ Native / Adapter | — | — | Chat Completions |
+| Anthropic-compatible clients | — | — | ✅ Native / Adapter | — | Anthropic Messages |
 
-**Providers and protocols.** Protocol support is model-specific. Chat Completions requires a native endpoint, while Responses and Messages can use supported adapters. The built-in `codex` provider uses Responses natively; third-party providers can use `anthropic`, `openai-compatible`, or `openai-responses`, with per-model overrides.
+**Providers and protocols.** Protocol support is model-specific. Chat Completions requires a native endpoint. Responses, Messages, and Gemini REST can use supported adapters. The built-in `codex` provider uses Responses natively. Third-party providers can use `anthropic`, `openai-compatible`, `openai-responses`, or `google` (native Gemini REST), with per-model overrides.
 
 ## Desktop App
 
@@ -100,18 +103,22 @@ Prefer a GUI? The Electron desktop app in `desktop/` covers GitHub Copilot sign-
 
 Windows x64 (`.exe`), macOS Apple Silicon (`.dmg`), and Linux x64 (`.AppImage`) packages are published in [GitHub Releases](https://github.com/caozhiyuan/copilot-api/releases). See [Electron Desktop App](docs/guides/en/desktop.md#electron-desktop-app) for full setup and advanced configuration.
 
+After the initial full-package installation, subsequent updates normally use differential downloads to reduce download size. On macOS, the first update may still download a complete DMG to establish the cache. If the cache is unavailable or differential downloading fails, the app falls back to a full download.
+
 ## Documentation
 
 | Guide | Contents |
 | --- | --- |
-| [Installation and Startup](docs/guides/en/getting-started.md) | Prerequisites, project overview, `npx` and source runs, provider-only mode without Copilot, and gateway API key setup |
+| [Installation and Startup](docs/guides/en/getting-started.md) | Prerequisites, project overview, `npx` and source runs, running without GitHub Copilot, and gateway API key setup |
 | [Claude Code](docs/guides/en/claude-code.md) | settings.json, gateway model discovery, model mappings, auto-compact window, and WebSearch behavior |
 | [OpenCode](docs/guides/en/opencode.md) | v2 Responses plugin and automatic model discovery, native compaction, model capabilities and pricing, context limits, and v1 Anthropic SDK setup |
 | [Codex](docs/guides/en/codex.md) | A full `config.toml` provider block, `GITHUB_COPILOT_API_KEY` environment variable setup, auto-review model mapping, generating `model_catalog.json`, and the merged model picker catalog with protocol adapters |
+| [AGY CLI](docs/guides/en/agy-cli.md) | Gemini gateway setup, cross-platform settings, and [AGY CLI Statusline](docs/guides/en/agy-cli.md#agy-cli-statusline) |
 | [DeepSeek Harness](docs/guides/en/dsh.md) | Install `dsh-copilot-api`, save the gateway API key, and choose Responses or Messages |
 | [Docker](docs/guides/en/docker.md) | Docker Compose quick start, the `/data` persistent mount and its ownership repair, supported environment variables, and host interface binding |
 | [Desktop App](docs/guides/en/desktop.md) | Copilot sign-in, Codex OAuth account switching, API-key providers, one-click start / stop, shared model mappings, advanced settings, and per-platform installers |
-| [Plugins and Tool Search](docs/guides/en/integrations.md) | The Responses `tool_search` MCP bridge (not needed on opencode v2, which already defers tools through Code Mode), Claude Code `agent-inject` and `tool-search` marketplace plugins, and the opencode subagent marker plugin |
+| [Plugins and Tool Search](docs/guides/en/integrations.md) | The Responses `tool_search` MCP bridge (not needed on opencode v2, which already defers tools through Code Mode), Claude Code `agent-inject` and `tool-search` marketplace plugins, and the OpenCode session context plugin |
+| [Gateway event plugins](docs/guides/en/gateway-plugins.md) | Observe request state, timing, and usage with server-side plugins |
 | [Usage Monitoring](docs/guides/en/usage.md) | The usage viewer URL and query parameters, period selectors, Copilot quota progress, token and cost metric cards, trend charts, and paginated request events |
 | [CLI Reference](docs/guides/en/cli.md) | Command structure, global options, and the full option sets for the `start`, `auth`, and `debug` subcommands with example usage |
 | [Configuration Reference](docs/guides/en/configuration.md) | Every `config.json` field: gateway and admin API keys, provider definitions, model mappings, WebSocket and HTTP transport, timeouts, and context management |

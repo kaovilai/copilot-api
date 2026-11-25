@@ -2,33 +2,37 @@
 
 import { defineCommand } from "citty"
 import consola from "consola"
-import { serve } from "srvx"
+import { setTimeout as delay } from "node:timers/promises"
+import { serve, type ServerHandler } from "srvx"
 
 import { runProviderSetup } from "./auth"
-import { isGitHubCopilotEnabled } from "./lib/github-copilot-provider"
+import { isGitHubCopilotEnabled } from "./lib/providers/github-copilot-provider"
 import { listEnabledProviders, mergeConfigWithDefaults } from "./lib/config"
-import { setupCopilotRuntime } from "~/lib/copilot-runtime"
+import { setupCopilotRuntime } from "~/lib/providers/copilot-runtime"
 import {
   GITHUB_TOKEN_ENV,
   readGitHubToken,
   readGitHubTokenFromEnv,
-} from "./lib/credential-store"
-import { startModelsDevCache } from "./lib/models-dev-cache"
-import { initOpencodeVersion } from "./lib/opencode"
-import { ensurePaths, PATHS } from "./lib/paths"
-import { initProxyFromEnv } from "./lib/proxy"
+} from "./lib/auth/credential-store"
+import { startModelsDevCache } from "./lib/catalog/models-dev-cache"
+import { initOpencodeVersion } from "./lib/providers/opencode"
+import { ensurePaths, PATHS } from "./lib/storage/paths"
+import { initProxyFromEnv } from "./lib/http/proxy"
 import {
   getConfiguredApiKeys,
   getMissingApiKeysMessage,
-} from "./lib/request-auth"
+} from "./lib/auth/request-auth"
 import {
   DEFAULT_SERVER_HOST,
   formatServerUrl,
   resolveServerBinding,
-} from "./lib/server-host"
+} from "./lib/http/server-host"
 import { state } from "./lib/state"
-import { loadGatewayPlugins } from "./lib/gateway-plugins"
-import { registerProcessCleanup } from "./lib/process-cleanup"
+import { loadGatewayPlugins } from "./lib/plugins/gateway-plugins"
+import {
+  registerProcessCleanup,
+  registerProcessShutdownDrain,
+} from "./lib/process-cleanup"
 
 interface RunServerOptions {
   host: string
@@ -106,12 +110,12 @@ async function setupProviderMode(): Promise<void> {
 }
 
 export async function runServer(options: RunServerOptions): Promise<void> {
-  const tlsModule = await import("./lib/tls")
+  const tlsModule = await import("./lib/http/tls")
   tlsModule.enableSystemCACompat()
 
   consola.options.throttle = 0
 
-  mergeConfigWithDefaults()
+  const config = mergeConfigWithDefaults()
 
   const configuredApiKeys = getConfiguredApiKeys()
   const binding = resolveServerBinding(
@@ -165,16 +169,39 @@ export async function runServer(options: RunServerOptions): Promise<void> {
     port: options.port,
     baseDir: PATHS.APP_DIR,
   })
+  if (plugins) registerProcessCleanup(() => plugins.close())
   const server = createServer({
     networkExposed: binding.networkExposed,
     port: options.port,
     plugins,
   })
 
+  const { initializeApiKeyQuotas } = await import(
+    "./lib/auth/api-key-quota-runtime"
+  )
+  const { startTokenUsageRetention } = await import(
+    "./lib/token-usage/retention"
+  )
+  const { startVideoUsageSettlement } = await import("./lib/video-settlement")
+  const { settlePendingVideoUsage } = await import(
+    "./services/xai/video-usage-settlement"
+  )
+  await startTokenUsageRetention()
+  if (config.auth?.apiKeyConfigs?.some((key) => key.quota)) {
+    try {
+      await initializeApiKeyQuotas()
+    } catch (error) {
+      consola.warn("Failed to load API key quotas", error)
+    }
+  }
+  startVideoUsageSettlement(settlePendingVideoUsage)
+
   const listener = serve({
-    fetch: server.fetch,
+    fetch: server.fetch as ServerHandler,
     hostname: binding.hostname,
     port: options.port,
+    // The process cleanup runtime drains the listener before closing storage.
+    gracefulShutdown: false,
     bun: {
       idleTimeout: 0,
       // SO_REUSEPORT: a replacement gateway can bind alongside this one and the
@@ -183,24 +210,21 @@ export async function runServer(options: RunServerOptions): Promise<void> {
       reusePort: true,
     },
   })
-
-  // SIGTERM is how a restart swap retires this process: stop accepting, let
-  // in-flight requests finish (capped at 30s), then let the remaining cleanups
-  // (plugin close, exit) run. The replacement already holds the port, so no
-  // request is refused and none is cut mid-response.
-  registerProcessCleanup(async () => {
-    const srv = listener as {
-      stop?: (closeActiveConnections?: boolean) => void
-      pendingRequests?: number
-    }
-    if (typeof srv?.stop !== "function") return
-    srv.stop(false)
-    const deadline = Date.now() + 30_000
-    while ((srv.pendingRequests ?? 0) > 0 && Date.now() < deadline) {
-      await new Promise((resolve) => setTimeout(resolve, 100))
+  registerProcessShutdownDrain(async () => {
+    const timeoutMs =
+      (Number.parseInt(process.env.SERVER_SHUTDOWN_TIMEOUT ?? "", 10) || 5)
+      * 1000
+    const timer = new AbortController()
+    try {
+      const drained = await Promise.race([
+        listener.close().then(() => true),
+        delay(timeoutMs, false, { signal: timer.signal }),
+      ])
+      if (!drained) await listener.close(true)
+    } finally {
+      timer.abort()
     }
   })
-  if (plugins) registerProcessCleanup(() => plugins.close())
 }
 
 export const start = defineCommand({
@@ -218,7 +242,7 @@ export const start = defineCommand({
       alias: "p",
       type: "string",
       default: "4141",
-      description: "Port to listen on",
+      description: "Port to listen on (1-65535)",
     },
     verbose: {
       alias: "v",
@@ -243,10 +267,15 @@ export const start = defineCommand({
       description: "Initialize proxy from environment variables",
     },
   },
-  run({ args }) {
+  async run({ args }) {
+    const port = parseServerPort(args.port)
+    if (port === null) {
+      return
+    }
+
     return runServer({
       host: args.host,
-      port: Number.parseInt(args.port, 10),
+      port,
       verbose: args.verbose,
       githubToken: args["github-token"],
       showToken: args["show-token"],
@@ -254,3 +283,26 @@ export const start = defineCommand({
     })
   },
 })
+
+export function parseServerPort(value: string): number | null {
+  const trimmed = value.trim()
+  if (!/^[0-9]+$/.test(trimmed)) {
+    rejectServerPort(value)
+    return null
+  }
+
+  const port = Number(trimmed)
+  if (!Number.isInteger(port) || port < 1 || port > 65535) {
+    rejectServerPort(value)
+    return null
+  }
+
+  return port
+}
+
+function rejectServerPort(value: string): void {
+  process.stderr.write(
+    `Invalid port ${JSON.stringify(value)}. Usage: copilot-api start --port <1-65535>\n`,
+  )
+  process.exitCode = 1
+}

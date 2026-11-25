@@ -1,22 +1,30 @@
-import { builtinProviderModelRegistry } from '../../src/lib/builtin-provider-models'
+import {
+  builtinProviderModelRegistry,
+  getBuiltinProviderImageModelRecords,
+} from '../../src/lib/catalog/builtin-provider-models'
 import {
   readEditableConfigFromDisk,
   type AppConfig,
-} from '../../src/lib/config-store'
+} from '../../src/lib/config/config-store'
 import {
   getModelsDevProviderModelIds,
   loadCachedModelsDevCatalog,
-} from '../../src/lib/models-dev-cache'
+} from '../../src/lib/catalog/models-dev-cache'
 import type { ProviderModelOptions } from '../../src/lib/types/provider-management'
 import {
   isProviderModelVisible,
   resolveProviderModelsDevId,
-} from '../../src/lib/provider-model-catalog'
+} from '../../src/lib/catalog/provider-model-catalog'
 
 export function buildProviderModelOptions(
   config: AppConfig,
   sources = {
-    builtin: (name: string) => builtinProviderModelRegistry.getModelIds(name),
+    builtin: (name: string) => [
+      ...builtinProviderModelRegistry.getModelIds(name),
+      ...getBuiltinProviderImageModelRecords(name)
+        .map((model) => model.id)
+        .filter((id): id is string => typeof id === 'string'),
+    ],
     catalog: getModelsDevProviderModelIds,
   },
 ): ProviderModelOptions {
@@ -32,9 +40,12 @@ export function buildProviderModelOptions(
           ...Object.keys(provider.models ?? {}),
           ...(provider.agentsModels ?? []),
         ]
-        // Copilot models are discovered from the account, not static catalogs.
+        // Copilot chat models come from the account; image defaults are local.
         if (name === 'github-copilot') {
-          return [name, [...new Set(configured)].sort()]
+          return [
+            name,
+            [...new Set([...configured, ...sources.builtin(name)])].sort(),
+          ]
         }
         return [
           name,

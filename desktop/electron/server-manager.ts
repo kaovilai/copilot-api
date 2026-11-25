@@ -7,6 +7,7 @@ import { StringDecoder } from 'node:string_decoder'
 
 import type {
   DesktopProxySettings,
+  ServerLogRecord,
   ServerRuntime,
   ServerStatus,
 } from '../src/types/ipc'
@@ -16,11 +17,12 @@ import {
   isInvalidBindErrorCode,
   normalizeServerHostname,
   resolveClientHostnameOrDefault,
-} from '../../src/lib/server-host'
+} from '../../src/lib/http/server-host'
 import { applyDesktopProxySettingsToEnv } from './electron-proxy-config'
 import { detectBunRuntime } from './bun-runtime'
 import { tMain } from './i18n'
 import { buildServerStartArgs, buildServerStartEnv } from './server-start-args'
+import { appendServerLog } from '../shared/server-logs'
 
 interface ServerProcess extends EventEmitter {
   stdout: NodeJS.ReadableStream | null
@@ -29,14 +31,14 @@ interface ServerProcess extends EventEmitter {
 }
 
 let serverProcess: ServerProcess | null = null
+let lifecycleQueue: Promise<void> = Promise.resolve()
 let currentPort = 4141
 let currentHost = ''
 let statusCallback: ((status: ServerStatus) => void) | null = null
-let logCallback: ((log: string) => void) | null = null
-// Ring buffer for logs, capped at 2000 entries for log panel replay.
-const LOG_BUFFER_MAX = 2000
-const STOP_TIMEOUT_MS = 5000
-const logBuffer: string[] = []
+let logCallback: ((log: ServerLogRecord) => void) | null = null
+const STOP_TIMEOUT_MS = 7000 // Leave time for cleanup after the default 5s drain.
+let nextLogSequence = 0
+const serverLogs: ServerLogRecord[] = []
 const ESC_CHAR_CODE = 27
 const BEL_CHAR_CODE = 7
 const CSI_CHAR_CODE = 0x9b
@@ -131,12 +133,13 @@ function stripAnsi(input: string): string {
 }
 
 function emitLog(message: string): void {
-  const sanitizedMessage = stripAnsi(message)
-  if (sanitizedMessage.length === 0) return
+  const text = stripAnsi(message)
+  if (text.length === 0) return
 
-  logBuffer.push(sanitizedMessage)
-  if (logBuffer.length > LOG_BUFFER_MAX) logBuffer.shift()
-  logCallback?.(sanitizedMessage)
+  nextLogSequence += 1
+  const log = { sequence: nextLogSequence, text }
+  appendServerLog(serverLogs, log)
+  logCallback?.(log)
 }
 
 function createLogStream() {
@@ -159,7 +162,7 @@ export function onStatusChange(cb: (status: ServerStatus) => void): void {
   statusCallback = cb
 }
 
-export function onLog(cb: (log: string) => void): void {
+export function onLog(cb: (log: ServerLogRecord) => void): void {
   logCallback = cb
 }
 
@@ -201,7 +204,25 @@ interface ServerStartOptions {
   proxy?: DesktopProxySettings
 }
 
-export async function startServer(
+function serializeServerLifecycle<T>(operation: () => Promise<T>): Promise<T> {
+  const result = lifecycleQueue.then(operation)
+  lifecycleQueue = result.then(
+    () => undefined,
+    () => undefined,
+  )
+  return result
+}
+
+export function startServer(
+  port: number,
+  serverOptions?: ServerStartOptions,
+): Promise<ServerStatus> {
+  return serializeServerLifecycle(() =>
+    startServerUnlocked(port, serverOptions),
+  )
+}
+
+async function startServerUnlocked(
   port: number,
   serverOptions?: ServerStartOptions,
 ): Promise<ServerStatus> {
@@ -218,17 +239,16 @@ export async function startServer(
   // Resolve the runtime before stopping a healthy server. Never use an old Bun.
   const bun =
     serverOptions?.runtime !== 'node' ? await detectBunRuntime() : null
-  // Validate the host before touching a running server, so an invalid host
-  // never stops a healthy instance.
-  // When the port changes, a conflicting listener cannot be our own
-  // previous instance. Probe first so an occupied new port fails fast
-  // without stopping the running server. The same-port case still stops
-  // first, because our own listener would otherwise report as a conflict
-  // (including wildcard/loopback overlap on the same port).
-  if (serverProcess && port !== currentPort) {
-    const preProbe = await checkPortAvailable(port, bindHostname)
+  // Use an ephemeral port to validate a changed host without conflicting
+  // with our own listener during a same-port restart.
+  const portChanged = port !== currentPort
+  if (serverProcess && (portChanged || host !== currentHost)) {
+    const preProbe = await checkPortAvailable(
+      portChanged ? port : 0,
+      bindHostname,
+    )
     if (!preProbe.available) {
-      if (isInvalidBindErrorCode(preProbe.code)) {
+      if (!portChanged || isInvalidBindErrorCode(preProbe.code)) {
         return {
           running: false,
           error: await tMain('server.invalidHost'),
@@ -290,8 +310,9 @@ async function launchServer(
     }
   }
 
-  // Clear the previous log buffer before each new server start.
-  logBuffer.length = 0
+  // Drop the previous run. Sequence numbers keep increasing so a viewer can
+  // tell the new lines from ones it already cleared.
+  serverLogs.length = 0
 
   const env = buildServerStartEnv(process.env)
   const proxyEnabled =
@@ -486,8 +507,8 @@ async function stopServerProcess(notifyStatus: boolean): Promise<void> {
   }
 }
 
-export async function stopServer(): Promise<void> {
-  await stopServerProcess(true)
+export function stopServer(): Promise<void> {
+  return serializeServerLifecycle(() => stopServerProcess(true))
 }
 
 export function isRunning(): boolean {
@@ -514,6 +535,12 @@ export function getServerBaseUrl(): string {
   )
 }
 
-export function getLogs(): string[] {
-  return [...logBuffer]
+export function getLogs(): ServerLogRecord[] {
+  return serverLogs.slice()
+}
+
+export function clearLogs(): number {
+  const watermark = nextLogSequence
+  serverLogs.length = 0
+  return watermark
 }

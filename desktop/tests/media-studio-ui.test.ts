@@ -7,9 +7,10 @@ import {
   spyOn,
   test,
 } from 'bun:test'
-import { Window } from 'happy-dom'
+import type { Window } from 'happy-dom'
 import { act, createElement } from 'react'
 import type { Root } from 'react-dom/client'
+import { createTestDom } from './helpers/dom'
 import MediaStudioPage from '../src/pages/MediaStudioPage'
 import { LanguageProvider } from '../src/contexts/LanguageContext'
 import type {
@@ -22,7 +23,7 @@ import type {
 let win: Window
 let root: Root
 let container: HTMLDivElement
-const previousGlobals = new Map<string, PropertyDescriptor | undefined>()
+let cleanupDom: () => Promise<void>
 let createImages = mock(
   (_id: string, _input: ImageCreationInput): Promise<CreatedImage[]> =>
     Promise.resolve([
@@ -42,29 +43,15 @@ let getVideo = mock(
 )
 let cancel = mock((_id: string): Promise<void> => Promise.resolve())
 let save = mock((): Promise<boolean> => Promise.resolve(true))
+let fetchModels = mock((): Promise<unknown> =>
+  Promise.resolve({
+    data: [{ id: 'codex/gpt-image-2' }],
+  }),
+)
 let timers: ReturnType<typeof spyOn<typeof globalThis, 'setTimeout'>>
 
 beforeEach(async () => {
-  win = new Window({ url: 'http://localhost' })
-  for (const [name, value] of Object.entries({
-    window: win,
-    document: win.document,
-    navigator: win.navigator,
-    HTMLElement: win.HTMLElement,
-    HTMLInputElement: win.HTMLInputElement,
-    HTMLTextAreaElement: win.HTMLTextAreaElement,
-    Event: win.Event,
-    KeyboardEvent: win.KeyboardEvent,
-    MouseEvent: win.MouseEvent,
-    IS_REACT_ACT_ENVIRONMENT: true,
-  })) {
-    previousGlobals.set(name, Object.getOwnPropertyDescriptor(globalThis, name))
-    Object.defineProperty(globalThis, name, {
-      configurable: true,
-      writable: true,
-      value,
-    })
-  }
+  ;({ win, root, container, cleanup: cleanupDom } = await createTestDom())
   createImages = mock((_id, _input) =>
     Promise.resolve([
       {
@@ -81,6 +68,9 @@ beforeEach(async () => {
   )
   cancel = mock((_id) => Promise.resolve())
   save = mock(() => Promise.resolve(true))
+  fetchModels = mock(() =>
+    Promise.resolve({ data: [{ id: 'codex/gpt-image-2' }] }),
+  )
   Object.defineProperty(win, 'electronAPI', {
     configurable: true,
     value: {
@@ -89,23 +79,15 @@ beforeEach(async () => {
       getVideo,
       cancelMediaRequest: cancel,
       saveMedia: save,
+      fetchModels,
     },
   })
   timers = spyOn(globalThis, 'setTimeout')
-  container = document.createElement('div')
-  document.body.append(container)
-  const { createRoot } = await import('react-dom/client')
-  root = createRoot(container)
 })
 afterEach(async () => {
   await act(async () => root.unmount())
   timers.mockRestore()
-  await win.happyDOM.close()
-  for (const [name, descriptor] of previousGlobals) {
-    if (descriptor) Object.defineProperty(globalThis, name, descriptor)
-    else Reflect.deleteProperty(globalThis, name)
-  }
-  previousGlobals.clear()
+  await cleanupDom()
 })
 
 async function render(serverRunning = true) {
@@ -176,6 +158,45 @@ const file = (name = 'source.png') =>
   new File([new Uint8Array([137, 80, 78, 71])], name, { type: 'image/png' })
 
 describe('media creation page', () => {
+  test('uses the backend automatic model without fetching the catalog', async () => {
+    await render()
+    const model =
+      container.querySelector<HTMLInputElement>('input:not([type])')!
+    expect(model.value).toBe('gpt-image-2')
+    expect(fetchModels).not.toHaveBeenCalled()
+    await prompt()
+    await click('Create')
+    expect(createImages.mock.calls[0][1]).toMatchObject({
+      provider: 'default',
+      model: 'gpt-image-2',
+    })
+  })
+
+  test('keeps a user model when the server restarts', async () => {
+    await render()
+    const model =
+      container.querySelector<HTMLInputElement>('input:not([type])')!
+    await change(model, 'github-copilot/gpt-image-2.5-flare')
+    await render(false)
+    await render(true)
+    expect(model.value).toBe('github-copilot/gpt-image-2.5-flare')
+    expect(fetchModels).not.toHaveBeenCalled()
+  })
+
+  test('allows clearing the model to use gateway defaults', async () => {
+    await render()
+    await change(
+      container.querySelector<HTMLInputElement>('input:not([type])')!,
+      '',
+    )
+    await prompt()
+    await click('Create')
+    expect(createImages.mock.calls[0][1]).toMatchObject({
+      provider: 'default',
+      model: '',
+    })
+  })
+
   test.each([
     ['Generate image', '1', '2'],
     ['Edit image', '1', '3'],
@@ -262,13 +283,13 @@ describe('media creation page', () => {
   test('generates, previews and saves images with the selected options', async () => {
     await render()
     await prompt()
-    await change(select(0), 'codex')
-    await change(select(1), '1536x1024')
-    await change(select(2), 'high')
+    expect(container.textContent).not.toContain('Provider')
+    await change(select(0), '1536x1024')
+    await change(select(1), 'high')
     await change(number(0), '2')
     await click('Create')
     expect(createImages.mock.calls[0][1]).toMatchObject({
-      provider: 'codex',
+      provider: 'default',
       model: 'gpt-image-2',
       mode: 'generate',
       size: '1536x1024',
@@ -285,6 +306,23 @@ describe('media creation page', () => {
       url: 'data:image/png;base64,iVBORw==',
     })
     expect(container.textContent).toContain('Saved')
+  })
+  test('keeps GIF generation hidden while Codex support is unavailable', async () => {
+    await render()
+    expect(container.querySelectorAll('select')).toHaveLength(2)
+    expect(container.querySelectorAll('input[type=number]')).toHaveLength(1)
+    expect(container.textContent).not.toContain('Output format')
+    expect(container.textContent).not.toContain('GIF')
+    await prompt()
+    await click('Create')
+    expect(createImages.mock.calls[0][1]).not.toHaveProperty('outputFormat')
+    expect(createImages.mock.calls[0][1]).not.toHaveProperty('frameCount')
+    expect(createImages.mock.calls[0][1]).not.toHaveProperty('frameDurationMs')
+    await click('Generate video')
+    expect(container.textContent).not.toContain('Output format')
+    await prompt()
+    await click('Create')
+    expect(createVideo.mock.calls[0][1]).not.toHaveProperty('outputFormat')
   })
   test('submits with Enter and keeps Shift+Enter for a newline', async () => {
     await render()
@@ -369,18 +407,17 @@ describe('media creation page', () => {
     )
     expect(container.querySelector('[role=dialog]')).toBeNull()
   })
-  test('changes the provider default model and permits a custom model alias', async () => {
+  test('routes custom model aliases through Gateway default', async () => {
     await render()
     await prompt()
-    await change(select(0), 'xai')
     const model =
       container.querySelector<HTMLInputElement>('input:not([type])')!
-    expect(model.value).toBe('grok-imagine-image-2.0')
-    await change(model, 'custom-image-model')
+    expect(model.value).toBe('gpt-image-2')
+    await change(model, 'github-copilot/gpt-image-2.5-flare')
     await click('Create')
     expect(createImages.mock.calls[0][1]).toMatchObject({
-      provider: 'xai',
-      model: 'custom-image-model',
+      provider: 'default',
+      model: 'github-copilot/gpt-image-2.5-flare',
     })
   })
   test('requires an edit image, uploads bytes and removes previews', async () => {
@@ -395,6 +432,7 @@ describe('media creation page', () => {
     await click('Create')
     expect(createImages.mock.calls[0][1]).toMatchObject({
       mode: 'edit',
+      provider: 'default',
       images: [
         {
           name: 'source.png',

@@ -3,13 +3,14 @@ import type { Context } from "hono"
 
 import { streamSSE, type SSEMessage } from "hono/streaming"
 
+import { guardChatCompletionsStream } from "~/lib/http/chat-completions-stream"
 import { resolveMappedModel } from "~/lib/config"
-import { recordChatCompletionFirstToken } from "~/lib/first-token"
+import { recordChatCompletionFirstToken } from "~/lib/http/first-token"
 import { createHandlerLogger, debugJson } from "~/lib/logger"
-import { findEndpointModel } from "~/lib/models"
-import { writeSSEIfConnected } from "~/lib/sse"
-import { setPluginRequestModel } from "~/lib/request-events"
-import { resolveConfiguredProviderModelAlias } from "~/lib/provider-resolver"
+import { findEndpointModel } from "~/lib/catalog/models"
+import { writeSSEIfConnected } from "~/lib/http/sse"
+import { setPluginRequestModel } from "~/lib/http/request-events"
+import { resolveConfiguredProviderModelAlias } from "~/lib/providers/provider-resolver"
 import {
   createCopilotTokenUsageRecorder,
   normalizeOpenAIUsage,
@@ -112,9 +113,11 @@ export async function handleCompletion(c: Context) {
     const toolCallIndexMap = new Map<string, number>()
 
     try {
-      for await (const chunk of response) {
+      for await (const {
+        message: chunk,
+        completion: parsedChunk,
+      } of guardChatCompletionsStream(response)) {
         debugJson(logger, "Streaming chunk:", chunk)
-        const parsedChunk = parseChatCompletionChunk(chunk)
         recordChatCompletionFirstToken(parsedChunk)
         if (parsedChunk?.usage || parsedChunk?.copilot_usage) {
           usage = {
@@ -128,54 +131,15 @@ export async function handleCompletion(c: Context) {
         const remapped = remapToolCallChunkIndices(chunk, toolCallIndexMap)
         await writeSSEIfConnected(stream, (remapped ?? chunk) as SSEMessage)
       }
-    } catch (error) {
-      // A client disconnect (or the request otherwise being cancelled) aborts
-      // the upstream stream mid-read -- expected, not a bug. Previously
-      // unhandled here: route.ts's try/catch only wraps handleCompletion's
-      // synchronous return of the streamSSE Response, not this async
-      // callback, which streamSSE invokes AFTER that Response has already
-      // been returned. An uncaught abort here surfaced as a raw, unformatted
-      // DOMException dump in logs and left the connection just stop instead
-      // of closing cleanly -- confirmed live. Log quietly for an abort
-      // (matching forwardError's existing handling for the non-streaming
-      // path), loudly for anything else, and still record whatever partial
-      // usage was captured either way rather than silently dropping it.
-      if (c.req.raw.signal.aborted || isAbortError(error)) {
-        logger.debug("Streaming response aborted (client disconnected)")
-      } else {
-        consola.error("Error in streaming response:", error)
-        // Best-effort: without this, a genuinely unexpected (non-abort)
-        // failure mid-stream silently truncated the response with no
-        // signal to the client -- indistinguishable from the model just
-        // finishing early. The connection may already be dead by the time
-        // we get here (the same failure that broke the loop could also
-        // have broken the write), so this must not throw past the outer
-        // catch it's already inside.
-        try {
-          await stream.writeSSE({
-            data: JSON.stringify({
-              error: {
-                message: error instanceof Error ? error.message : String(error),
-                type: "upstream_error",
-              },
-            }),
-          })
-        } catch {
-          // Client is already gone -- nothing more to report.
-        }
-      }
+    } finally {
+      recordUsage(usage)
     }
-
-    recordUsage(usage)
   })
 }
 
 const isNonStreaming = (
   response: Awaited<ReturnType<typeof createCopilotChatCompletions>>,
 ): response is ChatCompletionResponse => Object.hasOwn(response, "choices")
-
-const isAbortError = (error: unknown): boolean =>
-  error instanceof Error && error.name === "AbortError"
 
 /**
  * GitHub Copilot's upstream chat-completions response omits `object` on the
@@ -204,21 +168,6 @@ function normalizeChatCompletionResponse(
   }
 }
 
-const parseChatCompletionChunk = (
-  chunk: unknown,
-): ChatCompletionChunk | null => {
-  const data = (chunk as { data?: string }).data
-  if (!data || data === "[DONE]") {
-    return null
-  }
-
-  try {
-    return JSON.parse(data) as ChatCompletionChunk
-  } catch {
-    return null
-  }
-}
-
 /**
  * GitHub Copilot's upstream stream reuses Anthropic content-block indices
  * for `tool_calls[].index` -- when a text block precedes a tool call, the
@@ -239,7 +188,7 @@ const parseChatCompletionChunk = (
  * than the raw index alone -- an `n > 1` request can carry multiple
  * `choices`, each numbering its own tool calls independently starting from
  * 0, and a raw-index-only key would conflate two different tool calls (one
- * per choice) that happen to share the same raw index. Sequencing is
+ * per choice) that happen to share that raw index. Sequencing is
  * per-choice too, so each choice's tool calls remap to their own 0, 1, 2...
  * Returns null (pass the original chunk through unchanged) when there's
  * nothing to remap or the chunk doesn't parse.

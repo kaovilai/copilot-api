@@ -1,10 +1,10 @@
 import { afterEach, beforeEach, expect, mock, test } from "bun:test"
 
-const actualTokenModule = await import("../src/lib/token")
+const actualTokenModule = await import("../src/lib/auth/token")
 
 let setupCopilotTokenMock = mock(() => {})
 
-await mock.module("~/lib/token", () => ({
+await mock.module("~/lib/auth/token", () => ({
   ...actualTokenModule,
   setupCopilotToken: () => setupCopilotTokenMock(),
 }))

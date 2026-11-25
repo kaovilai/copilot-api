@@ -2,13 +2,16 @@ import { afterAll, afterEach, beforeEach, expect, spyOn, test } from "bun:test"
 import { Hono } from "hono"
 
 import type { ResolvedProviderConfig } from "~/lib/config"
-import { GatewayPlugins, type GatewayPluginEvents } from "~/lib/gateway-plugins"
+import {
+  GatewayPlugins,
+  type GatewayPluginEvents,
+} from "~/lib/plugins/gateway-plugins"
 import {
   requestEventsMiddleware,
   setPluginRequestModel,
-} from "~/lib/request-events"
+} from "~/lib/http/request-events"
 import { state } from "~/lib/state"
-import { traceIdMiddleware } from "~/lib/trace"
+import { traceIdMiddleware } from "~/lib/http/trace"
 import { createChatCompletions } from "~/services/copilot/create-chat-completions"
 import { createMessages } from "~/services/copilot/create-messages"
 import { createResponses } from "~/services/copilot/create-responses"
@@ -146,17 +149,27 @@ const cases: Array<[string, () => Promise<unknown>, string]> = [
   [
     "provider Messages",
     () => forwardProviderMessages(provider, messages(), new Headers()),
+    `test-provider/${target}`,
+  ],
+  [
+    "GitHub Copilot provider without a prefix",
+    () =>
+      forwardProviderMessages(
+        { ...provider, name: "github-copilot" },
+        messages(),
+        new Headers(),
+      ),
     target,
   ],
   [
     "provider Chat Completions",
     () => forwardProviderChatCompletions(provider, messages(), new Headers()),
-    target,
+    `test-provider/${target}`,
   ],
   [
     "provider Responses",
     () => forwardProviderResponses(provider, responses(), new Headers()),
-    target,
+    `test-provider/${target}`,
   ],
   [
     "Codex Responses HTTP",
@@ -164,7 +177,7 @@ const cases: Array<[string, () => Promise<unknown>, string]> = [
       forwardCodexResponses(responses(), new Headers(), undefined, {
         transport: "http",
       }),
-    target,
+    `codex/${target}`,
   ],
   [
     "Codex Responses WebSocket",
@@ -175,7 +188,7 @@ const cases: Array<[string, () => Promise<unknown>, string]> = [
         undefined,
         { transport: "websocket" },
       ),
-    target,
+    `codex/${target}`,
   ],
   [
     "Google model URL",
@@ -190,7 +203,7 @@ const cases: Array<[string, () => Promise<unknown>, string]> = [
         new Headers(),
         { stream: false, clientSignal: new AbortController().signal },
       ),
-    target,
+    `test-provider/${target}`,
   ],
 ]
 
@@ -224,10 +237,10 @@ test.each(cases)(
       const [input, init] = call
       const url = input instanceof Request ? input.url : input.toString()
       if (url.includes(":generateContent")) {
-        expect(url).toContain(`/models/${expected}:generateContent`)
+        expect(url).toContain(`/models/${target}:generateContent`)
       } else {
         expect(JSON.parse(init!.body as string)).toMatchObject({
-          model: expected,
+          model: target,
         })
       }
     }
@@ -324,7 +337,7 @@ test("alpha search exposes the Codex priority override from its existing parsed 
   alphaSearchRouteDependencies.resolveProviderConfig = () =>
     Promise.resolve({ ...provider, name: "codex", type: "openai-responses" })
   alphaSearchRouteDependencies.forwardCodexAlphaSearch = async (request) => {
-    expect(await request.json()).toMatchObject({ model: "gpt-5.6-luna" })
+    expect(await request.json()).toMatchObject({ model: "gpt-6-luna" })
     return Response.json({ ok: true })
   }
   app.post("/alpha/search", (c) => handleAlphaSearchRequest(c))
@@ -337,7 +350,7 @@ test("alpha search exposes the Codex priority override from its existing parsed 
   await plugins.flush()
   expect(actuals[0]).toMatchObject({
     model: "claude-client",
-    actualModel: "gpt-5.6-luna",
+    actualModel: "codex/gpt-6-luna",
   })
-  expect(ends[0].actualModel).toBe("gpt-5.6-luna")
+  expect(ends[0].actualModel).toBe("codex/gpt-6-luna")
 })

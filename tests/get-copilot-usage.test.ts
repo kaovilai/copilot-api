@@ -9,7 +9,7 @@ const { state } = await import("../src/lib/state")
 const { getCopilotUsage } = await import(
   "../src/services/github/get-copilot-usage"
 )
-const { HTTPError } = await import("../src/lib/error")
+const { HTTPError } = await import("../src/lib/http/http-error")
 
 const captureError = async (fn: () => Promise<unknown>): Promise<unknown> => {
   try {

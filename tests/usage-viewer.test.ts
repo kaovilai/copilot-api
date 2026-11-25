@@ -1,7 +1,7 @@
 import { describe, expect, test } from "bun:test"
 import { readFile } from "node:fs/promises"
 import { runInNewContext } from "node:vm"
-import { Window } from "happy-dom"
+import { Window, type HTMLButtonElement } from "happy-dom"
 import type { TokenUsageSummary } from "../desktop/src/types/ipc"
 
 const pagePath = new URL("../pages/index.html", import.meta.url)
@@ -30,6 +30,71 @@ function extractCollapseHelpers(html: string): string {
     "        function getModelField(model, fields) {",
   )
 }
+
+describe("usage viewer image model discovery", () => {
+  test.each([
+    ["http://localhost:4141/usage", "http://localhost:4141/models"],
+    [
+      "https://gateway.example/proxy/v1/usage?old=1#quota",
+      "https://gateway.example/proxy/v1/models",
+    ],
+    ["/v1/usage", "https://viewer.example/v1/models"],
+  ])(
+    "loads image models from %s with gateway credentials",
+    async (endpoint, expectedUrl) => {
+      const html = await readUsageViewerPage()
+      const source = [
+        [
+          "function parseCredential(value)",
+          "function resolveUsageUrl(endpoint)",
+        ],
+        [
+          "function deriveEndpointUrl(usageEndpoint, targetPath)",
+          "function buildTokenUsageSummaryUrl(usageEndpoint, period)",
+        ],
+        ["async function fetchJson(", "function syncUrlState()"],
+        ["async function fetchModels()", "function activateTab(tab)"],
+      ]
+        .map(([start, end]) => extractInlineFunctionRange(html, start, end))
+        .join("\n")
+      const imageModels = [
+        { id: "codex/gpt-image-2", type: "image" },
+        { id: "xai/grok-imagine-image-2.0", type: "image" },
+      ]
+      const state = {
+        models: null as typeof imageModels | null,
+        modelsError: null,
+        modelsConnectionKey: "connection",
+        modelsRequestId: 0,
+        isModelsLoading: false,
+      }
+      const requests: Array<{ url: string; headers: Headers }> = []
+      const viewer = runInNewContext(`${source}\n({ fetchModels })`, {
+        URL,
+        window: { location: { href: "https://viewer.example/usage-viewer" } },
+        endpointUrlInput: { value: endpoint },
+        apiKeyInput: { value: "Bearer viewer-key" },
+        state,
+        syncEndpointCredential: () => {},
+        syncModelsConnection: () => {},
+        getConnectionKey: () => "connection",
+        render: () => {},
+        getErrorMessage: String,
+        fetch: (url: string, init: RequestInit) => {
+          requests.push({ url, headers: new Headers(init.headers) })
+          return Promise.resolve(Response.json({ data: imageModels }))
+        },
+      }) as { fetchModels: () => Promise<void> }
+      await viewer.fetchModels()
+      expect(requests).toHaveLength(1)
+      expect(requests[0].url).toBe(expectedUrl)
+      expect(requests[0].headers.get("authorization")).toBe("Bearer viewer-key")
+      expect(state.models).toEqual(imageModels)
+      expect(state.modelsError).toBeNull()
+      expect(state.isModelsLoading).toBe(false)
+    },
+  )
+})
 
 describe("usage viewer period contract", () => {
   test("supports all periods in the selector and usage requests", async () => {
@@ -62,13 +127,13 @@ describe("usage viewer period contract", () => {
     expect(html).toContain('data-trend-day="${escapeHtml(day.date)}"')
     expect(html).not.toContain('data-trend-day="${day.date}"')
     expect(html).toContain(
-      "fetchJson(buildTokenUsageSummaryUrl(usageUrl, period))",
+      "fetchJson(buildTokenUsageSummaryUrl(usageUrl, period),",
     )
     expect(html).toContain(
-      "fetchJson(buildTokenUsageDailyUrl(usageUrl, period))",
+      "fetchJson(buildTokenUsageDailyUrl(usageUrl, period),",
     )
     expect(html).toContain(
-      "fetchJson(buildTokenUsageEventsUrl(usageUrl, period, page))",
+      "fetchJson(buildTokenUsageEventsUrl(usageUrl, period, page),",
     )
     expect(html).toContain(
       "buildTokenUsageEventsUrl(usageUrl, getSelectedPeriod(), page)",
@@ -77,6 +142,185 @@ describe("usage viewer period contract", () => {
     for (const builder of ["Summary", "Daily", "Events"]) {
       expect(html).toContain(`function buildTokenUsage${builder}Url`)
       expect(html).toContain('url.searchParams.set("period", period)')
+    }
+  })
+})
+
+describe("usage viewer key usage isolation", () => {
+  async function createViewer(isolated = false, activeTab = "usage") {
+    const html = await readUsageViewerPage()
+    const win = new Window({ url: "http://gateway/usage-viewer" })
+    win.document.body.innerHTML =
+      '<form></form><div id="content"></div><select></select><button data-tab="usage"></button><button data-tab="subscriptions"></button><button data-tab="models"></button>'
+    const tabButtons = [
+      ...win.document.querySelectorAll<HTMLButtonElement>("[data-tab]"),
+    ]
+    const state = {
+      isolateApiKeyUsage: isolated,
+      activeTab,
+      models: [],
+      subscriptionsLoaded: true,
+      tokenUsageSummary: { totals: { total_tokens: 999 } } as object | null,
+    }
+    const apiKeyInput = { value: "client-key" }
+    const responses: Array<{ resolve: (response: Response) => void }> = []
+    let usageFetches = 0
+    const source = [
+      extractInlineFunctionRange(
+        html,
+        "        async function fetchJson(",
+        "        function syncUrlState() {",
+      ),
+      extractInlineFunctionRange(
+        html,
+        "        function updateControls() {",
+        "        function formatNumber(value) {",
+      ),
+      extractInlineFunctionRange(
+        html,
+        "        function getConnectionKey() {",
+        "        function syncModelsConnection() {",
+      ),
+      extractInlineFunctionRange(
+        html,
+        "        function activateTab(tab) {",
+        "        function handleModelsSearch(event) {",
+      ),
+      "({fetchJson, updateControls, activateTab, handleTabsKeydown})",
+    ].join("\n")
+    const viewer = runInNewContext(source, {
+      state,
+      apiKeyInput,
+      tabButtons,
+      endpointUrlInput: { value: "http://gateway/usage" },
+      fetchButton: {},
+      fetchButtonLabel: {},
+      periodField: {},
+      tokenUsagePeriodSelect: {},
+      endpointForm: win.document.querySelector("form"),
+      contentArea: win.document.getElementById("content"),
+      buildRequestHeaders: () => ({}),
+      fetch: () =>
+        new Promise<Response>((resolve) => responses.push({ resolve })),
+      render: () => {},
+      syncUrlState: () => {},
+      syncEndpointCredential: () => {},
+      syncTokenUsageConnection: () => {},
+      syncModelsConnection: () => {},
+      syncSubscriptionsConnection: () => {},
+      invalidateSessionsRequest: () => {},
+      fetchData: () => {
+        usageFetches += 1
+      },
+      fetchModels: () => {},
+      refreshSubscriptionQuotas: () => {},
+    }) as {
+      fetchJson: (url: string) => Promise<unknown>
+      updateControls: () => void
+      activateTab: (tab: string) => void
+      handleTabsKeydown: (event: {
+        key: string
+        preventDefault: () => void
+      }) => void
+    }
+    return {
+      win,
+      viewer,
+      state,
+      apiKeyInput,
+      tabButtons,
+      responses,
+      usageFetches: () => usageFetches,
+    }
+  }
+
+  test("hides subscriptions for an isolated key, redirects a subscription view and skips the hidden tab", async () => {
+    const v = await createViewer(false, "subscriptions")
+    try {
+      const result = v.viewer.fetchJson("http://gateway/usage/codex")
+      v.responses[0].resolve(
+        Response.json(
+          { error: { message: "restricted" } },
+          { status: 403, headers: { "X-API-Key-Usage-Isolated": "true" } },
+        ),
+      )
+      expect(await result.catch((error: unknown) => error)).toMatchObject({
+        status: 403,
+      })
+      v.viewer.updateControls()
+      expect(v.state.activeTab).toBe("usage")
+      expect(v.usageFetches()).toBe(1)
+      expect(v.tabButtons[1].hidden).toBe(true)
+      expect(v.tabButtons[1].style.display).toBe("none")
+      v.viewer.activateTab("subscriptions")
+      expect(v.state.activeTab).toBe("usage")
+      v.viewer.handleTabsKeydown({
+        key: "ArrowRight",
+        preventDefault: () => {},
+      })
+      expect(v.state.activeTab).toBe("models")
+    } finally {
+      await v.win.happyDOM.close()
+    }
+  })
+
+  test.each([false, null])(
+    "shows subscriptions after isolation is disabled or an older server is used (%s)",
+    async (header) => {
+      const v = await createViewer(true)
+      try {
+        const result = v.viewer.fetchJson("http://gateway/token-usage")
+        v.responses[0].resolve(
+          Response.json(
+            {},
+            {
+              headers:
+                header === null ?
+                  {}
+                : { "X-API-Key-Usage-Isolated": String(header) },
+            },
+          ),
+        )
+        await result
+        v.viewer.updateControls()
+        expect(v.state.isolateApiKeyUsage).toBe(false)
+        expect(v.tabButtons[1].hidden).toBe(false)
+        v.viewer.activateTab("subscriptions")
+        expect(v.state.activeTab).toBe("subscriptions")
+      } finally {
+        await v.win.happyDOM.close()
+      }
+    },
+  )
+
+  test("ignores visibility from a previous credential", async () => {
+    const v = await createViewer()
+    try {
+      const result = v.viewer.fetchJson("http://gateway/token-usage")
+      v.apiKeyInput.value = "another-key"
+      v.responses[0].resolve(
+        Response.json({}, { headers: { "X-API-Key-Usage-Isolated": "true" } }),
+      )
+      await result
+      expect(v.state.isolateApiKeyUsage).toBe(false)
+    } finally {
+      await v.win.happyDOM.close()
+    }
+  })
+
+  test("clears cached global usage and reloads it when isolation changes on the models tab", async () => {
+    const v = await createViewer(false, "models")
+    try {
+      const result = v.viewer.fetchJson("http://gateway/models")
+      v.responses[0].resolve(
+        Response.json({}, { headers: { "X-API-Key-Usage-Isolated": "true" } }),
+      )
+      await result
+      expect(v.state.tokenUsageSummary).toBeNull()
+      expect(v.usageFetches()).toBe(1)
+      expect(v.state.activeTab).toBe("models")
+    } finally {
+      await v.win.happyDOM.close()
     }
   })
 })
@@ -217,7 +461,9 @@ describe("usage viewer model cache hit rate", () => {
         "Total Tokens",
         "Total Cost",
       ])
-      expect(win.document.querySelector("th")?.className).toContain("w-[200px]")
+      expect(win.document.querySelector("table")?.className).toContain(
+        "breakdown-table",
+      )
       for (const label of ["Cache Hit Rate", "Output speed"]) {
         const header = [...win.document.querySelectorAll("th")].find(
           (node) => node.textContent?.trim() === label,
@@ -462,14 +708,14 @@ describe("usage viewer session fetching", () => {
       extractInlineFunctionRange(
         html,
         "        function resolveUsageUrl(endpoint) {",
-        "        async function fetchJson(url) {",
+        "        async function fetchJson(",
       ),
       extractInlineFunctionRange(
         html,
         "        async function fetchData(page = 1) {",
         "        // --- Event Handlers & Initialization ---",
       ),
-      "({ fetchData, fetchTokenUsageSummaryAndEvents, fetchTokenUsageSessionsPage, invalidateSessionsRequest })",
+      "({ fetchData, fetchTokenUsageSummaryAndEvents, fetchTokenUsageEventsPage, fetchTokenUsageSessionsPage, invalidateSessionsRequest, syncTokenUsageConnection })",
     ].join("\n")
     const pending: Array<{
       url: string
@@ -479,6 +725,12 @@ describe("usage viewer session fetching", () => {
     const state = {
       isLoading: false,
       isTokenUsageLoading: false,
+      tokenUsageConnectionKey: null,
+      tokenUsageRequestId: 0,
+      eventsRequestId: 0,
+      tokenUsageSummary: null as unknown,
+      tokenUsageDailySummary: null as unknown,
+      tokenUsageEventsPage: null as unknown,
       tokenUsageSummaryError: null as string | null,
       isSessionsLoading: false,
       sessionsRequestId: 0,
@@ -486,10 +738,16 @@ describe("usage viewer session fetching", () => {
       tokenUsageSessionsPage: null as unknown,
     }
     const endpointUrlInput = { value: "http://server-a/usage" }
+    const apiKeyInput = { value: "first-key" }
     const rendering = { onRender: () => {} }
     const viewer = runInNewContext(source, {
       state,
       endpointUrlInput,
+      getConnectionKey: () =>
+        JSON.stringify([
+          endpointUrlInput.value.trim(),
+          apiKeyInput.value.trim(),
+        ]),
       window: { location: { href: "http://localhost/usage-viewer" } },
       URL,
       SESSION_PAGE_SIZE: 10,
@@ -510,11 +768,41 @@ describe("usage viewer session fetching", () => {
     }) as {
       fetchData: () => Promise<void>
       fetchTokenUsageSummaryAndEvents: () => Promise<void>
+      fetchTokenUsageEventsPage: (page: number) => Promise<void>
       fetchTokenUsageSessionsPage: (page: number) => Promise<void>
       invalidateSessionsRequest: () => void
+      syncTokenUsageConnection: () => string
     }
-    return { endpointUrlInput, pending, rendering, state, viewer }
+    return { apiKeyInput, endpointUrlInput, pending, rendering, state, viewer }
   }
+
+  test("discards late summary, daily, and event responses after switching keys", async () => {
+    const { apiKeyInput, pending, state, viewer } =
+      await createSessionsFetcher()
+    const stale = viewer.fetchData()
+    state.tokenUsageSummary = { label: "previous usage" }
+    const staleEvents = viewer.fetchTokenUsageEventsPage(2)
+
+    apiKeyInput.value = "second-key"
+    viewer.syncTokenUsageConnection()
+    expect(state.tokenUsageSummary).toBeNull()
+    const current = viewer.fetchData()
+    const summary = { totals: { total_tokens: 10 } }
+    const daily = { days: [] }
+    const events = { page: 1, items: [] }
+    pending[4].resolve(summary)
+    pending[5].resolve(daily)
+    pending[6].resolve(events)
+    await current
+
+    for (const request of pending.slice(0, 4)) request.resolve({ stale: true })
+    await Promise.all([stale, staleEvents])
+    pending[7].resolve({ page: 1, items: [] })
+    expect(state.tokenUsageSummary).toEqual(summary)
+    expect(state.tokenUsageDailySummary).toEqual(daily)
+    expect(state.tokenUsageEventsPage).toEqual(events)
+    expect(state.isLoading).toBe(false)
+  })
 
   test("ignores a response that arrives after the context changed", async () => {
     const { pending, state, viewer } = await createSessionsFetcher()
@@ -1165,7 +1453,7 @@ describe("usage viewer request/model timing", () => {
       const eventsHtml = viewer.renderTokenUsageEventsTable({
         items: [row, {}],
       })
-      expect(eventsHtml).toContain("min-w-[1140px]")
+      expect(eventsHtml).toContain("events-table")
       expect(eventsHtml).not.toContain("min-w-[1060px]")
       win.document.body.innerHTML = eventsHtml
       expect(win.document.querySelectorAll("th").length).toBe(12)

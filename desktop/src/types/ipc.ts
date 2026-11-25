@@ -1,4 +1,23 @@
+import type {
+  ApiKeyQuotaUsage,
+  GatewayApiKeyConfig,
+} from '../../../src/lib/types/api-key'
+export type {
+  ApiKeyQuotaUsage,
+  GatewayApiKeyConfig,
+} from '../../../src/lib/types/api-key'
 import type { LangPreference } from '../locales'
+import type {
+  ClientAgent,
+  ClientId,
+  ClientIntegrationsState,
+  ClientModelOption,
+  ClientRestoreResult,
+  ClientSetupInput,
+  ClientSetupResult,
+} from '../../shared/client-integrations'
+
+export type ClientIntegrationReply<T> = { data: T } | { error: string }
 import type {
   SubscriptionProvider,
   SubscriptionUsage,
@@ -101,6 +120,11 @@ export interface ServerStatus {
   error?: string
 }
 
+export interface ServerLogRecord {
+  sequence: number
+  text: string
+}
+
 export interface ServerAuthInfo {
   enabled: boolean
   headerName?: string
@@ -110,10 +134,12 @@ export interface ServerAuthInfo {
 export interface ServerKeysConfig {
   apiKeys: string[]
   adminApiKey: string
+  isolateApiKeyUsage?: boolean
 }
 
 export interface ServerKeysConfigUpdate {
   apiKeys?: string[]
+  isolateApiKeyUsage?: boolean
   // undefined = leave the field untouched, '' or null = remove the admin key
   adminApiKey?: string | null
 }
@@ -282,6 +308,7 @@ export interface AppUpdateStatus {
     | 'disabled'
   currentVersion: string
   manualInstall: boolean
+  packageReady?: boolean
   releaseUrl: string
   version?: string
   percent?: number
@@ -362,6 +389,7 @@ declare global {
       getAppUpdateStatus: () => Promise<AppUpdateStatus>
       checkAppUpdate: () => Promise<AppUpdateStatus>
       installAppUpdate: () => Promise<AppUpdateStatus>
+      openAppUpdatePackage: (showInFolder?: boolean) => Promise<void>
       onAppUpdateStatus: (
         callback: (status: AppUpdateStatus) => void,
       ) => () => void
@@ -387,6 +415,22 @@ declare global {
         provider: SubscriptionProvider,
       ) => Promise<SubscriptionUsage | null>
       fetchModels: () => Promise<unknown>
+      getClientIntegrations: (
+        agent?: ClientAgent,
+      ) => Promise<ClientIntegrationReply<ClientIntegrationsState>>
+      getClientModels: (
+        client: 'claude' | 'codex',
+      ) => Promise<ClientIntegrationReply<ClientModelOption[]>>
+      setupClient: (
+        input: ClientSetupInput,
+      ) => Promise<ClientIntegrationReply<ClientSetupResult>>
+      restoreClient: (
+        client: ClientId,
+        revision: string,
+      ) => Promise<ClientIntegrationReply<ClientRestoreResult>>
+      openClientConfig: (
+        client: ClientId,
+      ) => Promise<ClientIntegrationReply<void>>
       createImages: (
         id: string,
         input: ImageCreationInput,
@@ -399,27 +443,42 @@ declare global {
       cancelMediaRequest: (id: string) => Promise<void>
       saveMedia: (input: SaveMediaInput) => Promise<boolean>
       getProviderModelOptions: () => Promise<ProviderModelOptions>
-      fetchTokenUsage: (period: TokenUsagePeriod) => Promise<unknown>
-      fetchTokenUsageDaily: (period: TokenUsagePeriod) => Promise<unknown>
+      fetchTokenUsage: (
+        period: TokenUsagePeriod,
+        apiKeyId?: string,
+      ) => Promise<unknown>
+      fetchTokenUsageDaily: (
+        period: TokenUsagePeriod,
+        apiKeyId?: string,
+      ) => Promise<unknown>
       fetchTokenUsageEvents: (
         period: TokenUsagePeriod,
         page: number,
         pageSize: number,
+        apiKeyId?: string,
       ) => Promise<unknown>
       fetchTokenUsageSessions: (
         period: TokenUsagePeriod,
         page: number,
         pageSize: number,
+        apiKeyId?: string,
       ) => Promise<unknown>
       getServerAuthInfo: () => Promise<ServerAuthInfo>
+      getManagedApiKeys: () => Promise<GatewayApiKeyConfig[]>
+      saveManagedApiKey: (
+        key: GatewayApiKeyConfig,
+      ) => Promise<GatewayApiKeyConfig[]>
+      removeManagedApiKey: (id: string) => Promise<GatewayApiKeyConfig[]>
+      getApiKeyQuotaUsage: () => Promise<ApiKeyQuotaUsage[] | null>
       getServerKeys: () => Promise<ServerKeysConfig>
       saveServerKeys: (
         keys: ServerKeysConfigUpdate,
       ) => Promise<ServerKeysConfig>
-      getLogs: () => Promise<string[]>
+      getLogs: () => Promise<ServerLogRecord[]>
+      clearLogs: () => Promise<number>
       onAuthSuccess: (callback: (result: AuthResult) => void) => () => void
       onServerStatus: (callback: (status: ServerStatus) => void) => () => void
-      onServerLog: (callback: (log: string) => void) => () => void
+      onServerLog: (callback: (log: ServerLogRecord) => void) => () => void
       platform: NodeJS.Platform
       windowReload: () => void
       windowMinimize: () => void

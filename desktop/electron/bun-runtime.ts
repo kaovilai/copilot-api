@@ -1,5 +1,5 @@
 import { execFile } from 'node:child_process'
-import { readdir } from 'node:fs/promises'
+import { readdir, realpath } from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
 import { promisify } from 'node:util'
@@ -8,12 +8,18 @@ import type { BunRuntimeStatus } from '../src/types/ipc'
 
 const execFileAsync = promisify(execFile)
 
+const MINIMUM_BUN_VERSION = [1, 4, 4] as const
+
 export function isSupportedBunVersion(version: string): boolean {
   const match = /^(\d+)\.(\d+)\.(\d+)(?:\+[\w.-]+)?$/.exec(version.trim())
   if (!match) return false
-  const major = Number(match[1])
-  const minor = Number(match[2])
-  return major > 1 || (major === 1 && minor >= 4)
+  const parts = [Number(match[1]), Number(match[2]), Number(match[3])]
+  for (const [index, minimum] of MINIMUM_BUN_VERSION.entries()) {
+    const part = parts[index] ?? 0
+    if (part > minimum) return true
+    if (part < minimum) return false
+  }
+  return true
 }
 
 interface BunDetectionOptions {
@@ -22,6 +28,7 @@ interface BunDetectionOptions {
   homeDir?: string
   getVersion?: (executable: string) => Promise<string>
   readDirectory?: (directory: string) => Promise<string[]>
+  resolveDirectory?: (directory: string) => Promise<string>
 }
 
 async function getNvmBinDirectories({
@@ -36,6 +43,9 @@ async function getNvmBinDirectories({
     windows ?
       [
         env.NVM_HOME,
+        env.NVM_HOME && paths.isAbsolute(env.NVM_HOME) ?
+          paths.join(env.NVM_HOME, 'installs')
+        : undefined,
         paths.join(
           env.APPDATA ?? paths.join(homeDir, 'AppData', 'Roaming'),
           'nvm',
@@ -43,6 +53,13 @@ async function getNvmBinDirectories({
         paths.join(
           env.LOCALAPPDATA ?? paths.join(homeDir, 'AppData', 'Local'),
           'nvm',
+        ),
+        // nvm-windows 2 stores Node versions below this location by default.
+        paths.join(
+          env.LOCALAPPDATA ?? paths.join(homeDir, 'AppData', 'Local'),
+          'Author Software',
+          'nvm',
+          'installs',
         ),
       ]
     : [
@@ -71,6 +88,16 @@ async function getNvmBinDirectories({
   return directories
 }
 
+function isNvmWindowsShimDirectory(directory: string): boolean {
+  // The NVM2 shim starts the real Bun as a grandchild.
+  const normalized = path.win32.normalize(directory)
+  const parent = path.win32.dirname(normalized)
+  return (
+    path.win32.basename(normalized).toLowerCase() === '.shim'
+    && path.win32.basename(parent).toLowerCase() === 'nvm'
+  )
+}
+
 export async function getBunCandidates({
   env = process.env,
   platform = process.platform,
@@ -89,6 +116,7 @@ export async function getBunCandidates({
   const candidates: string[] = []
   const addBinDirectory = (directory: string | undefined) => {
     if (!directory || !paths.isAbsolute(directory)) return
+    if (windows && isNvmWindowsShimDirectory(directory)) return
     candidates.push(paths.join(directory, executable))
     if (windows) {
       // npm exposes bun.cmd here; execFile/spawn need the package's native exe.
@@ -148,6 +176,22 @@ export async function getBunCandidates({
   ]
 }
 
+async function* getBunRuntimeCandidates(
+  options: BunDetectionOptions,
+): AsyncGenerator<string, void, unknown> {
+  const env = options.env ?? process.env
+  const windows = (options.platform ?? process.platform) === 'win32'
+  const paths = windows ? path.win32 : path.posix
+  const directory = env.COPILOT_API_BUN_DIR?.trim().replace(/^"(.*)"$/, '$1')
+  if (directory && paths.isAbsolute(directory)) {
+    const executable = paths.join(directory, windows ? 'bun.exe' : 'bun')
+    if (!windows || !isNvmWindowsShimDirectory(paths.dirname(executable))) {
+      yield executable
+    }
+  }
+  yield* await getBunCandidates(options)
+}
+
 async function readBunVersion(executable: string): Promise<string> {
   const { stdout } = await execFileAsync(executable, ['--version'], {
     timeout: 2000,
@@ -162,9 +206,16 @@ export async function detectBunRuntime(
   options: BunDetectionOptions = {},
 ): Promise<BunRuntimeStatus> {
   const getVersion = options.getVersion ?? readBunVersion
+  const resolveDirectory = options.resolveDirectory ?? realpath
+  const windows = (options.platform ?? process.platform) === 'win32'
   let unsupported: BunRuntimeStatus | undefined
-  for (const executable of await getBunCandidates(options)) {
+  for await (const executable of getBunRuntimeCandidates(options)) {
     try {
+      // In NVM's shim mode, .nodejs exposes the same proxy as .shim.
+      if (windows && executable.toLowerCase().endsWith('\\.nodejs\\bun.exe')) {
+        const target = await resolveDirectory(path.win32.dirname(executable))
+        if (path.win32.basename(target).toLowerCase() === '.shim') continue
+      }
       const version = (await getVersion(executable)).trim()
       if (isSupportedBunVersion(version)) {
         return { available: true, version, path: executable }

@@ -47,7 +47,7 @@ describe("Codex service tier price estimates", () => {
     }
   }
 
-  test("applies the tier multiplier after long-context pricing", () => {
+  test("does not apply long-context surcharges to ChatGPT-signed-in Codex", () => {
     expect(
       resolveTokenUsageCost({
         ...usage,
@@ -57,9 +57,43 @@ describe("Codex service tier price estimates", () => {
     ).toEqual({
       currency: "USD",
       source: "builtin",
-      total_cost_nanos: 32_651_100_000,
+      total_cost_nanos: 16_327_050_000,
     })
   })
+
+  for (const { model, standardCost } of [
+    { model: "gpt-6.2-sol", standardCost: 544_206_000 },
+    { model: "gpt-6.2-astra", standardCost: 2_176_824_000 },
+  ]) {
+    test(`${model} uses flat Codex rates and the timed Ultrafast promotion`, () => {
+      const longContextUsage = {
+        ...usage,
+        at: new Date("2027-03-01T07:59:59.999Z"),
+        input_tokens: 272_001,
+        model,
+      }
+      for (const { serviceTier, multiplier } of [
+        { serviceTier: "default", multiplier: 1 },
+        { serviceTier: "priority", multiplier: 2 },
+        { serviceTier: "ultrafast", multiplier: 3 },
+      ]) {
+        expect(
+          resolveTokenUsageCost({ ...longContextUsage, serviceTier }),
+        ).toEqual({
+          currency: "USD",
+          source: "builtin",
+          total_cost_nanos: standardCost * multiplier,
+        })
+      }
+      expect(
+        resolveTokenUsageCost({
+          ...longContextUsage,
+          at: new Date("2027-03-01T08:00:00.000Z"),
+          serviceTier: "ultrafast",
+        })?.total_cost_nanos,
+      ).toBe(standardCost * 6)
+    })
+  }
 
   test("normalizes the provider, model, and tier names", () => {
     expect(
@@ -127,7 +161,7 @@ describe("Codex service tier price estimates", () => {
     ).toBe(100_000)
   })
 
-  test("applies GPT-5.6 Sol Fast rates after the long-context boundary", () => {
+  test("keeps GPT-5.6 Sol Fast rates flat after the 272K boundary", () => {
     expect(
       resolveTokenUsageCost({
         ...usage,
@@ -138,7 +172,7 @@ describe("Codex service tier price estimates", () => {
     ).toEqual({
       currency: "USD",
       source: "builtin",
-      total_cost_nanos: 4_353_480_000,
+      total_cost_nanos: 2_176_940_000,
     })
   })
 })

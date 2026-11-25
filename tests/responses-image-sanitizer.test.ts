@@ -8,8 +8,9 @@ import type {
 } from "~/lib/types/responses"
 
 import {
+  getResponsesRequestOptions,
+  hasVisionInput,
   normalizeInputImageDetails,
-  sanitizeAllInputImages,
   sanitizeOversizedInputImages,
 } from "~/routes/responses/utils"
 
@@ -73,7 +74,7 @@ describe("sanitizeOversizedInputImages", () => {
     ).toEqual({ detail: "low", image_url: imageUrl, type: "input_image" })
   })
 
-  test("replaces all input images for a retry after payload rejection", () => {
+  test("replaces every input image exceeding the configured size limit", () => {
     const firstImageUrl = imageDataUrl(1024)
     const secondImageUrl = imageDataUrl(1024)
     const payload = {
@@ -98,7 +99,7 @@ describe("sanitizeOversizedInputImages", () => {
       model: "gpt-test",
     } as unknown as ResponsesPayload
 
-    const sanitized = sanitizeAllInputImages(payload)
+    const sanitized = sanitizeOversizedInputImages(payload, 1)
 
     expect(sanitized).toBe(2)
     expect(JSON.stringify(payload)).not.toContain(firstImageUrl)
@@ -265,5 +266,85 @@ describe("normalizeInputImageDetails", () => {
 
     expect(normalized).toBe(1)
     expect(toolOutputImage.detail).toBe("auto")
+  })
+})
+
+describe("hasVisionInput", () => {
+  test("detects input_image inside user message content", () => {
+    const payload = makePayload(imageDataUrl(8))
+
+    expect(hasVisionInput(payload)).toBe(true)
+    expect(getResponsesRequestOptions(payload)).toEqual({
+      initiator: "user",
+      vision: true,
+    })
+  })
+
+  test("detects input_image inside function_call_output.output", () => {
+    const payload = {
+      input: [
+        {
+          call_id: "call_123",
+          output: [
+            {
+              image_url: imageDataUrl(8),
+              type: "input_image",
+            },
+          ],
+          status: "completed",
+          type: "function_call_output",
+        } satisfies ResponseFunctionCallOutputItem,
+      ],
+      model: "gpt-test",
+    } satisfies ResponsesPayload
+
+    expect(hasVisionInput(payload)).toBe(true)
+    expect(getResponsesRequestOptions(payload)).toEqual({
+      initiator: "agent",
+      vision: true,
+    })
+  })
+
+  test("detects input_image inside custom_tool_call_output.output", () => {
+    const payload = {
+      input: [
+        {
+          call_id: "call_456",
+          output: [
+            {
+              image_url: imageDataUrl(8),
+              type: "input_image",
+            },
+          ],
+          status: "completed",
+          type: "custom_tool_call_output",
+        } satisfies ResponseCustomToolCallOutputItem,
+      ],
+      model: "gpt-test",
+    } satisfies ResponsesPayload
+
+    expect(hasVisionInput(payload)).toBe(true)
+  })
+
+  test("returns false for text-only tool outputs", () => {
+    const payload = {
+      input: [
+        {
+          call_id: "call_str",
+          output: "plain text output",
+          status: "completed",
+          type: "function_call_output",
+        } satisfies ResponseFunctionCallOutputItem,
+        {
+          call_id: "call_arr",
+          output: [{ text: "only text", type: "input_text" }],
+          status: "completed",
+          type: "custom_tool_call_output",
+        } satisfies ResponseCustomToolCallOutputItem,
+      ],
+      model: "gpt-test",
+    } satisfies ResponsesPayload
+
+    expect(hasVisionInput(payload)).toBe(false)
   })
 })

@@ -2,8 +2,8 @@ import type { Context } from "hono"
 
 import type { Model } from "~/lib/types/models"
 
-import { COMPACT_REQUEST } from "~/lib/compact"
-import { setPluginRequestModel } from "~/lib/request-events"
+import { COMPACT_REQUEST } from "~/lib/http/compact"
+import { setPluginRequestModel } from "~/lib/http/request-events"
 import {
   getClaudeAutoModel,
   getSmallModel,
@@ -11,11 +11,12 @@ import {
   resolveMappedModel,
 } from "~/lib/config"
 import { createHandlerLogger, debugJson } from "~/lib/logger"
-import { fromClaudeDiscoveryModelId } from "~/lib/claude-models"
-import { findEndpointModel } from "~/lib/models"
-import { resolveConfiguredProviderModelAlias } from "~/lib/provider-resolver"
+import { fromClaudeDiscoveryModelId } from "~/lib/catalog/claude-models"
+import { findEndpointModel } from "~/lib/catalog/models"
+import { resolveConfiguredProviderModelAlias } from "~/lib/providers/provider-resolver"
 import { state } from "~/lib/state"
-import type { SubagentMarker } from "~/lib/subagent"
+import { requestContext } from "~/lib/http/request-context"
+import type { SubagentMarker } from "~/lib/http/subagent"
 import type { TokenUsageEndpoint } from "~/lib/token-usage"
 import {
   generateRequestIdFromPayload,
@@ -46,7 +47,6 @@ import {
   sanitizeIdeTools,
   stripToolReferenceTurnBoundary,
 } from "./preprocess"
-import { parseSubagentMarkerFromFirstUser } from "./subagent-marker"
 import { tryHandleWebSearch } from "./web-search/fulfill"
 import consola from "consola"
 
@@ -69,6 +69,7 @@ export async function handleCompletion(c: Context) {
 
 export interface CompletionPayloadOptions {
   compactType?: ReturnType<typeof getCompactType>
+  forwardStructuredOutput?: boolean
   skipClaudeAutoModel?: boolean
   skipModelMapping?: boolean
   skipWebSearch?: boolean
@@ -128,6 +129,7 @@ export async function handleCompletionPayload(
     return await handleProviderMessagesForProvider(c, {
       payload: anthropicPayload,
       provider: providerModelAlias.provider,
+      forwardStructuredOutput: dispatchOptions.forwardStructuredOutput,
       usageEndpoint: dispatchOptions.usageEndpoint,
     })
   }
@@ -140,13 +142,13 @@ export async function handleCompletionPayload(
 
   const subagentMarker =
     dispatchOptions.subagentMarker
-    ?? parseSubagentMarkerFromFirstUser(anthropicPayload)
+    ?? requestContext.getStore()?.subagent
+    ?? null
   if (subagentMarker) {
-    debugJson(logger, "Detected Subagent marker:", subagentMarker)
+    debugJson(logger, "Detected subagent session:", subagentMarker)
   }
 
-  let sessionId =
-    dispatchOptions.sessionId ?? getRootSessionId(anthropicPayload, c)
+  let sessionId = dispatchOptions.sessionId ?? getRootSessionId()
 
   // claude code and opencode compact / auto-continue detection
   const compactType =
@@ -217,6 +219,7 @@ export async function handleCompletionPayload(
         sessionId,
         compactType,
         logger,
+        forwardStructuredOutput: dispatchOptions.forwardStructuredOutput,
         usageEndpoint: dispatchOptions.usageEndpoint,
       },
     )
@@ -233,6 +236,7 @@ export async function handleCompletionPayload(
         sessionId,
         compactType,
         logger,
+        forwardStructuredOutput: dispatchOptions.forwardStructuredOutput,
         usageEndpoint: dispatchOptions.usageEndpoint,
       },
     )
@@ -248,6 +252,7 @@ export async function handleCompletionPayload(
       sessionId,
       compactType,
       logger,
+      forwardStructuredOutput: dispatchOptions.forwardStructuredOutput,
       usageEndpoint: dispatchOptions.usageEndpoint,
     },
   )

@@ -1,7 +1,8 @@
 import { afterEach, beforeEach, describe, expect, mock, test } from 'bun:test'
-import { Window } from 'happy-dom'
+import type { Window } from 'happy-dom'
 import { act, createElement } from 'react'
 import type { Root } from 'react-dom/client'
+import { createTestDom } from './helpers/dom'
 
 import SubscriptionQuotaCard, {
   SubscriptionQuotaDetails,
@@ -17,7 +18,7 @@ let container: HTMLDivElement
 let fetchUsage: ReturnType<
   typeof mock<(provider: string) => Promise<SubscriptionUsage | null>>
 >
-const previousGlobals = new Map<string, PropertyDescriptor | undefined>()
+let cleanupDom: () => Promise<void>
 function formatTestAmount(
   value: number,
   unit?: 'credits' | 'USD' | 'requests',
@@ -55,41 +56,16 @@ const business: SubscriptionUsage = {
 }
 
 beforeEach(async () => {
-  win = new Window({ url: 'http://localhost' })
-  for (const [name, value] of Object.entries({
-    window: win,
-    document: win.document,
-    navigator: win.navigator,
-    HTMLElement: win.HTMLElement,
-    Event: win.Event,
-    MouseEvent: win.MouseEvent,
-    IS_REACT_ACT_ENVIRONMENT: true,
-  })) {
-    previousGlobals.set(name, Object.getOwnPropertyDescriptor(globalThis, name))
-    Object.defineProperty(globalThis, name, {
-      configurable: true,
-      writable: true,
-      value,
-    })
-  }
+  ;({ win, root, container, cleanup: cleanupDom } = await createTestDom())
   fetchUsage = mock(() => Promise.resolve(structuredClone(business)))
   Object.defineProperty(win, 'electronAPI', {
     value: { fetchSubscriptionUsage: fetchUsage },
   })
-  container = document.createElement('div')
-  document.body.append(container)
-  const { createRoot } = await import('react-dom/client')
-  root = createRoot(container)
 })
 
 afterEach(async () => {
   await act(async () => root.unmount())
-  await win.happyDOM.close()
-  for (const [name, descriptor] of previousGlobals) {
-    if (descriptor) Object.defineProperty(globalThis, name, descriptor)
-    else Reflect.deleteProperty(globalThis, name)
-  }
-  previousGlobals.clear()
+  await cleanupDom()
 })
 
 async function renderDetails(usage: SubscriptionUsage) {
@@ -409,6 +385,22 @@ describe('subscriptions page', () => {
       ),
     )
   }
+
+  test('shows only the Codex card and queries only its quota for a Codex-only setup', async () => {
+    window.electronAPI.getProviderManagementConfig = mock(() =>
+      Promise.resolve({
+        configPath: 'config.json',
+        providers: [{ name: 'codex', type: 'openai-responses', enabled: true }],
+      }),
+    )
+
+    await renderPage(0)
+
+    expect(container.querySelectorAll('.quota-provider-card')).toHaveLength(1)
+    expect(container.textContent).toContain('Codex')
+    expect(container.textContent).not.toContain('GitHub Copilot')
+    expect(fetchUsage.mock.calls).toEqual([['codex']])
+  })
 
   test('offers provider management when no subscription provider is enabled', async () => {
     window.electronAPI.getProviderManagementConfig = mock(() =>

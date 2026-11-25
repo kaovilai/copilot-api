@@ -1,6 +1,6 @@
 import { afterEach, expect, test } from "bun:test"
 
-import { HTTPError } from "../src/lib/error"
+import { HTTPError } from "../src/lib/http/http-error"
 import { retryPreResponseFailures } from "../src/lib/fetch-timeout"
 
 const originalFetch = globalThis.fetch

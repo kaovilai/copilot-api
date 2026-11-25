@@ -1,9 +1,9 @@
 import { afterEach, describe, expect, spyOn, test } from "bun:test"
 
-import * as providerResolver from "~/lib/provider-resolver"
-import * as grokBuild from "~/lib/grok-build"
-import * as xaiToken from "~/lib/xai-token"
-import * as githubProvider from "~/lib/github-copilot-provider"
+import * as providerResolver from "~/lib/providers/provider-resolver"
+import * as grokBuild from "~/lib/providers/grok-build"
+import * as xaiToken from "~/lib/auth/xai-token"
+import * as githubProvider from "~/lib/providers/github-copilot-provider"
 import { state } from "~/lib/state"
 import * as subscriptionUsage from "~/services/subscription-usage"
 import {
@@ -539,9 +539,9 @@ describe("subscription usage requests", () => {
     expect(headers.get("chatgpt-account-id")).toBe("business-workspace")
     expect(headers.get("originator")).toBe("codex_cli_rs")
     expect(headers.get("user-agent")).toMatch(
-      /^codex_cli_rs\/0\.164\.0 \(.+; .+\) unknown$/u,
+      /^codex_cli_rs\/0\.166\.0 \(.+; .+\) unknown$/u,
     )
-    expect(headers.get("version")).toBe("0.164.0")
+    expect(headers.get("version")).toBe("0.166.0")
     expect(init?.redirect).toBe("error")
     controller.abort()
     expect(init?.signal?.aborted).toBe(true)

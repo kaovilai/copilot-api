@@ -7,12 +7,13 @@ import {
   resolveMappedModel,
 } from "~/lib/config"
 import { createHandlerLogger, debugJson, debugJsonTail } from "~/lib/logger"
-import { recordResponsesFirstToken } from "~/lib/first-token"
-import { findEndpointModel } from "~/lib/models"
-import { resolveConfiguredProviderModelAlias } from "~/lib/provider-resolver"
-import { requestContext } from "~/lib/request-context"
-import { setPluginRequestModel } from "~/lib/request-events"
-import { writeSSEIfConnected } from "~/lib/sse"
+import { recordResponsesFirstToken } from "~/lib/http/first-token"
+import { findEndpointModel } from "~/lib/catalog/models"
+import { resolveConfiguredProviderModelAlias } from "~/lib/providers/provider-resolver"
+import { requestContext } from "~/lib/http/request-context"
+import { setPluginRequestModel } from "~/lib/http/request-events"
+import { readResponsesStreamEvent } from "~/lib/http/responses-stream-event"
+import { writeSSEIfConnected } from "~/lib/http/sse"
 import { isCodexUserAgent } from "~/routes/models/codex-models"
 import {
   handleProviderResponsesForProvider,
@@ -27,31 +28,37 @@ import {
 import {
   generateRequestIdFromPayload,
   getUUID,
-  isAsyncIterable,
+  isResponsesStream,
 } from "~/lib/utils"
-import type { SubagentMarker } from "~/lib/subagent"
 import type {
   ResponsesPayload,
   ResponsesResult,
   ResponsesTransport,
-  ResponseStreamEvent,
 } from "~/lib/types/responses"
 import { createResponses as createCopilotResponses } from "~/services/copilot/create-responses"
 
 import { handleResponsesViaMessages } from "./messages-handler"
-import { applyStreamIdFix, createStreamIdTracker } from "./stream-id-sync"
+import { createResponsesStreamTerminalTracker } from "./stream-failure"
+import {
+  createCopilotResponsesSseMessage,
+  createStreamIdTracker,
+} from "./stream-id-sync"
 import { getCodexTaskTitleModel } from "./task-title"
 import {
+  applyDefaultReasoningSummary,
   applyResponsesApiContextManagement,
   compactInputByLatestCompaction,
   filterReasoningForTransport,
   getResponsesTransportForModel,
   getResponsesRequestOptions,
+  hasTerminalCompactionTrigger,
   normalizeGuardianAgentMessages,
   normalizeInputImageDetails,
   normalizeResponsesReasoningEffort,
+  replayMessagesCompactionForResponses,
   sanitizeOversizedInputImages,
   sanitizeUnsupportedInputFields,
+  RESPONSES_ENDPOINT,
 } from "./utils"
 import consola from "consola"
 
@@ -102,12 +109,9 @@ export const handleResponses = async (c: Context) => {
   const rootSessionId = store?.rootSessionId
   const sessionAffinity = store?.sessionAffinity
 
-  const subagentMarker = getCodexResponsesSubagentMarker(c, {
-    rootSessionId,
-    sessionAffinity,
-  })
+  const subagentMarker = store?.subagent ?? null
   if (subagentMarker) {
-    debugJson(logger, "Detected Codex subagent headers:", subagentMarker)
+    debugJson(logger, "Detected subagent session:", subagentMarker)
   }
 
   const sessionId = rootSessionId ? getUUID(rootSessionId) : undefined
@@ -166,6 +170,7 @@ export const handleResponses = async (c: Context) => {
   }
 
   filterReasoningForTransport(payload, false)
+  applyDefaultReasoningSummary(payload)
 
   const recordUsage = createCopilotTokenUsageRecorder({
     endpoint: "responses",
@@ -224,6 +229,7 @@ export const handleResponses = async (c: Context) => {
   if (shouldCompactInput) {
     compactInputByLatestCompaction(payload)
   }
+  replayMessagesCompactionForResponses(payload)
 
   debugJson(logger, "Translated Responses payload:", payload)
 
@@ -239,12 +245,16 @@ export const handleResponses = async (c: Context) => {
     sessionId: fallbackSessionId,
     clientSignal: c.req.raw.signal,
     transport: responsesTransport,
+    allowCompactionHttpFallback:
+      selectedModel?.supported_endpoints?.includes(RESPONSES_ENDPOINT)
+      && hasTerminalCompactionTrigger(payload),
   })
 
-  if (isStreamingRequested(payload) && isAsyncIterable(response)) {
+  if (isStreamingRequested(payload) && isResponsesStream(response)) {
     logger.debug("Forwarding native Responses stream")
     return streamSSE(c, async (stream) => {
       const idTracker = createStreamIdTracker()
+      const terminalTracker = createResponsesStreamTerminalTracker(publicModel)
       let usage: UsageTokens = {}
       const iterator = response[Symbol.asyncIterator]()
 
@@ -253,7 +263,8 @@ export const handleResponses = async (c: Context) => {
           [Symbol.asyncIterator]: () => iterator,
         }) {
           debugJson(logger, "Responses stream chunk:", chunk)
-          const parsedEvent = parseResponsesStreamEvent(chunk)
+          const parsedEvent = readResponsesStreamEvent(chunk)
+          terminalTracker.observe(parsedEvent)
           recordResponsesFirstToken(parsedEvent)
           if (
             parsedEvent?.type === "response.completed"
@@ -268,28 +279,22 @@ export const handleResponses = async (c: Context) => {
             }
           }
 
-          const rawData = (chunk as { data?: string }).data ?? ""
-          const processedData =
-            (
-              parsedEvent
-              && applyStreamIdFix(
-                parsedEvent,
-                (chunk as { event?: string }).event,
-                idTracker,
-              )
-            ) ?
-              JSON.stringify(parsedEvent)
-            : rawData
-
-          await writeSSEIfConnected(stream, {
-            id: (chunk as { id?: string }).id,
-            event: (chunk as { event?: string }).event,
-            data: processedData,
-          })
+          await writeSSEIfConnected(
+            stream,
+            createCopilotResponsesSseMessage(chunk, parsedEvent, idTracker),
+            parsedEvent?.type,
+          )
         }
       } finally {
         await iterator.return?.()
         recordUsage(usage)
+
+        const failure = terminalTracker.finalize(idTracker.responseId)
+        if (failure && (await writeSSEIfConnected(stream, failure.sse))) {
+          logger.warn(
+            `Responses stream ended without a terminal event; sent response.failed (${failure.code}: ${failure.message})`,
+          )
+        }
       }
     })
   }
@@ -330,21 +335,6 @@ const shouldFallbackToMessages = (
     supportedEndpoints.includes("/v1/messages")
     || supportedEndpoints.includes("/chat/completions")
   )
-}
-
-const parseResponsesStreamEvent = (
-  chunk: unknown,
-): ResponseStreamEvent | null => {
-  const data = (chunk as { data?: string }).data
-  if (!data || data === "[DONE]") {
-    return null
-  }
-
-  try {
-    return JSON.parse(data) as ResponseStreamEvent
-  } catch {
-    return null
-  }
 }
 
 const removeWebSearchTool = (payload: ResponsesPayload): void => {
@@ -408,37 +398,4 @@ const fillEmptyNamespaceDescriptions = (tools: unknown): void => {
       namespaceTool.description = namespaceTool.name
     }
   }
-}
-
-const codexSubagentHeaderValues = new Set([
-  "collab_spawn",
-  "compact",
-  "memory_consolidation",
-  "review",
-])
-
-const getCodexResponsesSubagentMarker = (
-  c: Context,
-  session: { rootSessionId?: string; sessionAffinity?: string },
-): SubagentMarker | null => {
-  const agentType = getTrimmedHeader(c, "x-openai-subagent")
-  if (!agentType || !codexSubagentHeaderValues.has(agentType)) {
-    return null
-  }
-
-  const { rootSessionId, sessionAffinity } = session
-  if (!sessionAffinity) {
-    return null
-  }
-
-  return {
-    agent_id: sessionAffinity,
-    agent_type: agentType,
-    session_id: rootSessionId ?? sessionAffinity,
-  }
-}
-
-const getTrimmedHeader = (c: Context, name: string): string | undefined => {
-  const value = c.req.header(name)?.trim()
-  return value || undefined
 }

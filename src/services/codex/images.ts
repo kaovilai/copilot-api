@@ -3,11 +3,9 @@ import {
   type RequestInit as UndiciRequestInit,
 } from "undici"
 
-import { createTimeoutDispatcher } from "~/lib/timeout-dispatcher"
-import {
-  buildCodexRequestHeaders,
-  CODEX_API_BASE_URL,
-} from "~/services/codex/create-responses"
+import { createTimeoutDispatcher } from "~/lib/http/timeout-dispatcher"
+import { CODEX_API_BASE_URL } from "~/services/codex/constants"
+import { buildCodexRequestHeaders } from "~/services/codex/create-responses"
 
 export type CodexImagesOperation = "generations" | "edits"
 
@@ -46,7 +44,10 @@ export async function forwardCodexImages(
     headers,
     body: request.body,
     duplex: "half",
-    signal: AbortSignal.timeout(CODEX_IMAGES_TIMEOUT_MS),
+    signal: AbortSignal.any([
+      request.signal,
+      AbortSignal.timeout(CODEX_IMAGES_TIMEOUT_MS),
+    ]),
   }
 
   const upstreamUrl = resolveCodexImagesUrl(request.url, operation)

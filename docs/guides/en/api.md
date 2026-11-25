@@ -4,10 +4,11 @@
 
 ## API Authentication
 
-- **Protected non-admin routes:** All routes except `/`, `/usage-viewer`, and `/usage-viewer/` require authentication when `auth.apiKeys` is configured and non-empty. Non-loopback listeners require a non-empty `auth.apiKeys` configuration at startup and continue failing closed if the keys are later cleared.
+- **Protected non-admin routes:** All routes except `/`, `/usage-viewer`, and `/usage-viewer/` require authentication when `auth.apiKeyConfigs` is non-empty. Non-loopback listeners require a non-empty key configuration at startup and continue failing closed if the keys are later cleared.
 - **Admin routes:** All `/admin/*` routes require `auth.adminApiKey`. If it is missing, the server generates one at startup and persists it to `config.json` before serving requests.
 - **Allowed auth headers:**
   - `x-api-key: <your_key>`
+  - `x-goog-api-key: <your_key>`
   - `Authorization: Bearer <your_key>`
 - **CORS preflight:** `OPTIONS` requests are always allowed.
 - **When no regular keys are configured:** Non-admin routes continue to allow requests. This does not apply to `/admin/*`, which only accepts `auth.adminApiKey`.
@@ -36,34 +37,54 @@ These endpoints mimic the OpenAI API structure.
 
 | Endpoint                    | Method | Description                                                      |
 | --------------------------- | ------ | ---------------------------------------------------------------- |
-| `POST /v1/responses`        | `POST` | OpenAI Most advanced interface for generating model responses. Supports `Content-Encoding: zstd` request bodies and `provider/model` aliases for `openai-responses` providers. Zstd request decompression is limited to Responses routes, including provider-scoped aliases. |
+| `POST /v1/responses`        | `POST` | Generates model responses using the OpenAI Responses API format. Supports `Content-Encoding: zstd` request bodies and `provider/model` aliases for `openai-responses` providers. Zstd request decompression is limited to Responses routes, including provider-scoped aliases. |
 | `POST /v1/chat/completions` | `POST` | Creates a model response for the given chat conversation. Supports `provider/model` aliases for `openai-compatible` providers and can be used without Copilot when the target provider is configured. |
-| `GET /v1/models`            | `GET`  | Lists Copilot models plus enabled provider models using `provider/model-id` IDs. Requests from Codex clients (`User-Agent` beginning with `codex`) are forwarded to the Codex Models upstream. |
+| `GET /v1/models`            | `GET`  | Lists Copilot models plus enabled provider models using `provider/model-id` IDs. Requests from Codex clients (`User-Agent` beginning with `codex`) receive the merged Codex-format catalog, excluding image-only models. |
 | `POST /v1/embeddings`       | `POST` | Creates an embedding vector representing the input text.         |
 
 ### Model Discovery Sources
 
 `GET /models`, `GET /v1/models`, and `GET /:provider/v1/models` read `xai`, `openrouter`, `deepseek`, `kimi`, `dashscope`, and `opencode-go` models from the models.dev cache without querying those providers' model endpoints. Kimi defaults to `kimi-code-plan-cn` and DashScope to `alibaba-cn`; other official URLs select their matching catalogs. Explicit `modelsDevProviderId` takes priority.
 
-Models missing from the catalog receive no built-in entries. A provider-scoped request with no valid cached models returns `503` (`service_unavailable`); aggregation skips empty catalogs. Capabilities, limits, and USD prices come from the catalog, with explicit model settings taking priority.
+Chat models missing from the catalog receive no additional built-in entries. A provider-scoped request with no valid cached models returns `503` (`service_unavailable`); aggregation skips empty catalogs. Capabilities, limits, and USD prices come from the catalog, with explicit model settings taking priority.
+
+The ordinary aggregated OpenAI-format `GET /models` and `GET /v1/models` catalogs include built-in GitHub Copilot, Codex, and xAI image models by default for available providers and do not apply `agentsModels`. The desktop Dashboard's Available Models and the web viewer's Models tab use these ordinary model endpoints with no extra query parameter.
+
+Claude, Codex, and DeepSeek client catalogs always exclude image-only models, even when `agentsModels` explicitly selects them. Chat models that accept image input or produce both text and images remain subject to the normal selection rules. OpenCode discovery continues to include image-only models when their providers are available and `agentsModels` allows them; explicit lists must include the raw upstream image ID, such as `gpt-image-2` under `codex`.
 
 All models.dev lists exclude deprecated models and those released before `2026-05-01`, including explicit display selections. Models without a valid `release_date` remain listed.
 
 The Codex model catalog, Copilot model cache, and other custom providers retain their existing remote discovery behavior.
 
-### Codex Backend Endpoints
+<a id="codex-backend-endpoints"></a>
 
-These endpoints implement Codex backend APIs. Image requests routed to Codex require an active Codex login; configured provider image routes use that provider's credentials. Alpha search can use either the Codex backend or a Responses web-search adapter.
+### Image and Search Endpoints
+
+Top-level image routes apply model mappings first. A missing or blank model, or the bare `gpt-image-2` name, selects the first available provider in this order: **Codex → GitHub Copilot → xAI**, using that provider's default image model. Availability checks the enabled provider and its credentials without querying model catalogs; if none is available, the gateway returns `404`.
+
+Explicit `provider/model` aliases stay on that provider and preserve the upstream model name, including names absent from the built-in catalog. An unavailable explicit target returns its error instead of selecting another provider. Other bare model names target Codex unchanged; their names do not select GitHub Copilot or xAI. Use a provider alias, model mapping, or provider-scoped path to specify those targets. Provider-scoped paths preserve supplied model names. Built-in scoped paths fill their provider's default only when the model is omitted or blank and strip a matching `provider/` prefix. Custom providers receive native Images JSON or multipart requests. The final model is used for usage accounting.
+
+JSON image requests must be UTF-8 encoded objects. Invalid JSON returns `400` (`invalid_request_error`) on both top-level and provider-scoped routes instead of falling back to Codex. Validation preserves large-request streaming and stops forwarding if an error is discovered during upload. Multipart image edits remain supported.
+
+Image requests routed to Codex require an active Codex login; other image routes use their provider's credentials. Alpha search can use the Codex backend, native DeepSeek Alpha Search with an official DeepSeek base URL, or a Responses web-search adapter.
 
 | Endpoint                                                       | Method | Description                                                     |
 | -------------------------------------------------------------- | ------ | --------------------------------------------------------------- |
-| `POST /v1/alpha/search`                | `POST` | Routes Codex alpha-search requests to the Codex backend, or handles supported commands locally and through Responses web search. |
-| `POST /v1/images/generations` | `POST` | Forwards a JSON image generation request to the Codex Images upstream. When the request omits `Content-Type`, the gateway defaults it to `application/json`. Configured model mappings apply to the request `model`; a mapping that resolves to a `provider/model` alias forwards the request to that provider's images endpoint when the provider is configured. |
-| `POST /v1/images/edits` | `POST` | Sends JSON image edits to Codex or a mapped provider. Use `Content-Type: application/json`, `prompt`, and `images: [{ image_url }]` (HTTP URL or base64 data URL) or `images: [{ file_id }]`; an optional `mask` is a single reference object. Model mappings and `provider/model` aliases apply. The desktop app converts local images to data URLs before sending JSON. Multipart uploads are no longer supported and return `415`; send JSON instead. `/codex/v1/images/edits` also requires JSON and forwards it unchanged. Other provider-scoped image routes retain their existing pass-through behavior. |
+| `POST /v1/alpha/search`                | `POST` | Routes alpha-search requests to Codex or native DeepSeek, or handles supported commands locally and through Responses web search. |
+| `POST /v1/images/generations` | `POST` | Routes a JSON image generation request by its model mapping or provider alias. Missing `Content-Type` defaults to `application/json`. Only missing, blank, or bare `gpt-image-2` models use automatic provider selection; other model names are preserved for upstream validation. |
+| `POST /v1/images/edits` | `POST` | Accepts JSON image references or `multipart/form-data` uploads. JSON requests retain their existing behavior, including `images: [{ image_url }]`, `images: [{ file_id }]`, and an optional `mask` reference. Multipart uploads accept `image`, `image[]`, and repeated image fields in their original order, plus an optional `mask`. Files are staged to disk, then converted to base64 data URLs and JSON for Codex, GitHub Copilot, or xAI. Model mappings and `provider/model` aliases apply. `/codex/v1/images/edits`, `/github-copilot/v1/images/edits`, and `/xai/v1/images/edits` also accept multipart; other provider-scoped multipart edits are staged to disk and forwarded as multipart with usage recorded against `model`. |
 
-When `imageGenerationModel` or `imageEditModel` is an `xai/model` alias, that top-level route translates the OpenAI image request and sends it to the enabled `xai` provider's Imagine API. The alias selects the upstream model. An empty setting keeps the OpenAI forwarding path described above. Other providers are not accepted in these two settings.
+Use `model: "github-copilot/gpt-image-2.5-flare"` on either image endpoint to select GitHub Copilot when available, or configure a model mapping to this alias. The gateway removes `github-copilot/` from the upstream model and forwards OpenAI-compatible image parameters, JSON image references, and responses, including streaming events. Multipart edits are converted to the same JSON format. Provider-scoped `/github-copilot/v1/images/generations` and `/github-copilot/v1/images/edits` accept the raw model ID and stay on Copilot; disabled Copilot returns `403`, and a missing GitHub login returns `401`. Copilot image requests use the active GitHub login token and existing device ID. The built-in image catalog supplies this model even when Copilot's models endpoint omits it. Token usage comes from the standard OpenAI-compatible `usage` field. Only costs use `copilot_usage.total_nano_aiu`, converted at the existing Copilot AIU rate.
+
+Multipart uploads are limited to 128 MiB total, 64 MiB per file, and 16 files; exceeding a limit returns `413`, and malformed multipart returns `400`. Verbose logs include only the `model`, `prompt`, `size`, `quality`, and `n` fields; individual fields are truncated after 8192 characters. Temporary files are removed after JSON conversion or on failure/cancellation. Base64 expands image data by about one third, and the generated JSON is buffered before forwarding. xAI retains its 5-image limit and rejects masks, file IDs, and streaming.
+
+When an image model resolves to `xai/model`, the common route translates OpenAI image parameters for the xAI Imagine API. OpenAI `size` maps to `aspect_ratio` and `resolution`. For `grok-imagine-image-2.0`, `high` and `hd` quality map to `medium`; other models omit `quality`. xAI supports up to five image references and rejects masks, file IDs, and streaming. OAuth uses the subscription base URL; API-key requests use the configured provider base URL.
+
+The default xAI response format is `b64_json`. URL-only output is downloaded from the xAI output CDN with a 32 MiB limit; failure returns `502`. Explicit `response_format: "url"` skips downloading. Provider-scoped xAI JSON retains its native behavior, and multipart edits use the xAI conversion.
 
 For requests routed to the Codex backend, the gateway replaces client authorization and account headers with the active Codex login and preserves compatible request metadata. Responses-backed alpha search instead follows the selected Copilot or provider route.
+
+Native Alpha Search calls appear in Token usage with `endpoint: "alpha_search"`, zero token counts, their actual provider, and a `_search` suffix on the model name (for example, `deepseek-flash_search`) so search requests have separate model summaries. The session falls back to `x-codex-turn-metadata.session_id`, then `thread_id`, then the request `id`, after existing session headers. Codex Alpha Search has a recorded USD cost of zero. Official DeepSeek Alpha Search uses the official Search/Fetch price: [CNY 5 per 1,000 operations](https://api-docs.deepseek.com/zh-cn/quick_start/pricing/) by default, or [USD 0.75 per 1,000](https://api-docs.deepseek.com/guides/search/#billing) when the provider uses USD. If successful tool counts are present in the response, those counts are used; otherwise fees are estimated from submitted search/open/find commands and available results, with `cost.source: "estimate"`. Batch partial failures cannot be reconciled without upstream counts. Failed HTTP requests and empty searches have zero fees. Requests adapted to Responses retain their existing Responses usage record without an extra Alpha Search record.
 
 ### xAI Video Endpoints
 
@@ -90,7 +111,7 @@ curl http://localhost:4141/v1/videos/YOUR_REQUEST_ID \
   -H 'Authorization: Bearer your_gateway_key'
 ```
 
-The gateway does not wait for generation, retry submissions, or store jobs. Keep the same xAI account and base URL while querying. Clients handle native statuses such as `pending`, `done`, and `failed`, and access the returned `video.url` directly. Default xAI video URLs are temporary. See the [xAI video documentation](https://docs.x.ai/developers/model-capabilities/video/generation).
+The submit endpoint returns as soon as xAI accepts the job. For jobs submitted with a gateway API key, the gateway saves the job ID and settles reported costs in the background, resuming pending checks after restart. Keep the same xAI account and base URL available during settlement. Clients handle native statuses such as `pending`, `done`, and `failed`, and access the temporary `video.url` directly. See the [xAI video documentation](https://docs.x.ai/developers/model-capabilities/video/generation).
 
 ### Anthropic Compatible Endpoints
 
@@ -100,6 +121,23 @@ These endpoints are designed to be compatible with the Anthropic Messages API.
 | -------------------------------- | ------ | ------------------------------------------------------------ |
 | `POST /v1/messages`              | `POST` | Creates a model response for a given conversation. Supports `provider/model` aliases for configured providers, including translation through `openai-compatible` and native Google Gemini (`google`) providers. |
 | `POST /v1/messages/count_tokens` | `POST` | Calculates the number of tokens for a given set of messages. Supports `provider/model` aliases for configured providers. |
+
+When token counting falls back to local estimation, image URLs and Base64 data are not tokenized as text: each image has a base estimate of 85 tokens for `low` detail, or 765 tokens for `high`, `auto`, or unspecified detail, before any configured model multiplier. Actual usage depends on the upstream model and image dimensions; use the response usage for actual token counts.
+
+### Google Gemini Compatible Endpoints
+
+These endpoints expose the Gemini 4+ / GenAI REST surface. Requests targeting configured `type: "google"` providers (including per-model `type: "google"` overrides) pass through natively; all other Copilot and provider models translate bidirectionally through the Messages API hub while preserving `thoughtSignature` round-trips. Usage is recorded under the `generate_content` endpoint.
+
+Use lowerCamelCase for Gemini request fields such as `generationConfig` and `inlineData`.
+
+| Endpoint | Method | Description |
+| --- | --- | --- |
+| `GET /v1beta/models` | `GET` | Lists available gateway models in Google `models/<id>` format. Models with multiple reasoning levels are listed as variants such as `-high`. A variant selects that level on the base model. |
+| `POST /v1beta/models/<model>:generateContent` | `POST` | Generates a non-streaming Gemini response. Supports `provider/model` aliases and model mappings. |
+| `POST /v1beta/models/<model>:streamGenerateContent` | `POST` | Generates a streaming Gemini response as SSE (`?alt=sse`) or a JSON array. |
+| `POST /v1beta:<action>` | `POST` | Acknowledges Antigravity / GenAI telemetry pings with `{}`. |
+
+The Gemini catalog follows each provider's `agentsModels` selection. It can advertise a `my-gemini-` alias for a selected model that accepts both images and PDF files. Generation resolves that alias to the original model and applies any reasoning level selected in the ID.
 
 ### Usage Monitoring Endpoints
 
@@ -113,9 +151,24 @@ Endpoints for monitoring subscription usage and quotas.
 | `GET /usage/xai` | `GET` | Get the selected xAI subscription's Grok Build allowance and prepaid balance. |
 | `GET /usage/opencode-go` | `GET` | Get OpenCode Go rolling 5-hour, weekly, and monthly usage percentages and reset times. |
 
+Desktop uses the corresponding `/admin/usage` endpoints with the Admin Key. This keeps subscription cards available when regular key usage is isolated.
+
 OpenCode Go uses the configured provider API key and base URL to query `GET /v1/usage`; legacy `https://opencode.ai/zen/go` URLs use the existing normalization to `https://opencode.ai/inference/go`. Monetary caps and plan tiers are not inferred from percentages. A workspace without a Go allowance returns 404, matching other unavailable subscriptions.
 
 Subscription endpoints use the server's enabled provider and selected account. They return normalized `provider`, `planType`, `windows`, `credits`, and limit status fields, with `resetAt` in Unix seconds. Copilot calendar reset dates use `resetDate`; individual windows may report `unlimited`. Unavailable subscriptions return 404; upstream or credential failures return 502. The desktop and web Subscriptions tabs query these endpoints independently. Upstream credentials stay on the server.
+
+### Token Usage History Endpoints
+
+These endpoints query request usage, costs, and performance saved by the gateway, separately from subscription allowances.
+
+| Endpoint | Method | Description |
+| --- | --- | --- |
+| `/token-usage` | `GET` | Usage summary for the selected period. |
+| `/token-usage/daily` | `GET` | Daily usage summaries. |
+| `/token-usage/events` | `GET` | Paginated request events. |
+| `/token-usage/sessions` | `GET` | Paginated session summaries. |
+
+All four accept `period`: `today` (default), `this_week`, `last_7_days`, `this_month`, `last_30_days`, or `lifetime`. Legacy `day`, `week`, and `month` values remain accepted. Paginated endpoints also accept `page` (default `1`) and `page_size` (default `20`). These paths have no `/v1` prefix and use regular gateway API key authentication. See [usage monitoring](usage.md#request-timing) for metric definitions.
 
 ### Admin / Configuration Endpoints
 
@@ -128,3 +181,9 @@ These endpoints are reserved for local administrative actions and only accept `a
 | `POST /admin/config/reload` | `POST` | Reloads configuration into the current server process without restarting. |
 
 The reload endpoint requires no request body and returns `{ configPath, reloaded: true }`. After changing the admin key on disk, authenticate the reload with the previous active key. Invalid JSON preserves the last working configuration. The desktop calls this endpoint automatically after saving gateway configuration.
+
+### Responses WebSocket continuation
+
+For the built-in Codex and GitHub Copilot providers, streamed requests using an upstream WebSocket may reuse the latest completed response or supported interrupted checkpoint on that same socket. The gateway prefers an opaque anchor: a reasoning item's `encrypted_content` or a tool call's type and `call_id`. If the response has no usable opaque anchor and ends with a nonempty text-only assistant message, it uses a SHA-256 hash of that message's text instead. Anchors come from `response.output_item.done`; terminal output fills only missing items. On the next request, opaque anchors are matched from the end of input as before; a text anchor is compared only with the last `role: "assistant"` message, without searching older text. String content and text blocks are normalized to the same text without trimming whitespace. After a match, subsequent assistant items are skipped and `previous_response_id` is sent with input starting at the next non-assistant item, such as a user message or client tool result. The gateway does not retain assistant text or item counts; it retains the response ID, its anchor, and the latest input compaction checkpoint hash. HTTP clients may use this optimization when their upstream transport is WebSocket; upstream HTTP requests are unchanged.
+
+Missing or mismatched anchors, no new input, reconnects, and changed compaction checkpoints send full input. A completed response without a usable anchor clears the older checkpoint. So does a response the client did not receive, such as a cancelled request that finished on the socket, or one that ended `incomplete` for a reason other than an interruption, because only the socket's latest response can be continued. Interrupted responses may save their own ID and anchor only when `status` is `incomplete` and `incomplete_details.reason` is `interrupted`. Anchors do not verify earlier history: after editing or reordering history, explicitly send `previous_response_id: null` or start a new session. A rejected automatic response ID is retried once with full input before any response events have been forwarded. Client-supplied response IDs are left intact. See the [OpenAI WebSocket continuation contract](https://developers.openai.com/api/docs/guides/websocket-mode#how-continuation-works).

@@ -2,18 +2,22 @@ import type { Context } from "hono"
 
 import { streamSSE } from "hono/streaming"
 
-import { logCodexRateLimitsEvent } from "~/lib/codex-rate-limit"
+import { logCodexRateLimitsEvent } from "~/lib/providers/codex-rate-limit"
 import {
   type ModelConfig,
   type ProviderType,
   resolveProviderConfigForModel,
 } from "~/lib/config"
-import { HTTPError } from "~/lib/error"
-import { recordResponsesFirstToken } from "~/lib/first-token"
+import { HTTPError } from "~/lib/http/error"
+import { recordResponsesFirstToken } from "~/lib/http/first-token"
 import { createHandlerLogger, debugJson } from "~/lib/logger"
-import { resolveProviderConfig } from "~/lib/provider-resolver"
-import { requestContext } from "~/lib/request-context"
-import { writeSSEIfConnected } from "~/lib/sse"
+import { resolveProviderConfig } from "~/lib/providers/provider-resolver"
+import { requestContext } from "~/lib/http/request-context"
+import {
+  readResponsesStreamEvent,
+  type ResponsesStreamChunk,
+} from "~/lib/http/responses-stream-event"
+import { writeSSEIfConnected } from "~/lib/http/sse"
 import {
   createProviderTokenUsageRecorder,
   normalizeResponsesUsage,
@@ -22,11 +26,14 @@ import {
 import { isResponsesStream } from "~/lib/utils"
 import { isCodexUserAgent } from "~/routes/models/codex-models"
 import {
+  applyDefaultReasoningSummary,
   applyResponsesApiContextManagement,
   compactInputByLatestCompaction,
   filterReasoningForTransport,
+  replayMessagesCompactionForResponses,
 } from "~/routes/responses/utils"
 import { handleResponsesViaMessages } from "~/routes/responses/messages-handler"
+import { createResponsesStreamTerminalTracker } from "~/routes/responses/stream-failure"
 import { getCodexTaskTitleModel } from "~/routes/responses/task-title"
 import {
   forwardProviderResponseHeaders,
@@ -39,7 +46,10 @@ import type {
   ResponseStreamEvent,
   ResponsesStream,
 } from "~/lib/types/responses"
-import { forwardCodexResponses } from "~/services/codex/create-responses"
+import {
+  forwardCodexResponses,
+  resolveCodexResponsesTransport,
+} from "~/services/codex/create-responses"
 import { getModels as getCodexModels } from "~/services/codex/get-models"
 import { createResponsesSafeStream } from "~/services/responses-websocket-helpers"
 import { createResponsesHttpEventStream } from "~/services/responses-http"
@@ -127,6 +137,7 @@ export async function handleProviderResponsesForProvider(
   }
 
   filterReasoningForTransport(payload, false)
+  applyDefaultReasoningSummary(payload)
 
   const model =
     providerConfig.name === "codex" ?
@@ -145,6 +156,7 @@ export async function handleProviderResponsesForProvider(
   if (shouldCompactInput) {
     compactInputByLatestCompaction(payload)
   }
+  replayMessagesCompactionForResponses(payload)
 
   debugJson(logger, "Translated Responses request payload:", {
     contextManagement: payload.context_management,
@@ -154,14 +166,23 @@ export async function handleProviderResponsesForProvider(
   const modelConfig = providerConfig.models?.[payload.model]
 
   if (providerConfig.name === "codex") {
+    const transport = resolveCodexResponsesTransport()
+    const streamAbort =
+      payload.stream && transport === "websocket" ?
+        new AbortController()
+      : undefined
     const upstreamResponse = await forwardCodexResponses(
       payload,
       c.req.raw.headers,
       providerConfig.baseUrl,
       {
-        clientSignal: c.req.raw.signal,
+        clientSignal:
+          streamAbort ?
+            AbortSignal.any([c.req.raw.signal, streamAbort.signal])
+          : c.req.raw.signal,
         onResponseHeaders: (headers) =>
           forwardProviderResponseHeaders(c, headers),
+        transport,
       },
     )
     const recordUsage = createProviderResponsesUsageRecorder(
@@ -175,7 +196,9 @@ export async function handleProviderResponsesForProvider(
       return streamProviderResponses(c, upstreamResponse, {
         normalizeCodex: true,
         provider,
+        publicModel,
         recordUsage,
+        streamAbort,
       })
     }
 
@@ -209,6 +232,7 @@ export async function handleProviderResponsesForProvider(
     return streamProviderResponses(c, getResponsesEvents(upstreamResponse), {
       normalizeCodex: false,
       provider,
+      publicModel,
       recordUsage,
     })
   }
@@ -267,7 +291,9 @@ const streamProviderResponses = async (
   options: {
     normalizeCodex: boolean
     provider: string
+    publicModel: string
     recordUsage: (usage: UsageTokens) => void
+    streamAbort?: AbortController
   },
 ): Promise<Response> => {
   const iterator = upstreamResponse[Symbol.asyncIterator]()
@@ -281,46 +307,52 @@ const streamProviderResponses = async (
   }
 
   const firstChunk = firstResult.value
-  if (firstChunk.data && firstChunk.data !== "[DONE]") {
-    const event = parseProviderResponsesStreamEvent(firstChunk.data, {
-      normalizeCodex: false,
-      provider: options.provider,
-    })
-    if (event?.type === "error") {
-      const errorEvent = event
-      const statusCode = errorEvent.status_code ?? 500
-      await iterator.return?.()
-      return c.json(
-        {
-          error: {
-            message: errorEvent.message,
-            ...errorEvent.error,
-          },
-        },
-        statusCode as ContentfulStatusCode,
-        errorEvent.headers ?? undefined,
-      )
+  const firstEvent = parseProviderResponsesStreamEvent(
+    firstChunk,
+    options.provider,
+  )
+  if (firstEvent?.type === "error") {
+    const statusCode = firstEvent.status_code ?? 500
+    await iterator.return?.()
+    if (firstEvent.headers) {
+      forwardProviderResponseHeaders(c, new Headers(firstEvent.headers))
     }
+    return c.json(
+      {
+        error: {
+          message: firstEvent.message,
+          ...firstEvent.error,
+        },
+      },
+      statusCode as ContentfulStatusCode,
+    )
   }
 
   return streamSSE(c, async (stream) => {
+    stream.onAbort(() => options.streamAbort?.abort())
+    const terminalTracker = createResponsesStreamTerminalTracker(
+      options.publicModel,
+    )
+    let responseId: string | undefined
     let usage: UsageTokens = {}
 
-    const writeChunk = async (chunk: typeof firstChunk) => {
+    const writeChunk = async (
+      chunk: ResponsesStreamChunk,
+      event = parseProviderResponsesStreamEvent(chunk, options.provider),
+    ) => {
       debugJson(logger, "Responses stream chunk:", chunk)
-      let responseChunk = chunk
-      let event: ResponseStreamEvent | null = null
+      if (options.normalizeCodex) {
+        logCodexRateLimitsEvent(event)
+      }
 
-      if (chunk.data && chunk.data !== "[DONE]") {
-        event = parseProviderResponsesStreamEvent(chunk.data, {
-          normalizeCodex: options.normalizeCodex,
-          provider: options.provider,
-        })
-        if (event && options.normalizeCodex && chunk.event !== event.type) {
-          // The Codex normalizer observes rate limits but does not modify
-          // the event body. Keep the original JSON instead of re-encoding it.
-          responseChunk = { ...chunk, event: event.type }
-        }
+      terminalTracker.observe(event)
+      if (
+        event
+        && "response" in event
+        && typeof event.response.id === "string"
+        && event.response.id
+      ) {
+        responseId = event.response.id
       }
 
       recordResponsesFirstToken(event)
@@ -331,14 +363,18 @@ const streamProviderResponses = async (
         }
       }
 
-      await writeSSEIfConnected(stream, {
-        data: responseChunk.data ?? "",
-        event: responseChunk.event,
-      })
+      await writeSSEIfConnected(
+        stream,
+        {
+          data: chunk.data ?? "",
+          event: options.normalizeCodex && event ? event.type : chunk.event,
+        },
+        event?.type,
+      )
     }
 
     try {
-      await writeChunk(firstChunk)
+      await writeChunk(firstChunk, firstEvent)
 
       for await (const chunk of {
         [Symbol.asyncIterator]: () => iterator,
@@ -348,27 +384,27 @@ const streamProviderResponses = async (
     } finally {
       await iterator.return?.()
       options.recordUsage(usage)
+
+      const failure = terminalTracker.finalize(responseId)
+      if (failure && (await writeSSEIfConnected(stream, failure.sse))) {
+        logger.warn(
+          `Responses stream ended without a terminal event; sent response.failed (${failure.code}: ${failure.message})`,
+        )
+      }
     }
   })
 }
 
 const parseProviderResponsesStreamEvent = (
-  data: string,
-  options: {
-    normalizeCodex: boolean
-    provider: string
-  },
+  chunk: ResponsesStreamChunk,
+  provider: string,
 ): ResponseStreamEvent | null => {
   try {
-    const parsed = JSON.parse(data) as ResponseStreamEvent
-    if (options.normalizeCodex) {
-      logCodexRateLimitsEvent(parsed)
-    }
-    return parsed
+    return readResponsesStreamEvent(chunk)
   } catch (error) {
     logger.error("provider.responses.parse_chunk_error", {
-      provider: options.provider,
-      data,
+      provider,
+      data: chunk.data,
       error,
     })
     return null

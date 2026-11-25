@@ -1,9 +1,13 @@
-import { afterEach, beforeEach, expect, mock, test } from "bun:test"
+import { afterEach, beforeEach, expect, mock, spyOn, test } from "bun:test"
 import fs from "node:fs"
 import os from "node:os"
 import path from "node:path"
 
-import type { ResponsesPayload, ResponsesResult } from "~/lib/types/responses"
+import type {
+  ResponseInputItem,
+  ResponsesPayload,
+  ResponsesResult,
+} from "~/lib/types/responses"
 
 type ListenerEvent = {
   data?: unknown
@@ -46,6 +50,8 @@ class MockWebSocket {
   static readonly OPEN = 1
   static readonly CLOSING = 2
   static readonly CLOSED = 3
+  static continuationError: { code: string; param?: string } | null = null
+  static errorAfterCreated = false
   static autoComplete = true
   static closeAfterComplete = false
   static failOpen = false
@@ -92,8 +98,22 @@ class MockWebSocket {
     this.sent.push(data)
 
     if (MockWebSocket.autoComplete) {
+      const payload = JSON.parse(data) as ResponsesPayload & { type?: string }
+      if (payload.type === "response.interrupt") return
       originalSetTimeout(() => {
-        this.completeLatestResponse()
+        if (payload.previous_response_id && MockWebSocket.continuationError) {
+          if (MockWebSocket.errorAfterCreated)
+            this.emitMessage(JSON.stringify({ type: "response.created" }))
+          this.emitMessage(
+            JSON.stringify({
+              type: "error",
+              error: {
+                ...MockWebSocket.continuationError,
+                message: "continuation unavailable",
+              },
+            }),
+          )
+        } else this.completeLatestResponse()
       }, 0)
     }
   }
@@ -126,6 +146,18 @@ class MockWebSocket {
     }
 
     const parsed = JSON.parse(latestSent) as { model: string }
+    if (parsed.model === "gpt-continuation") {
+      for (const [outputIndex, item] of continuationOutput.entries()) {
+        this.emitMessage(
+          JSON.stringify({
+            type: "response.output_item.done",
+            sequence_number: outputIndex + 1,
+            output_index: outputIndex,
+            item,
+          }),
+        )
+      }
+    }
     this.emit("message", {
       data: JSON.stringify({
         response: createResponsesResult(
@@ -182,16 +214,24 @@ await mock.module("undici", () => ({
 
 const { state } = await import("~/lib/state")
 const { getConfig, invalidateConfigCache } = await import("~/lib/config")
-const { PATHS } = await import("~/lib/paths")
-const { createResponses } = await import("~/services/copilot/create-responses")
+const { PATHS } = await import("~/lib/storage/paths")
+const { createResponses, COPILOT_RESPONSES_WEBSOCKET_MAX_MESSAGE_BYTES } =
+  await import("~/services/copilot/create-responses")
 const {
   createPooledWebSocketStream,
   ResponsesWebSocketInactivityTimeoutError,
+  ResponsesWebSocketMessageTooLargeError,
   ResponsesWebSocketOpenTimeoutError,
   WebSocketMessageBuffer,
 } = await import("~/services/responses-websocket")
-const { createResponsesSafeStream, getResponsesStreamTerminalDisposition } =
-  await import("~/services/responses-websocket-helpers")
+const {
+  createResponsesSafeStream,
+  decodeResponsesWebSocketChunk,
+  getResponsesStreamTerminalDisposition,
+} = await import("~/services/responses-websocket-helpers")
+const { createContinuableResponsesWebSocketStream } = await import(
+  "~/services/responses-websocket-continuation"
+)
 
 const originalState = {
   accountType: state.accountType,
@@ -200,6 +240,7 @@ const originalState = {
   vsCodeDeviceId: state.vsCodeDeviceId,
   vsCodeVersion: state.vsCodeVersion,
 }
+const { requestContext } = await import("~/lib/http/request-context")
 const originalConfigPath = PATHS.CONFIG_PATH
 let configDir: string
 
@@ -215,7 +256,15 @@ const createResponsesResult = (
   metadata: null,
   model,
   object: "response",
-  output: [],
+  output:
+    model === "gpt-continuation" ?
+      continuationOutput.map((item) =>
+        item.type === "reasoning" ?
+          { ...item, encrypted_content: "completed-cipher" }
+        : item,
+      )
+    : model === "gpt-text-continuation" ? [continuationOutput[1]]
+    : [],
   output_text: "",
   parallel_tool_calls: false,
   status: "completed",
@@ -235,6 +284,8 @@ beforeEach(() => {
   invalidateConfigCache()
   globalThis.WebSocket = MockWebSocket as unknown as typeof globalThis.WebSocket
   MockWebSocket.autoComplete = true
+  MockWebSocket.continuationError = null
+  MockWebSocket.errorAfterCreated = false
   MockWebSocket.closeAfterComplete = false
   MockWebSocket.failOpen = false
   MockWebSocket.failOpenEvent = null
@@ -361,6 +412,28 @@ test("Responses websocket omits include when only disabled output token replay i
   ) as ResponsesPayload
   expect(sent).not.toHaveProperty("include")
   expect(payload.include).toEqual(["output.encrypted_content"])
+})
+
+test("Responses websocket raises low positive integer output limits to the Copilot minimum", async () => {
+  const payload: ResponsesPayload = {
+    input: "hello",
+    model: "gpt-6-astra",
+    max_output_tokens: 1,
+    stream: true,
+  }
+
+  const response = await createResponses(payload, {
+    initiator: "user",
+    requestId: "request-output-limit",
+    transport: "websocket",
+    vision: false,
+  })
+  await collectStreamChunks(response as AsyncIterable<unknown>)
+
+  const sent = JSON.parse(
+    MockWebSocket.instances[0]?.sent[0] ?? "",
+  ) as ResponsesPayload
+  expect(sent.max_output_tokens).toBe(16)
 })
 
 test("Responses websocket pool reuses the same connection for matching pool keys", async () => {
@@ -1084,16 +1157,20 @@ test("Responses websocket cancellation while connecting closes the socket", asyn
 })
 
 test("Responses websocket buffer tracks bytes, binary data, and dequeue order", async () => {
-  const buffer = new WebSocketMessageBuffer(32, 4)
+  const buffer = new WebSocketMessageBuffer(8, 4)
   const binary = new TextEncoder().encode("bc")
 
-  expect(buffer.enqueue("a")).toBe(true)
+  expect(buffer.enqueue("中文")).toBe(true)
   expect(buffer.enqueue(binary)).toBe(true)
-  expect(buffer.bufferedBytes).toBe(3)
+  expect(buffer.bufferedBytes).toBe(8)
   expect(buffer.bufferedMessages).toBe(2)
-  expect(await buffer.dequeue()).toBe("a")
+  expect(buffer.enqueue("x")).toBe(false)
+  expect(await buffer.dequeue()).toBe("中文")
   expect(buffer.bufferedBytes).toBe(2)
+  expect(buffer.enqueue({ toString: () => "😀" })).toBe(true)
+  expect(buffer.bufferedBytes).toBe(6)
   expect(await buffer.dequeue()).toBe("bc")
+  expect(await buffer.dequeue()).toBe("😀")
   expect(buffer.bufferedBytes).toBe(0)
   expect(buffer.bufferedMessages).toBe(0)
 })
@@ -1131,7 +1208,10 @@ const createTestPooledStream = (
   overrides: {
     maxBufferedBytes?: number
     maxBufferedMessages?: number
+    maxMessageBytes?: number
     openTimeoutMs?: number
+    payload?: Record<string, unknown>
+    preparePayload?: () => Record<string, unknown>
     signal?: AbortSignal
     streamInactivityTimeoutMs?: number
   } = {},
@@ -1139,8 +1219,9 @@ const createTestPooledStream = (
   createPooledWebSocketStream(
     {
       headers: {},
-      payload: { model: "gpt-test" },
+      payload: overrides.payload ?? { model: "gpt-test" },
       poolKey: `test-${poolKey}`,
+      preparePayload: overrides.preparePayload,
       signal: overrides.signal,
       url: "wss://api.githubcopilot.com/responses",
     },
@@ -1153,6 +1234,7 @@ const createTestPooledStream = (
         chunk.event === "response.completed" ? "reuse" : "continue",
       maxBufferedBytes: overrides.maxBufferedBytes ?? 1024,
       maxBufferedMessages: overrides.maxBufferedMessages ?? 32,
+      maxMessageBytes: overrides.maxMessageBytes,
       openErrorMessage: "open failed",
       openTimeoutMs: overrides.openTimeoutMs ?? 100,
       poolIdleTimeoutMs: 1000,
@@ -1285,3 +1367,1067 @@ const restoreProxyEnv = (
     process.env[key] = value
   }
 }
+
+const continuationRequest = (
+  socketIndex: number,
+  requestIndex: number,
+): ResponsesPayload =>
+  JSON.parse(
+    MockWebSocket.instances[socketIndex].sent[requestIndex],
+  ) as ResponsesPayload
+
+const withAffinity = <T>(affinity: string, callback: () => T): T =>
+  requestContext.run(
+    {
+      traceId: "continuation",
+      startTime: Date.now(),
+      userAgent: "claude-code",
+      rootSessionId: "shared-root",
+      sessionAffinity: affinity,
+      parentSessionId: undefined,
+    },
+    callback,
+  )
+const continuationInput = [
+  { type: "message", role: "user", content: "hello" },
+] as const
+const continuationOutput = [
+  {
+    type: "reasoning",
+    id: "server-reasoning",
+    encrypted_content: "cipher",
+    summary: [],
+  },
+  {
+    type: "message",
+    id: "server-message",
+    role: "assistant",
+    status: "completed",
+    content: [{ type: "output_text", text: "answer", annotations: [] }],
+  },
+] satisfies ResponsesResult["output"]
+const continuationHistory = () => [
+  ...continuationInput,
+  ...continuationOutput,
+  ...continuationInput,
+]
+const getContinuationRequestId = () =>
+  requestContext.getStore()?.sessionAffinity ?? "continuation"
+const sendContinuationTurn = async (
+  input: ResponsesPayload["input"],
+  clientSignal = new AbortController().signal,
+  model = "gpt-continuation",
+) =>
+  collectStreamChunks(
+    (await createResponses(
+      { model, stream: true, input },
+      {
+        requestId: getContinuationRequestId(),
+        initiator: "user",
+        transport: "websocket",
+        vision: false,
+        clientSignal,
+      },
+    )) as AsyncIterable<unknown>,
+  )
+
+test("Copilot websocket continues text-only answers and retries a missing ID with full input", async () => {
+  await withAffinity("text-only-continuation", async () => {
+    const history: Array<ResponseInputItem> = [...continuationInput]
+    const send = () =>
+      sendContinuationTurn(history, undefined, "gpt-text-continuation")
+    for (let turn = 0; turn < 3; turn++) {
+      await send()
+      const sent = continuationRequest(0, turn)
+      if (turn === 0) expect(sent.previous_response_id).toBeUndefined()
+      else {
+        expect(sent.previous_response_id).toBe(`resp-${turn}`)
+        expect(sent.input).toEqual(history.slice(-1))
+      }
+      history.push(continuationOutput[1], {
+        ...continuationInput[0],
+        content: `question ${turn + 1}`,
+      })
+    }
+    MockWebSocket.continuationError = { code: "previous_response_not_found" }
+    const chunks = await send()
+    expect(continuationRequest(0, 3).previous_response_id).toBe("resp-3")
+    expect(MockWebSocket.instances).toHaveLength(2)
+    expect(continuationRequest(1, 0).previous_response_id).toBeUndefined()
+    expect(continuationRequest(1, 0).input).toEqual(history)
+    expect(chunks.at(-1)?.event).toBe("response.completed")
+  })
+})
+
+test("Copilot websocket continues an existing stable pool key and isolates agents", async () => {
+  await withAffinity("agent-a", async () => {
+    await sendContinuationTurn([...continuationInput])
+    await sendContinuationTurn(continuationHistory())
+  })
+  expect(MockWebSocket.instances).toHaveLength(1)
+  expect(continuationRequest(0, 1)).toMatchObject({
+    previous_response_id: "resp-1",
+    input: [...continuationInput],
+  })
+  await withAffinity("agent-b", () =>
+    sendContinuationTurn(continuationHistory()),
+  )
+  expect(MockWebSocket.instances).toHaveLength(2)
+  expect(continuationRequest(1, 0).previous_response_id).toBeUndefined()
+})
+
+test("Copilot cancellation drains the old stream, then reuses its socket without the stale parent", async () => {
+  await withAffinity("copilot-cancel", async () => {
+    await sendContinuationTurn([...continuationInput])
+    MockWebSocket.autoComplete = false
+    const controller = new AbortController()
+    const socket = MockWebSocket.instances[0]
+    const input = continuationHistory()
+    const cancelled = sendContinuationTurn(input, controller.signal)
+    await waitFor(() => socket.sent.length === 2)
+    socket.emitMessage(
+      JSON.stringify({ type: "response.created", response: { id: "resp-2" } }),
+    )
+    controller.abort()
+
+    MockWebSocket.autoComplete = true
+    await sendContinuationTurn(input)
+    expect(socket.sent).toHaveLength(2)
+    expect(socket.readyState).toBe(MockWebSocket.OPEN)
+    expect(MockWebSocket.instances).toHaveLength(2)
+    expect(continuationRequest(1, 0).previous_response_id).toBeUndefined()
+
+    socket.completeLatestResponse()
+    await cancelled
+    await sendContinuationTurn(input)
+    // The drained response replaced resp-1 as the socket's latest response.
+    expect(continuationRequest(0, 2).previous_response_id).toBeUndefined()
+    expect(continuationRequest(0, 2).input).toEqual(input)
+    expect(MockWebSocket.instances).toHaveLength(2)
+  })
+})
+
+test("a response that ends incomplete without an interruption drops the stale parent", async () => {
+  await withAffinity("incomplete", async () => {
+    await sendContinuationTurn([...continuationInput])
+    MockWebSocket.autoComplete = false
+    const socket = MockWebSocket.instances[0]
+    const turn = sendContinuationTurn(continuationHistory())
+    await waitFor(() => socket.sent.length === 2)
+    socket.emitMessage(
+      JSON.stringify({
+        response: {
+          ...createResponsesResult("gpt-continuation", "resp-2"),
+          incomplete_details: { reason: "max_output_tokens" },
+          output: continuationOutput,
+          status: "incomplete",
+        },
+        sequence_number: 1,
+        type: "response.incomplete",
+      }),
+    )
+    await turn
+
+    MockWebSocket.autoComplete = true
+    const input = [
+      ...continuationHistory(),
+      ...continuationOutput,
+      ...continuationInput,
+    ]
+    await sendContinuationTurn(input)
+    expect(continuationRequest(0, 1).previous_response_id).toBe("resp-1")
+    expect(continuationRequest(0, 2).previous_response_id).toBeUndefined()
+    expect(continuationRequest(0, 2).input).toEqual(input)
+  })
+})
+
+test.each([
+  { code: "previous_response_not_found" },
+  { code: "unsupported_parameter", param: "previous_response_id" },
+  { code: "unknown_parameter", param: "previous_response_id" },
+  { code: "invalid_request_body", param: "previous_response_id" },
+])(
+  "retries a rejected automatic continuation once with full input (%j)",
+  async (error) => {
+    await withAffinity("retry", async () => {
+      await sendContinuationTurn([...continuationInput])
+      MockWebSocket.continuationError = error
+      const chunks = await sendContinuationTurn(continuationHistory())
+      expect(chunks.some((chunk) => chunk.event === "error")).toBe(false)
+    })
+    expect(MockWebSocket.instances).toHaveLength(2)
+    expect(continuationRequest(0, 1).previous_response_id).toBe("resp-1")
+    expect(continuationRequest(1, 0)).toMatchObject({
+      input: continuationHistory(),
+    })
+    expect(continuationRequest(1, 0).previous_response_id).toBeUndefined()
+  },
+)
+
+test.each(["response-started", "other-error"])(
+  "does not replay a continuation after %s",
+  async (mode) => {
+    await withAffinity("no-retry", async () => {
+      await sendContinuationTurn([...continuationInput])
+      MockWebSocket.errorAfterCreated = mode === "response-started"
+      MockWebSocket.continuationError = {
+        code:
+          mode === "other-error" ? "server_error" : (
+            "previous_response_not_found"
+          ),
+      }
+      const chunks = await sendContinuationTurn(continuationHistory())
+      expect(chunks.some((chunk) => chunk.event === "error")).toBe(true)
+    })
+    expect(MockWebSocket.instances).toHaveLength(1)
+  },
+)
+
+test("reconnected sockets send full history", async () => {
+  await withAffinity("reconnect", async () => {
+    await sendContinuationTurn([...continuationInput])
+    MockWebSocket.instances[0].close()
+    await sendContinuationTurn(continuationHistory())
+  })
+  expect(MockWebSocket.instances).toHaveLength(2)
+  expect(continuationRequest(1, 0).previous_response_id).toBeUndefined()
+})
+
+test("HTTP requests keep full input even when the websocket has a continuation", async () => {
+  const fetchBefore = globalThis.fetch
+  try {
+    await withAffinity("http", async () => {
+      await sendContinuationTurn([...continuationInput])
+      let body: ResponsesPayload | undefined
+      globalThis.fetch = ((_url: unknown, init?: RequestInit) => {
+        body = JSON.parse(init?.body as string) as ResponsesPayload
+        return Promise.resolve(
+          Response.json(createResponsesResult("gpt-continuation")),
+        )
+      }) as typeof fetch
+      await createResponses(
+        {
+          model: "gpt-continuation",
+          input: continuationHistory(),
+        },
+        {
+          requestId: "http",
+          initiator: "user",
+          transport: "http",
+          vision: false,
+        },
+      )
+      expect(body?.previous_response_id).toBeUndefined()
+      expect(body?.input).toEqual(continuationHistory())
+    })
+  } finally {
+    globalThis.fetch = fetchBefore
+  }
+})
+
+// Exercise the shared interrupt-capable transport independently of Copilot.
+const sendInterruptibleTurn = (
+  input: ResponsesPayload["input"],
+  clientSignal = new AbortController().signal,
+) =>
+  collectStreamChunks(
+    createResponsesSafeStream(
+      createContinuableResponsesWebSocketStream(
+        {
+          headers: {},
+          payload: {
+            type: "response.create",
+            model: "gpt-continuation",
+            input,
+          },
+          poolKey: `interrupt-${getContinuationRequestId()}`,
+          interruptSignal: clientSignal,
+          url: "wss://responses.example/responses",
+        },
+        {
+          createChunk: (data) =>
+            decodeResponsesWebSocketChunk(data, () => false),
+          getTerminalDisposition: getResponsesStreamTerminalDisposition,
+          maxBufferedBytes: 65536,
+          maxBufferedMessages: 32,
+          openErrorMessage: "open failed",
+          openTimeoutMs: 100,
+          poolIdleTimeoutMs: 1000,
+          streamErrorMessage: "stream failed",
+          streamInactivityTimeoutMs: 30000,
+          terminalChunkMissingMessage: "terminal missing",
+        },
+        { sessionId: getContinuationRequestId(), clientSignal },
+      ),
+    ),
+  )
+
+const interruptedResponseId = "resp-interrupted"
+const interruptedOutput = [
+  {
+    type: "reasoning",
+    id: "interrupted-reasoning",
+    encrypted_content: "interrupted-cipher",
+    summary: [],
+  },
+] satisfies ResponsesResult["output"]
+const interruptAcknowledgement = {
+  type: "response.interrupt.accepted",
+  response_id: interruptedResponseId,
+}
+const interruptedTerminal = {
+  type: "response.incomplete",
+  response: {
+    ...createResponsesResult("gpt-continuation", interruptedResponseId),
+    status: "incomplete",
+    incomplete_details: { reason: "interrupted" },
+    output: interruptedOutput,
+  },
+}
+const emitInterruptibleResponseCreated = (socket: MockWebSocket) => {
+  socket.emitMessage(
+    JSON.stringify({
+      type: "response.created",
+      response: { id: interruptedResponseId },
+    }),
+  )
+}
+
+const startInterruptibleTurn = async () => {
+  await sendInterruptibleTurn([...continuationInput])
+  MockWebSocket.autoComplete = false
+  const controller = new AbortController()
+  const socket = MockWebSocket.instances[0]
+  const input = continuationHistory()
+  const stream = sendInterruptibleTurn(input, controller.signal)
+  await waitFor(() => socket.sent.length === 2)
+  expect(continuationRequest(0, 1).previous_response_id).toBe("resp-1")
+  return { controller, socket, input, stream }
+}
+
+test.each(["acknowledgement-first", "terminal-first"] as const)(
+  "interrupts on the existing socket and resumes after both events (%s)",
+  async (order) => {
+    await withAffinity(`interrupt-${order}`, async () => {
+      const { controller, socket, input, stream } =
+        await startInterruptibleTurn()
+      if (order === "acknowledgement-first") {
+        emitInterruptibleResponseCreated(socket)
+        await delay(0)
+      }
+      controller.abort()
+      const followup = { ...continuationInput[0], content: "follow-up" }
+      const resent = sendInterruptibleTurn([
+        ...input,
+        ...interruptedOutput,
+        followup,
+      ])
+      if (order === "terminal-first") {
+        await delay(0)
+        expect(socket.sent).toHaveLength(2)
+        expect(MockWebSocket.instances).toHaveLength(1)
+        emitInterruptibleResponseCreated(socket)
+      }
+      await waitFor(() => socket.sent.length === 3)
+      expect(JSON.parse(socket.sent[2])).toEqual({
+        type: "response.interrupt",
+        response_id: interruptedResponseId,
+        mode: "discard_partial_items",
+      })
+
+      const [first, second] =
+        order === "acknowledgement-first" ?
+          [interruptAcknowledgement, interruptedTerminal]
+        : [interruptedTerminal, interruptAcknowledgement]
+      socket.emitMessage(JSON.stringify(first))
+      await delay(0)
+      expect(socket.sent).toHaveLength(3)
+      expect(MockWebSocket.instances).toHaveLength(1)
+      socket.emitMessage(JSON.stringify(second))
+
+      await waitFor(() => socket.sent.length === 4)
+      expect(continuationRequest(0, 3)).toMatchObject({
+        previous_response_id: interruptedResponseId,
+        input: [followup],
+      })
+      socket.completeLatestResponse()
+      expect((await resent).at(-1)?.data).toContain('"id":"resp-4"')
+      expect((await stream).map((chunk) => chunk.event)).toEqual([
+        "response.created",
+        "response.incomplete",
+      ])
+      expect(MockWebSocket.instances).toHaveLength(1)
+    })
+  },
+)
+
+test.each(["rejected", "wrong-id", "timeout", "closed", "missing-id"] as const)(
+  "falls back to full input when the interrupt cannot release the socket (%s)",
+  async (mode) => {
+    const timeoutSpy = spyOn(globalThis, "setTimeout")
+    await withAffinity(`interrupt-fallback-${mode}`, async () => {
+      const { controller, socket, input, stream } =
+        await startInterruptibleTurn()
+      if (mode !== "missing-id") emitInterruptibleResponseCreated(socket)
+      controller.abort()
+      if (mode !== "missing-id") await waitFor(() => socket.sent.length === 3)
+      MockWebSocket.autoComplete = true
+      const resent = sendInterruptibleTurn(input)
+      await delay(0)
+      expect(MockWebSocket.instances).toHaveLength(1)
+
+      if (mode === "closed") socket.close()
+      if (mode === "rejected")
+        socket.emitMessage(
+          JSON.stringify({
+            ...interruptAcknowledgement,
+            type: "response.interrupt.failed",
+          }),
+        )
+      if (mode === "wrong-id")
+        socket.emitMessage(
+          JSON.stringify({
+            ...interruptAcknowledgement,
+            response_id: "resp-other",
+          }),
+        )
+      if (mode === "timeout") {
+        socket.emitMessage(JSON.stringify(interruptAcknowledgement))
+        await delay(0)
+      }
+      if (mode === "timeout" || mode === "missing-id") {
+        const deadline = timeoutSpy.mock.calls.find(([, ms]) => ms === 10_000)
+        expect(deadline).toBeDefined()
+        deadline![0]()
+      }
+
+      await resent
+      await stream
+      expect(socket.readyState).toBe(MockWebSocket.CLOSED)
+      expect(socket.sent).toHaveLength(mode === "missing-id" ? 2 : 3)
+      expect(MockWebSocket.instances).toHaveLength(2)
+      expect(continuationRequest(1, 0).previous_response_id).toBeUndefined()
+      expect(continuationRequest(1, 0).input).toEqual(input)
+    }).finally(() => timeoutSpy.mockRestore())
+  },
+)
+
+test("a cancelled interruption waiter releases its slot for the next request", async () => {
+  await withAffinity("cancel-interrupt-waiter", async () => {
+    const { controller, socket, input, stream } = await startInterruptibleTurn()
+    emitInterruptibleResponseCreated(socket)
+    controller.abort()
+    await waitFor(() => socket.sent.length === 3)
+
+    const waiter = new AbortController()
+    const waiting = sendInterruptibleTurn(input, waiter.signal)
+    await delay(0)
+    waiter.abort()
+    const successor = sendInterruptibleTurn([
+      ...input,
+      ...interruptedOutput,
+      ...continuationInput,
+    ])
+    await delay(0)
+    expect(await waiting).toEqual([])
+    expect(MockWebSocket.instances).toHaveLength(1)
+    expect(socket.sent).toHaveLength(3)
+    socket.emitMessage(JSON.stringify(interruptAcknowledgement))
+    socket.emitMessage(JSON.stringify(interruptedTerminal))
+    await waitFor(() => socket.sent.length === 4)
+    expect(continuationRequest(0, 3)).toMatchObject({
+      previous_response_id: interruptedResponseId,
+      input: [...continuationInput],
+    })
+    socket.completeLatestResponse()
+    await Promise.all([stream, successor])
+    expect(MockWebSocket.instances).toHaveLength(1)
+  })
+})
+
+test.each(["missing-client-anchor", "missing-output-anchor"] as const)(
+  "sends full input directly after interruption with %s",
+  async (mode) => {
+    await withAffinity(`interrupt-full-${mode}`, async () => {
+      const { controller, socket, input, stream } =
+        await startInterruptibleTurn()
+      emitInterruptibleResponseCreated(socket)
+      controller.abort()
+      await waitFor(() => socket.sent.length === 3)
+      const followup = { ...continuationInput[0], content: "follow-up" }
+      const full = [...input, followup]
+      const resent = sendInterruptibleTurn(full)
+      socket.emitMessage(JSON.stringify(interruptAcknowledgement))
+      socket.emitMessage(
+        JSON.stringify({
+          ...interruptedTerminal,
+          response: {
+            ...interruptedTerminal.response,
+            output: mode === "missing-output-anchor" ? [] : interruptedOutput,
+          },
+        }),
+      )
+
+      await waitFor(() => socket.sent.length === 4)
+      expect(continuationRequest(0, 3).previous_response_id).toBeUndefined()
+      expect(continuationRequest(0, 3).input).toEqual(full)
+      socket.completeLatestResponse()
+      await Promise.all([stream, resent])
+      expect(MockWebSocket.instances).toHaveLength(1)
+    })
+  },
+)
+
+test("retries full input if the interrupted response ID is unavailable", async () => {
+  await withAffinity("interrupt-continuation-miss", async () => {
+    const { controller, socket, input, stream } = await startInterruptibleTurn()
+    emitInterruptibleResponseCreated(socket)
+    controller.abort()
+    await waitFor(() => socket.sent.length === 3)
+
+    MockWebSocket.continuationError = { code: "previous_response_not_found" }
+    MockWebSocket.autoComplete = true
+    const full = [...input, ...interruptedOutput, ...continuationInput]
+    const resent = sendInterruptibleTurn(full)
+    await delay(0)
+    expect(MockWebSocket.instances).toHaveLength(1)
+    socket.emitMessage(JSON.stringify(interruptAcknowledgement))
+    socket.emitMessage(JSON.stringify(interruptedTerminal))
+
+    expect((await resent).some((chunk) => chunk.event === "error")).toBe(false)
+    await stream
+    expect(continuationRequest(0, 3).previous_response_id).toBe(
+      interruptedResponseId,
+    )
+    expect(MockWebSocket.instances).toHaveLength(2)
+    expect(continuationRequest(1, 0).previous_response_id).toBeUndefined()
+    expect(continuationRequest(1, 0).input).toEqual(full)
+  })
+})
+
+test("Responses websocket rejects a message above maxMessageBytes before sending it", async () => {
+  const error = await getRejectedError(
+    collectStreamChunks(
+      createTestPooledStream("too-large", {
+        maxMessageBytes: 500,
+        payload: { model: "gpt-test", input: "x".repeat(600) },
+      }),
+    ),
+  )
+
+  expect(error).toBeInstanceOf(ResponsesWebSocketMessageTooLargeError)
+  expect(error).toMatchObject({ code: "context_length_exceeded" })
+  expect(MockWebSocket.instances).toHaveLength(0)
+})
+
+test("Responses websocket measures maxMessageBytes in UTF-8 bytes and allows an exact fit", async () => {
+  const payload = { model: "gpt-test", input: "€".repeat(400) }
+  const messageBytes = Buffer.byteLength(JSON.stringify(payload))
+  expect(messageBytes).toBeGreaterThan(1000)
+
+  const error = await getRejectedError(
+    collectStreamChunks(
+      createTestPooledStream("utf8", {
+        maxMessageBytes: messageBytes - 1,
+        payload,
+      }),
+    ),
+  )
+  expect(error).toBeInstanceOf(ResponsesWebSocketMessageTooLargeError)
+
+  await collectStreamChunks(
+    createTestPooledStream("exact-fit", {
+      maxMessageBytes: messageBytes,
+      payload,
+    }),
+  )
+  expect(MockWebSocket.instances.flatMap((socket) => socket.sent)).toEqual([
+    JSON.stringify(payload),
+  ])
+})
+
+test("Responses websocket applies maxMessageBytes to the prepared payload", async () => {
+  await collectStreamChunks(
+    createTestPooledStream("prepared", {
+      maxMessageBytes: 500,
+      payload: { model: "gpt-test", input: "x".repeat(600) },
+      preparePayload: () => ({ model: "gpt-test" }),
+    }),
+  )
+
+  expect(MockWebSocket.instances[0]?.sent).toEqual([
+    JSON.stringify({ model: "gpt-test" }),
+  ])
+})
+
+test("Copilot websocket fails fast with context_length_exceeded above 16 MiB", async () => {
+  const chunks = await collectStreamChunks(
+    (await createResponses(
+      {
+        input: "x".repeat(COPILOT_RESPONSES_WEBSOCKET_MAX_MESSAGE_BYTES),
+        model: "gpt-test",
+        stream: true,
+      },
+      {
+        initiator: "user",
+        requestId: "request-1",
+        transport: "websocket",
+        vision: false,
+      },
+    )) as AsyncIterable<unknown>,
+  )
+
+  expect(chunks).toHaveLength(1)
+  expect(chunks[0]?.event).toBe("error")
+  expect(JSON.parse(chunks[0]?.data ?? "{}")).toMatchObject({
+    code: "context_length_exceeded",
+    type: "error",
+  })
+  expect(chunks[0]?.data).toContain("exceeds the 16.0 MiB limit")
+  expect(MockWebSocket.instances).toHaveLength(0)
+})
+
+test("Copilot websocket applies the 16 MiB limit to the prepared continuation delta", async () => {
+  const mib = 1024 * 1024
+  const firstInput = [
+    {
+      type: "message",
+      role: "user",
+      content: "x".repeat(COPILOT_RESPONSES_WEBSOCKET_MAX_MESSAGE_BYTES - mib),
+    },
+  ] as const
+  const delta = [
+    { type: "message", role: "user", content: "y".repeat(2 * mib) },
+  ] as const
+  const fullHistory = [...firstInput, ...continuationOutput, ...delta]
+
+  await withAffinity("oversized-history", async () => {
+    await sendContinuationTurn([...firstInput])
+    const chunks = await sendContinuationTurn(fullHistory)
+    expect(chunks.some((chunk) => chunk.event === "error")).toBe(false)
+  })
+
+  expect(MockWebSocket.instances).toHaveLength(1)
+  expect(continuationRequest(0, 1)).toMatchObject({
+    previous_response_id: "resp-1",
+    input: [...delta],
+  })
+
+  const cold = await withAffinity("cold-history", () =>
+    sendContinuationTurn(fullHistory),
+  )
+  expect(cold.map((chunk) => chunk.event)).toEqual(["error"])
+  expect(JSON.parse(cold[0]?.data ?? "{}")).toMatchObject({
+    code: "context_length_exceeded",
+  })
+  expect(MockWebSocket.instances).toHaveLength(1)
+})
+
+test.each([
+  {
+    name: "completion",
+    mib: 17,
+    status: 200,
+    code: null,
+    json413: false,
+    failOpen: false,
+  },
+  {
+    name: "completion when websocket open fails",
+    mib: 17,
+    status: 200,
+    code: null,
+    json413: false,
+    failOpen: true,
+  },
+  {
+    name: "plain-text HTTP 413",
+    mib: 17,
+    status: 413,
+    code: "context_length_exceeded",
+    json413: false,
+    failOpen: false,
+  },
+  {
+    name: "JSON HTTP 413 with upstream code",
+    mib: 17,
+    status: 413,
+    code: "context_length_exceeded",
+    json413: true,
+    failOpen: false,
+  },
+  {
+    name: "upstream error",
+    mib: 17,
+    status: 400,
+    code: "invalid_request_body",
+    json413: false,
+    failOpen: false,
+  },
+  {
+    name: "empty error body",
+    mib: 17,
+    status: 502,
+    code: null,
+    json413: false,
+    failOpen: false,
+  },
+  {
+    name: "size limit",
+    mib: 32,
+    status: 200,
+    code: "context_length_exceeded",
+    json413: false,
+    failOpen: false,
+  },
+])(
+  "Copilot oversized compaction handles $name",
+  async ({ mib, status, code, json413, failOpen }) => {
+    MockWebSocket.failOpen = failOpen
+    const input: Array<ResponseInputItem> = [
+      { role: "user", content: "x".repeat(mib * 1024 * 1024) },
+      { type: "compaction_trigger" },
+    ]
+    const fetchBefore = globalThis.fetch
+    const http = mock((url: string, init?: RequestInit) => {
+      expect(url).toBe("https://api.githubcopilot.com/responses")
+      const body = JSON.parse(init?.body as string) as ResponsesPayload
+      expect(body.input).toEqual(input)
+      expect(body.stream).toBe(true)
+      expect(body.previous_response_id).toBeUndefined()
+      if (status === 400) {
+        return Promise.resolve(
+          Response.json(
+            {
+              error: { code: "invalid_request_body", message: "Invalid input" },
+            },
+            { status },
+          ),
+        )
+      }
+      if (status === 413) {
+        return Promise.resolve(
+          json413 ?
+            Response.json(
+              {
+                error: {
+                  code: "request_too_large",
+                  message: "Request body exceeds limit",
+                },
+              },
+              { status },
+            )
+          : new Response("Too large", { status }),
+        )
+      }
+      if (status === 502) {
+        return Promise.resolve(new Response("", { status }))
+      }
+
+      const completion = JSON.stringify({
+        type: "response.completed",
+        response: createResponsesResult("gpt-test"),
+      })
+      return Promise.resolve(
+        new Response(`event: response.completed\ndata: ${completion}\n\n`),
+      )
+    })
+    globalThis.fetch = http as unknown as typeof fetch
+
+    try {
+      const chunks = await collectStreamChunks(
+        (await createResponses(
+          { input, model: "gpt-test", stream: true },
+          {
+            allowCompactionHttpFallback: true,
+            initiator: "agent",
+            requestId: "oversized-compaction",
+            transport: "websocket",
+            vision: false,
+          },
+        )) as AsyncIterable<unknown>,
+      )
+      expect(chunks.map((chunk) => chunk.event)).toEqual([
+        status !== 200 || code ? "error" : "response.completed",
+      ])
+      if (status !== 200 || code) {
+        const parsed = JSON.parse(chunks[0]?.data ?? "{}") as {
+          code: string | null
+          message: string
+        }
+        expect(parsed.code).toBe(code)
+        if (json413) expect(parsed.message).toBe("Request body exceeds limit")
+        if (status === 502) expect(parsed.message).toContain("HTTP 502")
+      }
+      if (mib === 32) expect(chunks[0]?.data).toContain("32.0 MiB")
+      expect(http).toHaveBeenCalledTimes(mib === 32 ? 0 : 1)
+      expect(MockWebSocket.instances).toHaveLength(0)
+    } finally {
+      globalThis.fetch = fetchBefore
+    }
+  },
+)
+
+test("Copilot oversized compaction keeps the original host paired with its token snapshot", async () => {
+  const input: Array<ResponseInputItem> = [
+    { role: "user", content: "x".repeat(17 * 1024 * 1024) },
+    { type: "compaction_trigger" },
+  ]
+  const fetchBefore = globalThis.fetch
+  const http = mock((url: string, init?: RequestInit) => {
+    expect(url).toBe("https://api.enterprise-old.githubcopilot.com/responses")
+    expect((init?.headers as Record<string, string>).Authorization).toBe(
+      "Bearer old-copilot-token",
+    )
+    const completion = JSON.stringify({
+      type: "response.completed",
+      response: createResponsesResult("gpt-test"),
+    })
+    return Promise.resolve(
+      new Response(`event: response.completed\ndata: ${completion}\n\n`),
+    )
+  })
+  globalThis.fetch = http as unknown as typeof fetch
+
+  try {
+    state.copilotApiUrl = "https://api.enterprise-old.githubcopilot.com"
+    state.copilotToken = "old-copilot-token"
+    const stream = (await createResponses(
+      { input, model: "gpt-test", stream: true },
+      {
+        allowCompactionHttpFallback: true,
+        initiator: "agent",
+        requestId: "host-snapshot",
+        transport: "websocket",
+        vision: false,
+      },
+    )) as AsyncIterable<unknown>
+
+    // Simulate a background token refresh switching host before stream consumption.
+    state.copilotApiUrl = "https://api.enterprise-new.githubcopilot.com"
+    state.copilotToken = "new-copilot-token"
+
+    const chunks = await collectStreamChunks(stream)
+    expect(chunks.map((chunk) => chunk.event)).toEqual(["response.completed"])
+    expect(http).toHaveBeenCalledTimes(1)
+  } finally {
+    globalThis.fetch = fetchBefore
+  }
+})
+
+test("Copilot oversized compaction does not fall back to HTTP when previous_response_id is explicit", async () => {
+  const input: Array<ResponseInputItem> = [
+    { role: "user", content: "x".repeat(17 * 1024 * 1024) },
+    { type: "compaction_trigger" },
+  ]
+  const fetchBefore = globalThis.fetch
+  const http = mock(() => Promise.resolve(new Response("unexpected")))
+  globalThis.fetch = http as unknown as typeof fetch
+
+  try {
+    const chunks = await collectStreamChunks(
+      (await createResponses(
+        {
+          input,
+          model: "gpt-test",
+          previous_response_id: "resp-client",
+          stream: true,
+        },
+        {
+          allowCompactionHttpFallback: true,
+          initiator: "agent",
+          requestId: "explicit-parent",
+          transport: "websocket",
+          vision: false,
+        },
+      )) as AsyncIterable<unknown>,
+    )
+    expect(chunks.map((chunk) => chunk.event)).toEqual(["error"])
+    expect(JSON.parse(chunks[0]?.data ?? "{}")).toMatchObject({
+      code: "context_length_exceeded",
+    })
+    expect(chunks[0]?.data).toContain("16.0 MiB")
+    expect(http).toHaveBeenCalledTimes(0)
+    expect(MockWebSocket.instances).toHaveLength(0)
+  } finally {
+    globalThis.fetch = fetchBefore
+  }
+})
+
+test("Copilot oversized compaction on a warm socket preserves the socket and falls back to HTTP on oversized delta or continuation miss", async () => {
+  const mib = 1024 * 1024
+  const firstInput: Array<ResponseInputItem> = [
+    { role: "user", content: "x".repeat(5 * mib) },
+  ]
+  const oversizedDeltaCompact: Array<ResponseInputItem> = [
+    ...firstInput,
+    ...continuationOutput,
+    { role: "user", content: "y".repeat(17 * mib) },
+    { type: "compaction_trigger" },
+  ]
+  const fetchBefore = globalThis.fetch
+  const receivedBodies: Array<ResponsesPayload> = []
+  const http = mock((_url: string, init?: RequestInit) => {
+    receivedBodies.push(JSON.parse(init?.body as string) as ResponsesPayload)
+    const completion = JSON.stringify({
+      type: "response.completed",
+      response: createResponsesResult("gpt-continuation"),
+    })
+    return Promise.resolve(
+      new Response(`event: response.completed\ndata: ${completion}\n\n`),
+    )
+  })
+  globalThis.fetch = http as unknown as typeof fetch
+
+  try {
+    await withAffinity("warm-compaction-fallback", async () => {
+      await sendContinuationTurn(firstInput)
+      const fallbackChunks = await collectStreamChunks(
+        (await createResponses(
+          {
+            input: oversizedDeltaCompact,
+            model: "gpt-continuation",
+            stream: true,
+          },
+          {
+            allowCompactionHttpFallback: true,
+            initiator: "agent",
+            requestId: getContinuationRequestId(),
+            transport: "websocket",
+            vision: false,
+          },
+        )) as AsyncIterable<unknown>,
+      )
+      expect(fallbackChunks.map((chunk) => chunk.event)).toEqual([
+        "response.completed",
+      ])
+      expect(http).toHaveBeenCalledTimes(1)
+      expect(receivedBodies[0]?.previous_response_id).toBeUndefined()
+      expect(receivedBodies[0]?.input).toEqual(oversizedDeltaCompact)
+      // The existing pooled socket stays open and reusable after local rejection.
+      expect(MockWebSocket.instances).toHaveLength(1)
+      expect(MockWebSocket.instances[0]?.readyState).toBe(MockWebSocket.OPEN)
+
+      // On continuation miss, retry full (>16 MiB) falls back to HTTP without opening a second socket.
+      const missInput: Array<ResponseInputItem> = [
+        ...firstInput,
+        ...continuationOutput,
+        { role: "user", content: "z".repeat(12 * mib) },
+        { type: "compaction_trigger" },
+      ]
+      MockWebSocket.continuationError = { code: "previous_response_not_found" }
+      const missChunks = await collectStreamChunks(
+        (await createResponses(
+          {
+            input: missInput,
+            model: "gpt-continuation",
+            stream: true,
+          },
+          {
+            allowCompactionHttpFallback: true,
+            initiator: "agent",
+            requestId: getContinuationRequestId(),
+            transport: "websocket",
+            vision: false,
+          },
+        )) as AsyncIterable<unknown>,
+      )
+      expect(missChunks.map((chunk) => chunk.event)).toEqual([
+        "response.completed",
+      ])
+      expect(http).toHaveBeenCalledTimes(2)
+      expect(receivedBodies[1]?.previous_response_id).toBeUndefined()
+      expect(receivedBodies[1]?.input).toEqual(missInput)
+      expect(MockWebSocket.instances).toHaveLength(1)
+    })
+  } finally {
+    globalThis.fetch = fetchBefore
+  }
+})
+
+test("Copilot oversized compaction skips HTTP fallback when client aborts before fallback starts", async () => {
+  const mib = 1024 * 1024
+  const firstInput: Array<ResponseInputItem> = [
+    { role: "user", content: "x".repeat(16 * mib - mib) },
+  ]
+  const oversizedDeltaCompact: Array<ResponseInputItem> = [
+    ...firstInput,
+    ...continuationOutput,
+    { role: "user", content: "y".repeat(18 * mib) },
+    { type: "compaction_trigger" },
+  ]
+  const fetchBefore = globalThis.fetch
+  const http = mock(() => Promise.resolve(new Response("unexpected")))
+  globalThis.fetch = http as unknown as typeof fetch
+
+  try {
+    await withAffinity("abort-before-fallback", async () => {
+      await sendContinuationTurn(firstInput)
+      const controller = new AbortController()
+      const stream = (await createResponses(
+        {
+          input: oversizedDeltaCompact,
+          model: "gpt-continuation",
+          stream: true,
+        },
+        {
+          allowCompactionHttpFallback: true,
+          clientSignal: controller.signal,
+          initiator: "agent",
+          requestId: getContinuationRequestId(),
+          transport: "websocket",
+          vision: false,
+        },
+      )) as AsyncIterable<unknown>
+      const iterator = stream[Symbol.asyncIterator]()
+      const firstChunk = iterator.next()
+      // Abort while runPooledWebSocketRequest is suspended on the pooled socket promise.
+      controller.abort()
+      expect(await firstChunk).toEqual({ done: true, value: undefined })
+      expect(http).toHaveBeenCalledTimes(0)
+    })
+  } finally {
+    globalThis.fetch = fetchBefore
+  }
+})
+
+test("Copilot preserves the pooled checkpoint after a local oversized delta rejection", async () => {
+  const mib = 1024 * 1024
+  const firstInput: Array<ResponseInputItem> = [
+    { role: "user", content: "x".repeat(15 * mib) },
+  ]
+  const inputWithDelta = (size: number): Array<ResponseInputItem> => [
+    ...firstInput,
+    ...continuationOutput,
+    { role: "user", content: "y".repeat(size * mib) },
+  ]
+
+  await withAffinity("after-size-rejection", async () => {
+    await sendContinuationTurn(firstInput)
+    const rejected = await sendContinuationTurn(inputWithDelta(17))
+    expect(rejected[0]?.data).toContain("context_length_exceeded")
+    expect(MockWebSocket.instances[0].sent).toHaveLength(1)
+
+    const compactInput: Array<ResponseInputItem> = [
+      ...inputWithDelta(2),
+      { type: "compaction_trigger" },
+    ]
+    await collectStreamChunks(
+      (await createResponses(
+        { input: compactInput, model: "gpt-continuation", stream: true },
+        {
+          allowCompactionHttpFallback: true,
+          initiator: "agent",
+          requestId: getContinuationRequestId(),
+          transport: "websocket",
+          vision: false,
+        },
+      )) as AsyncIterable<unknown>,
+    )
+    expect(MockWebSocket.instances).toHaveLength(1)
+    expect(continuationRequest(0, 1)).toMatchObject({
+      previous_response_id: "resp-1",
+      input: compactInput.slice(-2),
+    })
+  })
+})

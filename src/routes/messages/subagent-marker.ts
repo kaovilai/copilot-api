@@ -1,6 +1,10 @@
-import { subagentMarkerPrefix, type SubagentMarker } from "~/lib/subagent"
+import type { SubagentMarker } from "~/lib/http/subagent"
 
 import type { AnthropicMessagesPayload } from "~/lib/types/anthropic"
+
+// Must stay in sync with MARKER_PREFIX in plugin/opencode/agent-context.js,
+// which emits the marker into the first child message.
+const subagentMarkerPrefix = "__SUBAGENT_MARKER__"
 
 export const parseSubagentMarkerFromFirstUser = (
   payload: AnthropicMessagesPayload,

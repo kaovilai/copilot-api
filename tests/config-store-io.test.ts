@@ -6,7 +6,6 @@ import path from "node:path"
 import {
   defaultConfig,
   getAlphaSearchModel,
-  getClaudeAutoModel,
   getMessageApiWebSearchModel,
   getOpencodeModelContextWindow,
   invalidateConfigCache,
@@ -15,18 +14,20 @@ import {
   setConfiguredApiKeys,
   writeConfigToDisk,
   type AppConfig,
-} from "~/lib/config-store"
+} from "~/lib/config/config-store"
 import {
+  getClaudeAutoModel,
   getSmallModel,
   getSmallModelForProvider,
   isOutputEncryptedContentDisabled,
-} from "~/lib/model-policy"
-import { PATHS } from "~/lib/paths"
+} from "~/lib/config/model-policy"
+import { PATHS } from "~/lib/storage/paths"
 import { state } from "~/lib/state"
 
 interface StoredConfig {
   auth: {
-    apiKeys: Array<string>
+    apiKeys?: Array<string>
+    apiKeyConfigs: Array<{ id: string; key: string }>
     adminApiKey: string
   }
   providers: Record<string, { apiKey: string; baseUrl: string }>
@@ -84,6 +85,9 @@ test("writeConfigToDisk atomically replaces the editable config", () => {
   expect(JSON.parse(fs.readFileSync(configPath, "utf8"))).toEqual({
     auth: {
       apiKeys: ["new"],
+      apiKeyConfigs: [
+        { id: "key_a949fa412bb7b318a927b99ea4e5ae7e", key: "new" },
+      ],
     },
     providers: {
       example: {
@@ -100,7 +104,7 @@ test("reloadConfig creates a default config when it is missing", () => {
 
   const config = reloadConfig()
 
-  expect(config.auth?.apiKeys).toEqual([])
+  expect(config.auth?.apiKeyConfigs).toEqual([])
   expect(config.smallModels).toEqual({
     codex: "gpt-6-luna",
     copilot: "gpt-6-luna",
@@ -109,12 +113,21 @@ test("reloadConfig creates a default config when it is missing", () => {
   expect(config.messageApiWebSearchModel).toBe("gpt-6-luna")
   expect(config.opencodeModelContextWindow).toBe(400_000)
   expect(config.noEncryptedOutputModels).toEqual([])
+  expect(config.codexMultiAgentV1).toBe(false)
   expect(isOutputEncryptedContentDisabled("gpt-6-astra")).toBe(false)
   expect(getOpencodeModelContextWindow()).toBe(400_000)
   expect(config.extraPrompts).toBeUndefined()
   expect(config.modelReasoningEfforts).toBeUndefined()
   if (process.platform !== "win32") {
     expect(fs.statSync(configPath).mode & 0o777).toBe(0o600)
+  }
+})
+
+test("reloads Codex Multi-Agent V1 changes saved through the config store", () => {
+  useTempConfigPath()
+  for (const codexMultiAgentV1 of [true, false]) {
+    writeConfigToDisk({ codexMultiAgentV1 })
+    expect(reloadConfig().codexMultiAgentV1).toBe(codexMultiAgentV1)
   }
 })
 
@@ -175,31 +188,26 @@ test.each([
   { configured: {}, expected: 400_000 },
   { configured: [], expected: 400_000 },
 ])(
-  "normalizes and persists the OpenCode context window setting %j",
+  "normalizes the OpenCode context window on read without rewriting config %j",
   ({ configured, expected }) => {
     const configPath = useTempConfigPath()
-    fs.writeFileSync(
-      configPath,
-      JSON.stringify({
-        ...defaultConfig,
-        auth: { adminApiKey: "existing-admin-key" },
-        opencodeModelContextWindow: configured,
-      }),
-      "utf8",
-    )
+    const storedConfig = JSON.stringify({
+      ...defaultConfig,
+      auth: { adminApiKey: "existing-admin-key" },
+      opencodeModelContextWindow: configured,
+    })
+    fs.writeFileSync(configPath, storedConfig, "utf8")
 
-    expect(reloadConfig().opencodeModelContextWindow).toBe(expected)
+    reloadConfig()
     expect(getOpencodeModelContextWindow()).toBe(expected)
-    const storedConfig = fs.readFileSync(configPath, "utf8")
-    expect(
-      (JSON.parse(storedConfig) as AppConfig).opencodeModelContextWindow,
-    ).toBe(expected)
-    expect(reloadConfig().opencodeModelContextWindow).toBe(expected)
+    expect(fs.readFileSync(configPath, "utf8")).toBe(storedConfig)
+    reloadConfig()
+    expect(getOpencodeModelContextWindow()).toBe(expected)
     expect(fs.readFileSync(configPath, "utf8")).toBe(storedConfig)
   },
 )
 
-test("uses the default OpenCode context ceiling on a lazy read without rewriting legacy config", () => {
+test("uses the default OpenCode context ceiling on a lazy read and reload without rewriting legacy config", () => {
   const configPath = useTempConfigPath()
   const legacyConfig = JSON.stringify({
     ...defaultConfig,
@@ -212,10 +220,8 @@ test("uses the default OpenCode context ceiling on a lazy read without rewriting
   expect(getOpencodeModelContextWindow()).toBe(400_000)
   expect(fs.readFileSync(configPath, "utf8")).toBe(legacyConfig)
   reloadConfig()
-  expect(
-    (JSON.parse(fs.readFileSync(configPath, "utf8")) as AppConfig)
-      .opencodeModelContextWindow,
-  ).toBe(400_000)
+  expect(getOpencodeModelContextWindow()).toBe(400_000)
+  expect(fs.readFileSync(configPath, "utf8")).toBe(legacyConfig)
 })
 
 test("reloadConfig refreshes an explicitly configured OpenCode context ceiling", () => {
@@ -562,7 +568,10 @@ test("setConfiguredApiKeys normalizes keys and preserves other config fields", (
 
   expect(storedKeys).toEqual(["key-1", "key-2"])
   const config = JSON.parse(fs.readFileSync(configPath, "utf8")) as StoredConfig
-  expect(config.auth.apiKeys).toEqual(["key-1", "key-2"])
+  expect(config.auth.apiKeyConfigs.map((key) => key.key)).toEqual([
+    "key-1",
+    "key-2",
+  ])
   expect(config.auth.adminApiKey).toBe("existing-admin-key")
   expect(config.providers).toEqual({
     example: {
@@ -588,7 +597,8 @@ test("setConfiguredApiKeys can clear all keys", () => {
   const storedKeys = setConfiguredApiKeys([])
   expect(storedKeys).toEqual([])
   const config = JSON.parse(fs.readFileSync(configPath, "utf8")) as StoredConfig
-  expect(config.auth.apiKeys).toEqual([])
+  expect(config.auth.apiKeyConfigs).toEqual([])
+  expect(config.auth.apiKeys).toEqual(["key-1"])
   expect(config.auth.adminApiKey).toBe("admin-key")
 })
 

@@ -7,7 +7,7 @@ import {
 import {
   UpstreamHeadersTimeoutError,
   UpstreamStreamInactivityTimeoutError,
-} from "~/lib/error"
+} from "~/lib/http/error"
 import { createResponsesHttpEventStream } from "~/services/responses-http"
 import { fetchUpstreamWithLifecycle } from "~/services/upstream-http"
 
@@ -32,6 +32,16 @@ test("upstream transport configuration validates positive integer limits", () =>
     headersTimeoutMs: 12,
     websocketOpenTimeoutMs: 45,
   })
+})
+
+test("the websocket pool defaults to 270 seconds and honors an explicit timeout", () => {
+  expect(
+    normalizeUpstreamTransportConfig(undefined).websocketPoolIdleTimeoutMs,
+  ).toBe(270_000)
+  expect(
+    normalizeUpstreamTransportConfig({ websocketPoolIdleTimeoutMs: 60_000 })
+      .websocketPoolIdleTimeoutMs,
+  ).toBe(60_000)
 })
 
 test("a client cancelled before dispatch does not call fetch", async () => {

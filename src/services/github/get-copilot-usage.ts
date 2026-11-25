@@ -1,6 +1,6 @@
 import consola from "consola"
-import { getGitHubApiBaseUrl, githubHeaders } from "~/lib/api-config"
-import { HTTPError, parseRetryAfterMs } from "~/lib/error"
+import { getGitHubApiBaseUrl, githubHeaders } from "~/lib/providers/api-config"
+import { HTTPError, parseRetryAfterMs } from "~/lib/http/http-error"
 import { state } from "~/lib/state"
 import { sleep } from "~/lib/utils"
 

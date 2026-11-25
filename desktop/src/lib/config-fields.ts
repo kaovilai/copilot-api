@@ -28,11 +28,23 @@ export const configFields = [
     unit: 'tokens',
   },
   {
+    id: 'codexMultiAgentV1',
+    path: 'codexMultiAgentV1',
+    section: 'general',
+    type: 'boolean',
+  },
+  {
     id: 'claudeTokenMultiplier',
     path: 'claudeTokenMultiplier',
     section: 'general',
     type: 'number',
     step: '0.01',
+  },
+  {
+    id: 'tokenUsageRetentionDays',
+    path: 'tokenUsageRetentionDays',
+    section: 'general',
+    type: 'number',
   },
   {
     id: 'anthropicApiKey',
@@ -81,18 +93,6 @@ export const configFields = [
   {
     id: 'messageApiWebSearchModel',
     path: 'messageApiWebSearchModel',
-    section: 'search',
-    type: 'string',
-  },
-  {
-    id: 'imageGenerationModel',
-    path: 'imageGenerationModel',
-    section: 'search',
-    type: 'string',
-  },
-  {
-    id: 'imageEditModel',
-    path: 'imageEditModel',
     section: 'search',
     type: 'string',
   },

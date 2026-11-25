@@ -1,11 +1,11 @@
 import { z } from "zod"
 import os from "node:os"
 
-import { getGrokBuildVersion } from "~/lib/grok-build"
-import { XAI_API_BASE_URL } from "~/lib/oauth/xai"
-import { resolveProviderConfig } from "~/lib/provider-resolver"
-import { readXaiCredentials } from "~/lib/xai-token"
-import { isGitHubCopilotEnabled } from "~/lib/github-copilot-provider"
+import { getGrokBuildVersion } from "~/lib/providers/grok-build"
+import { XAI_API_BASE_URL } from "~/lib/auth/oauth/xai"
+import { resolveProviderConfig } from "~/lib/providers/provider-resolver"
+import { readXaiCredentials } from "~/lib/auth/xai-token"
+import { isGitHubCopilotEnabled } from "~/lib/providers/github-copilot-provider"
 import { getCopilotUsage } from "~/services/github/get-copilot-usage"
 import { resolveProviderEndpointUrl } from "~/services/providers/provider-proxy"
 import type {
@@ -13,13 +13,11 @@ import type {
   SubscriptionQuotaWindow,
   SubscriptionUsage,
 } from "~/lib/types/subscription-usage"
-import {
-  buildCodexRequestHeaders,
-  CODEX_API_BASE_URL,
-} from "~/services/codex/create-responses"
+import { CODEX_API_BASE_URL } from "~/services/codex/constants"
+import { buildCodexRequestHeaders } from "~/services/codex/create-responses"
 
 // Published @openai/codex stable version, checked on 2026-10-25.
-const CODEX_CLI_VERSION = "0.164.0"
+const CODEX_CLI_VERSION = "0.166.0"
 
 const amount = z
   .union([

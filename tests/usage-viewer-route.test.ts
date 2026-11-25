@@ -1,9 +1,10 @@
 import { describe, expect, test } from "bun:test"
 import { readFileSync } from "node:fs"
 
-import { server } from "../src/server"
+import { createServer } from "../src/server"
 
 describe("GET /usage-viewer", () => {
+  const server = createServer()
   test("serves the usage viewer HTML consistently across repeated requests", async () => {
     const expected = readFileSync(
       new URL("../pages/index.html", import.meta.url),

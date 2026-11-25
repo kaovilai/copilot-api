@@ -1,5 +1,9 @@
 import { contextBridge, ipcRenderer } from 'electron'
-import type { AppUpdateStatus, XaiAuthInfo } from '../src/types/ipc'
+import type {
+  AppUpdateStatus,
+  ServerLogRecord,
+  XaiAuthInfo,
+} from '../src/types/ipc'
 import type {
   ImageCreationInput,
   SaveMediaInput,
@@ -65,6 +69,8 @@ contextBridge.exposeInMainWorld('electronAPI', {
   getAppUpdateStatus: () => ipcRenderer.invoke('update:get-status'),
   checkAppUpdate: () => ipcRenderer.invoke('update:check'),
   installAppUpdate: () => ipcRenderer.invoke('update:install'),
+  openAppUpdatePackage: (showInFolder = false) =>
+    ipcRenderer.invoke('update:open-package', showInFolder),
   onAppUpdateStatus: (callback: (status: AppUpdateStatus) => void) => {
     const handler = (
       _event: Electron.IpcRendererEvent,
@@ -97,6 +103,15 @@ contextBridge.exposeInMainWorld('electronAPI', {
     provider: 'github-copilot' | 'codex' | 'xai' | 'opencode-go',
   ) => ipcRenderer.invoke('server:fetch-subscription-usage', provider),
   fetchModels: () => ipcRenderer.invoke('server:fetch-models'),
+  getClientIntegrations: (agent?: string) =>
+    ipcRenderer.invoke('clients:get-state', agent),
+  getClientModels: (client: string) =>
+    ipcRenderer.invoke('clients:get-models', client),
+  setupClient: (input: unknown) => ipcRenderer.invoke('clients:setup', input),
+  restoreClient: (client: string, revision: string) =>
+    ipcRenderer.invoke('clients:restore', client, revision),
+  openClientConfig: (client: string) =>
+    ipcRenderer.invoke('clients:open-config', client),
   createImages: (id: string, input: ImageCreationInput) =>
     ipcRenderer.invoke('media:create-images', id, input),
   createVideo: (id: string, input: VideoCreationInput) =>
@@ -105,29 +120,56 @@ contextBridge.exposeInMainWorld('electronAPI', {
     ipcRenderer.invoke('media:get-video', id, requestId),
   cancelMediaRequest: (id: string) => ipcRenderer.invoke('media:cancel', id),
   saveMedia: (input: SaveMediaInput) => ipcRenderer.invoke('media:save', input),
-  fetchTokenUsage: (period: string) =>
-    ipcRenderer.invoke('server:fetch-token-usage', period),
-  fetchTokenUsageDaily: (period: string) =>
-    ipcRenderer.invoke('server:fetch-token-usage-daily', period),
-  fetchTokenUsageEvents: (period: string, page: number, pageSize: number) =>
+  fetchTokenUsage: (period: string, apiKeyId?: string) =>
+    ipcRenderer.invoke(
+      'server:fetch-token-usage',
+      period,
+      ...(apiKeyId === undefined ? [] : [apiKeyId]),
+    ),
+  fetchTokenUsageDaily: (period: string, apiKeyId?: string) =>
+    ipcRenderer.invoke(
+      'server:fetch-token-usage-daily',
+      period,
+      ...(apiKeyId === undefined ? [] : [apiKeyId]),
+    ),
+  fetchTokenUsageEvents: (
+    period: string,
+    page: number,
+    pageSize: number,
+    apiKeyId?: string,
+  ) =>
     ipcRenderer.invoke(
       'server:fetch-token-usage-events',
       period,
       page,
       pageSize,
+      ...(apiKeyId === undefined ? [] : [apiKeyId]),
     ),
-  fetchTokenUsageSessions: (period: string, page: number, pageSize: number) =>
+  fetchTokenUsageSessions: (
+    period: string,
+    page: number,
+    pageSize: number,
+    apiKeyId?: string,
+  ) =>
     ipcRenderer.invoke(
       'server:fetch-token-usage-sessions',
       period,
       page,
       pageSize,
+      ...(apiKeyId === undefined ? [] : [apiKeyId]),
     ),
   getServerAuthInfo: () => ipcRenderer.invoke('server:get-auth-info'),
+  getManagedApiKeys: () => ipcRenderer.invoke('auth:get-managed-api-keys'),
+  saveManagedApiKey: (key: unknown) =>
+    ipcRenderer.invoke('auth:save-managed-api-key', key),
+  removeManagedApiKey: (id: string) =>
+    ipcRenderer.invoke('auth:remove-managed-api-key', id),
+  getApiKeyQuotaUsage: () => ipcRenderer.invoke('auth:get-api-key-quota-usage'),
   getServerKeys: () => ipcRenderer.invoke('auth:get-server-keys'),
   saveServerKeys: (keys: unknown) =>
     ipcRenderer.invoke('auth:save-server-keys', keys),
   getLogs: () => ipcRenderer.invoke('server:get-logs'),
+  clearLogs: () => ipcRenderer.invoke('server:clear-logs'),
 
   onAuthSuccess: (callback: (result: unknown) => void) => {
     const handler = (_event: Electron.IpcRendererEvent, result: unknown) =>
@@ -143,8 +185,8 @@ contextBridge.exposeInMainWorld('electronAPI', {
     return () => ipcRenderer.off('server:status', handler)
   },
 
-  onServerLog: (callback: (log: string) => void) => {
-    const handler = (_event: Electron.IpcRendererEvent, log: string) =>
+  onServerLog: (callback: (log: ServerLogRecord) => void) => {
+    const handler = (_event: Electron.IpcRendererEvent, log: ServerLogRecord) =>
       callback(log)
     ipcRenderer.on('server:log', handler)
     return () => ipcRenderer.off('server:log', handler)

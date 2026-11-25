@@ -1,8 +1,6 @@
 import type { Model, ModelsResponse } from "~/lib/types/models"
-import {
-  buildCodexRequestHeaders,
-  CODEX_API_BASE_URL,
-} from "~/services/codex/create-responses"
+import { CODEX_API_BASE_URL } from "~/services/codex/constants"
+import { buildCodexRequestHeaders } from "~/services/codex/create-responses"
 
 interface CodexModelDefinition {
   contextWindow: number
@@ -77,6 +75,22 @@ const CODEX_MODELS: Array<CodexModelDefinition> = [
     maxTokens: 128_000,
     name: "GPT-6.1 Terra",
     reasoningEfforts: ["none", "low", "medium", "high", "xhigh", "max"],
+  },
+  {
+    contextWindow: 872_000,
+    id: "gpt-6.2-sol",
+    input: ["text", "image"],
+    maxTokens: 128_000,
+    name: "GPT-6.2 Sol",
+    reasoningEfforts: ["low", "medium", "high", "xhigh", "max"],
+  },
+  {
+    contextWindow: 872_000,
+    id: "gpt-6.2-astra",
+    input: ["text", "image"],
+    maxTokens: 128_000,
+    name: "GPT-6.2 Astra",
+    reasoningEfforts: ["low", "medium", "high", "xhigh", "max"],
   },
   ...["codex-auto-review", "gpt-reserve"].map((id) => ({
     contextWindow: 872_000,

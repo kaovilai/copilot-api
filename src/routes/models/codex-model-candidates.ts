@@ -5,18 +5,19 @@ import {
   type ResolvedProviderConfig,
 } from "~/lib/config"
 import { createHandlerLogger } from "~/lib/logger"
-import { toClientModelId } from "~/lib/models"
-import { isProviderModelVisible } from "~/lib/provider-model-catalog"
-import { getProviderAgentModels } from "~/lib/provider-management"
-import { resolveProviderConfig } from "~/lib/provider-resolver"
+import { toClientModelId } from "~/lib/catalog/models"
+import { isProviderModelVisible } from "~/lib/catalog/provider-model-catalog"
+import { getProviderAgentModels } from "~/lib/config/provider-management"
+import { resolveProviderConfig } from "~/lib/providers/provider-resolver"
 import type { Model } from "~/lib/types/models"
-import type { SyntheticCodexModelCandidate } from "~/routes/models/codex-models-types"
+import type { SyntheticCodexModelCandidate } from "~/lib/types/codex-models"
 import {
   deduplicateModels,
   getCopilotModelRecords,
   getModelsById,
   getProviderModelRecords,
   getStringField,
+  isImageOnlyModel,
 } from "~/routes/models/model-discovery"
 import { getModelMetadata } from "~/routes/models/model-metadata"
 
@@ -76,12 +77,14 @@ function getCopilotCodexCandidates(): Array<SyntheticCodexModelCandidate> {
 function isCopilotCodexCandidate(model: Model): boolean {
   const endpoints = model.supported_endpoints ?? []
   return (
-    endpoints.some(
+    !isImageOnlyModel("github-copilot", model.id, model)
+    && endpoints.some(
       (endpoint) =>
         endpoint === MESSAGES_ENDPOINT
         || endpoint === CHAT_COMPLETIONS_ENDPOINT
         || RESPONSES_ENDPOINTS.has(endpoint),
-    ) && model.capabilities.supports.tool_calls !== false
+    )
+    && model.capabilities.supports.tool_calls !== false
   )
 }
 
@@ -135,6 +138,10 @@ async function getProviderCodexCandidates(
     const candidates: Array<SyntheticCodexModelCandidate> = []
     for (const modelId of modelIds) {
       if (!isProviderModelVisible(provider, modelId, providerConfig)) continue
+      const remoteModel = modelsById.get(modelId)
+      if (isImageOnlyModel(provider, modelId, remoteModel, providerConfig)) {
+        continue
+      }
       const effectiveType = resolveEffectiveProviderType(
         providerConfig,
         modelId,
@@ -147,7 +154,7 @@ async function getProviderCodexCandidates(
         createProviderCodexCandidate(
           providerConfig,
           modelId,
-          modelsById.get(modelId),
+          remoteModel,
           effectiveType,
         ),
       )

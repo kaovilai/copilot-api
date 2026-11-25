@@ -2,7 +2,7 @@
 
 [项目首页](../../../README.zh-CN.md) · [English](../en/README.md)
 
-首次使用请先阅读[项目首页](../../../README.zh-CN.md#quick-start)的快速开始，再选择对应客户端指南。
+要运行网关，请参阅项目首页的[快速开始](../../../README.zh-CN.md#quick-start)。
 
 | 文档 | 内容 |
 | --- | --- |
@@ -10,10 +10,12 @@
 | [Claude Code](claude-code.md) | settings.json、网关模型发现与模型映射 |
 | [OpenCode](opencode.md) | v2 Responses 插件、自动模型发现与 v1 Anthropic SDK 配置 |
 | [Codex](codex.md) | config.toml、`GITHUB_COPILOT_API_KEY` 设置、模型目录与自动审核映射 |
+| [AGY CLI](agy-cli.md) | Gemini 网关接入、跨平台配置与 [AGY CLI Statusline](agy-cli.md#agy-cli-statusline) |
 | [DeepSeek Harness](dsh.md) | 安装 `dsh-copilot-api` 并接入本地网关 |
 | [Docker](docker.md) | Docker Compose、持久化存储与网络设置 |
 | [桌面应用](desktop.md) | 安装、账号管理与高级设置 |
 | [插件与工具搜索](integrations.md) | Claude Code / OpenCode 插件与 MCP 工具搜索桥接 |
+| [网关事件插件](gateway-plugins.md) | 编写服务端插件，获取请求状态、耗时和用量 |
 | [用量监控](usage.md) | 用量面板、Token 历史与配额监控 |
 | [命令行参考](cli.md) | 命令、参数与请求示例 |
 | [配置参考](configuration.md) | config.json 配置项、模型路由与传输设置 |

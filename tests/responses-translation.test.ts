@@ -1,7 +1,8 @@
 import { describe, expect, it } from "bun:test"
 
-import { requestContext } from "~/lib/request-context"
-import { createMcpToolSearchSentinel } from "~/lib/tool-search"
+import { getExtraPromptForModel } from "~/lib/config"
+import { requestContext } from "~/lib/http/request-context"
+import { createMcpToolSearchSentinel } from "~/lib/cli/tool-search"
 import type { AnthropicMessagesPayload } from "~/lib/types/anthropic"
 import type {
   ResponseFunctionCallOutputItem,
@@ -135,6 +136,42 @@ describe("translateAnthropicMessagesToResponsesPayload", () => {
     })
 
     expect(result.reasoning?.effort).toBe("xhigh")
+  })
+
+  it("maps output_config.format into Responses text.format only when enabled", () => {
+    const schema = {
+      title: "Review Summary",
+      description: "Summary payload",
+      type: "object",
+      properties: { ok: { type: "boolean" } },
+    }
+    const payload: AnthropicMessagesPayload = {
+      ...samplePayload,
+      output_config: {
+        effort: "high",
+        format: {
+          type: "json_schema",
+          schema,
+        },
+      },
+    }
+
+    const defaultResult = translateAnthropicMessagesToResponsesPayload(payload)
+    expect(defaultResult.text).toBeUndefined()
+    expect(defaultResult.reasoning?.effort).toBe("high")
+
+    const result = translateAnthropicMessagesToResponsesPayload(payload, {
+      forwardStructuredOutput: true,
+    })
+    expect(result.text).toEqual({
+      format: {
+        type: "json_schema",
+        name: "Review_Summary",
+        description: "Summary payload",
+        schema,
+        strict: false,
+      },
+    })
   })
 
   it("converts anthropic text blocks into response input messages", () => {
@@ -445,7 +482,7 @@ describe("translateAnthropicMessagesToResponsesPayload", () => {
 
       expect(result.temperature).toBe(1)
       expect(result.top_p).toBeNull()
-      expect(result.max_output_tokens).toBe(12800)
+      expect(result.max_output_tokens).toBe(1024)
       expect(result.reasoning?.summary).toBe("auto")
       expect(result.include).toEqual(["reasoning.encrypted_content"])
       expect(result.input).toEqual([
@@ -464,60 +501,56 @@ describe("translateAnthropicMessagesToResponsesPayload", () => {
     },
   )
 
-  it("extracts identifiers from JSON-like user_id metadata", () => {
-    const result = translateAnthropicMessagesToResponsesPayload({
-      ...samplePayload,
-      metadata: {
-        user_id: jsonStyleUserId,
-      },
-      tools: sampleTools,
-    })
-
-    expect(result.prompt_cache_key).toBe("2c4e1cf0-7a67-4d2e-9a4b-1d16d3f44752")
-  })
-
-  it.each([undefined, "agent-a", "agent-b"])(
-    "shares the metadata cache key between main and subagents (%s)",
-    (agentId) => {
+  it.each([1, 64, 1024, 12800, 32768])(
+    "preserves the explicit output token limit %i",
+    (maxTokens) => {
       const result = translateAnthropicMessagesToResponsesPayload({
-        ...samplePayload,
-        metadata: { user_id: jsonStyleUserId },
-        tools: sampleTools,
-        messages: [
-          {
-            role: "user",
-            content: [
-              {
-                type: "text",
-                text:
-                  agentId ?
-                    `<system-reminder>__SUBAGENT_MARKER__${JSON.stringify({ session_id: "child", agent_id: agentId, agent_type: "Explore" })}</system-reminder>`
-                  : "hello",
-              },
-            ],
-          },
-        ],
+        model: "gpt-5.4",
+        max_tokens: maxTokens,
+        messages: [{ role: "user", content: "Hello" }],
       })
-
-      expect(result.prompt_cache_key).toBe(
-        "2c4e1cf0-7a67-4d2e-9a4b-1d16d3f44752",
-      )
+      expect(result.max_output_tokens).toBe(maxTokens)
     },
   )
 
-  it("keeps legacy user_id parsing before JSON fallback", () => {
-    const result = translateAnthropicMessagesToResponsesPayload({
-      ...samplePayload,
-      metadata: {
-        user_id: legacyStyleUserId,
-      },
-      tools: sampleTools,
-    })
+  it.each([jsonStyleUserId, legacyStyleUserId, emptySessionUserId])(
+    "preserves metadata without using it as the cache key (%s)",
+    (userId) => {
+      const metadata = { user_id: userId }
+      const result = translateAnthropicMessagesToResponsesPayload({
+        ...samplePayload,
+        metadata,
+        tools: sampleTools,
+      })
+      expect(result.prompt_cache_key).toBeNull()
+      expect(result.metadata).toEqual(metadata)
+    },
+  )
 
-    expect(result.prompt_cache_key).toBe("7d0e2f61-4b5c-4a9d-8f11-2c3d4e5f6a7b")
-  })
+  it.each([undefined, "agent-a", "agent-b"])(
+    "shares the trace root cache key between main and subagents (%s)",
+    (agentId) => {
+      const result = requestContext.run(
+        {
+          parentSessionId: undefined,
+          rootSessionId: "root",
+          sessionAffinity: agentId ? `root:${agentId}` : "root",
+          startTime: Date.now(),
+          traceId: "trace-123",
+          userAgent: "test",
+        },
+        () =>
+          translateAnthropicMessagesToResponsesPayload({
+            ...samplePayload,
+            metadata: { user_id: jsonStyleUserId },
+            tools: sampleTools,
+          }),
+      )
+      expect(result.prompt_cache_key).toBe("root")
+    },
+  )
 
-  it("falls back to session affinity when metadata session id is empty", () => {
+  it("uses trace affinity when the root session is absent", () => {
     const result = requestContext.run(
       {
         parentSessionId: undefined,
@@ -529,39 +562,66 @@ describe("translateAnthropicMessagesToResponsesPayload", () => {
       () =>
         translateAnthropicMessagesToResponsesPayload({
           ...samplePayload,
-          metadata: {
-            user_id: emptySessionUserId,
-          },
+          metadata: { user_id: jsonStyleUserId },
           tools: sampleTools,
         }),
     )
-
     expect(result.prompt_cache_key).toBe("opencode-session")
   })
 
-  it("keeps unrelated system prompt text unchanged", () => {
-    const payload = {
-      model: "gpt-5.4",
-      max_tokens: 1024,
-      system: [
-        {
-          type: "text",
-          text: "ordinary system prompt",
-        },
-      ],
-      messages: [
-        {
-          role: "user",
-          content: [{ type: "text", text: "hello gpt54" }],
-        },
-      ],
-    } as unknown as AnthropicMessagesPayload
+  const systemPrompt = "ordinary system prompt"
+  const systemPromptPayload: Omit<AnthropicMessagesPayload, "model"> = {
+    max_tokens: 1024,
+    system: [{ type: "text", text: systemPrompt }],
+    messages: [{ role: "user", content: "hello" }],
+  }
+  const translatedUserMessage = {
+    type: "message",
+    role: "user",
+    content: "hello",
+  }
 
-    const result = translateAnthropicMessagesToResponsesPayload(payload)
+  it.each([
+    ["gpt-6", "developer"],
+    ["gpt-6-sol", "developer"],
+    ["gpt-6.1-sol", "developer"],
+    ["gpt-6.2-sol", "developer"],
+    ["gpt-6.2-astra", "developer"],
+    ["openai/gpt-6.2-sol", "developer"],
+    ["gpt-6.3-sol", "developer"],
+    ["gpt-7-sol", "developer"],
+    ["grok-4", "system"],
+  ])("sends the top-level system prompt in input for %s", (model, role) => {
+    const result = translateAnthropicMessagesToResponsesPayload({
+      ...systemPromptPayload,
+      model,
+    })
 
-    expect(result.instructions).toContain("ordinary system prompt")
-    expect(result.instructions).not.toContain("cch=<stable>;")
+    expect(result).not.toHaveProperty("instructions")
+    expect(result.input).toEqual([
+      {
+        type: "message",
+        role,
+        content: `${systemPrompt}\n\n${getExtraPromptForModel(model)}\n\n`,
+      },
+      translatedUserMessage,
+    ])
   })
+
+  it.each(["gpt-5.4", "gpt-5.5", "gpt-5.6-sol"])(
+    "keeps the top-level system prompt in instructions for %s",
+    (model) => {
+      const result = translateAnthropicMessagesToResponsesPayload({
+        ...systemPromptPayload,
+        model,
+      })
+
+      expect(result.instructions).toBe(
+        `${systemPrompt}\n\n${getExtraPromptForModel(model)}\n\n`,
+      )
+      expect(result.input).toEqual([translatedUserMessage])
+    },
+  )
 
   it("translates inline system messages to developer items", () => {
     const result = translateAnthropicMessagesToResponsesPayload({
@@ -785,6 +845,83 @@ describe("translateAnthropicMessagesToResponsesPayload", () => {
         '{"type":"input_text"}',
       )
     })
+  })
+
+  it("translates only text blocks in inline system messages", () => {
+    const toolAdditionBlock = {
+      type: "tool_addition",
+      tool: {
+        type: "tool_reference",
+        name: "mcp__plugin_tool-search_tool_search__search",
+      },
+    }
+    const payload = {
+      model: "gpt-5.4",
+      max_tokens: 1024,
+      messages: [
+        {
+          role: "system",
+          content: [
+            {
+              type: "text",
+              text: "tools are available",
+            },
+            toolAdditionBlock,
+          ],
+        },
+        {
+          role: "user",
+          content: "hello",
+        },
+        {
+          role: "system",
+          content: [toolAdditionBlock],
+        },
+        {
+          role: "system",
+          content: "",
+        },
+        {
+          role: "system",
+          content: [
+            {
+              type: "text",
+              text: " \n\t",
+            },
+          ],
+        },
+      ],
+    } as unknown as AnthropicMessagesPayload
+
+    const result = translateAnthropicMessagesToResponsesPayload(payload)
+
+    expect(result.input).toEqual([
+      {
+        type: "message",
+        role: "developer",
+        content: [
+          {
+            type: "input_text",
+            text: "tools are available",
+          },
+        ],
+      },
+      {
+        type: "message",
+        role: "user",
+        content: "hello",
+      },
+      {
+        type: "message",
+        role: "developer",
+        content: [
+          {
+            type: "input_text",
+            text: " \n\t",
+          },
+        ],
+      },
+    ])
   })
 
   it("drops text blocks with missing or empty text instead of emitting text-less input_text parts", () => {
@@ -1089,7 +1226,7 @@ describe("translateAnthropicMessagesToResponsesPayload", () => {
     ])
   })
 
-  it("converts bridge and deferred tools into Responses tool_search and namespaces", () => {
+  it("keeps bridge deferred tools out of top-level tools until loaded", () => {
     const result = translateAnthropicMessagesToResponsesPayload({
       model: "gpt-5.4",
       max_tokens: 1024,
@@ -1166,48 +1303,6 @@ describe("translateAnthropicMessagesToResponsesPayload", () => {
           required: ["names"],
           additionalProperties: false,
         },
-      },
-      {
-        type: "namespace",
-        name: "mcp__fetch__fetch",
-        description: "Fetch a URL",
-        tools: [
-          {
-            type: "function",
-            name: "mcp__fetch__fetch",
-            description: "Fetch a URL",
-            parameters: {
-              type: "object",
-              properties: {
-                url: { type: "string" },
-              },
-              required: ["url"],
-            },
-            strict: false,
-            defer_loading: true,
-          },
-        ],
-      },
-      {
-        type: "namespace",
-        name: "chrome-devtools_click",
-        description: "Click an element",
-        tools: [
-          {
-            type: "function",
-            name: "chrome-devtools_click",
-            description: "Click an element",
-            parameters: {
-              type: "object",
-              properties: {
-                uid: { type: "string" },
-              },
-              required: ["uid"],
-            },
-            strict: false,
-            defer_loading: true,
-          },
-        ],
       },
       {
         type: "function",
@@ -1327,7 +1422,7 @@ describe("translateAnthropicMessagesToResponsesPayload", () => {
     },
   )
 
-  it("preserves namespace on deferred tool_use history", () => {
+  it("replays deferred tool_use history as a function call", () => {
     const result = translateAnthropicMessagesToResponsesPayload({
       model: "gpt-5.4",
       max_tokens: 1024,
@@ -1361,7 +1456,6 @@ describe("translateAnthropicMessagesToResponsesPayload", () => {
         type: "function_call",
         call_id: "call_shipping_eta",
         name: "get_shipping_eta",
-        namespace: "get_shipping_eta",
         arguments: '{"order_id":"order_42"}',
         status: "completed",
       },
@@ -1427,24 +1521,17 @@ describe("translateAnthropicMessagesToResponsesPayload", () => {
       execution: "client",
       tools: [
         {
-          type: "namespace",
+          type: "function",
           name: "mcp__fetch__fetch",
           description: "Fetch a URL",
-          tools: [
-            {
-              type: "function",
-              name: "mcp__fetch__fetch",
-              description: "Fetch a URL",
-              parameters: {
-                type: "object",
-                properties: {
-                  url: { type: "string" },
-                },
-              },
-              strict: false,
-              defer_loading: true,
+          parameters: {
+            type: "object",
+            properties: {
+              url: { type: "string" },
             },
-          ],
+          },
+          strict: false,
+          defer_loading: true,
         },
       ],
       status: "completed",

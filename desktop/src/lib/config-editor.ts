@@ -1,4 +1,5 @@
 import { z } from 'zod'
+import { isValidCostAmount } from '../../../src/lib/token-usage/currency'
 import { ConfigEditorError } from './config-editor-errors'
 
 export type ConfigObject = Record<string, unknown>
@@ -79,19 +80,43 @@ const providerSchema = z.looseObject({
   agentsModels: z.array(z.string()).optional(),
   models: z.record(z.string(), modelSchema).optional(),
 })
-const imageModel = z
-  .string()
-  .refine((value) => value === '' || /^xai\/.+/.test(value), {
-    message: 'Use an xai/model alias, or an empty string for the default route',
-  })
 
 // Validate known fields without stripping future or provider-specific fields.
 // The original parsed document is persisted, not Zod's transformed output.
 export const appConfigSchema = z.looseObject({
   auth: z
     .looseObject({
-      apiKeys: z.array(nonEmptyString).optional(),
+      apiKeyConfigs: z
+        .array(
+          z.looseObject({
+            id: z.string().regex(/^[\w-]{1,128}$/),
+            key: nonEmptyString,
+            name: nonEmptyString.optional(),
+            enabled: z.boolean().optional(),
+            expiresAt: z
+              .string()
+              .refine(
+                (value) => Number.isFinite(Date.parse(value)),
+                'Invalid expiry date',
+              )
+              .optional(),
+            allowedModels: z.array(nonEmptyString).optional(),
+            quota: z
+              .looseObject({
+                period: z.enum(['day', 'month', 'lifetime']),
+                amount: z
+                  .number()
+                  .refine(
+                    isValidCostAmount,
+                    'Amount must be non-negative and fit in cost nanos',
+                  ),
+              })
+              .optional(),
+          }),
+        )
+        .optional(),
       adminApiKey: z.string().optional(),
+      isolateApiKeyUsage: z.boolean().optional(),
     })
     .optional(),
   providers: z.record(z.string(), providerSchema).optional(),
@@ -111,6 +136,7 @@ export const appConfigSchema = z.looseObject({
   modelReasoningEfforts: z.record(z.string(), reasoningEffort).optional(),
   useMessagesApi: z.boolean().optional(),
   useResponsesApiWebSocket: z.boolean().optional(),
+  codexMultiAgentV1: z.boolean().optional(),
   noEncryptedOutputModels: z.array(nonEmptyString).optional(),
   upstreamTransport: z
     .looseObject({
@@ -127,10 +153,9 @@ export const appConfigSchema = z.looseObject({
   alphaSearchCodexPriority: z.boolean().optional(),
   alphaSearchModel: z.string().optional(),
   messageApiWebSearchModel: z.string().optional(),
-  imageGenerationModel: imageModel.optional(),
-  imageEditModel: imageModel.optional(),
   claudeAutoModel: z.string().optional(),
   claudeTokenMultiplier: z.number().positive().optional(),
+  tokenUsageRetentionDays: positiveInteger.optional(),
 })
 
 export function isConfigObject(value: unknown): value is ConfigObject {
@@ -157,7 +182,6 @@ export function parseConfigContent(content: string): ConfigObject {
 // legacy values may bypass strict validation; newly entered values still fail.
 function legacyField(path: PropertyKey[]): string[] | undefined {
   const keys = path.map(String)
-  if (keys[0] === 'auth' && keys[1] === 'apiKeys') return keys.slice(0, 2)
   if (keys[0] === 'opencodeModelContextWindow') return keys.slice(0, 1)
   if (keys[0] === 'contextManagement') return keys.slice(0, 1)
   if (

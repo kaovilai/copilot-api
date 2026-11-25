@@ -2,12 +2,13 @@
 
 import type { events } from "fetch-event-stream"
 
-import type { CopilotQuotaSnapshot } from "~/lib/copilot-rate-limit"
+import type { CopilotQuotaSnapshot } from "./copilot-rate-limit"
 
 export interface ResponsesPayload {
   model: string
   instructions?: string | null
   input?: string | Array<ResponseInputItem>
+  previous_response_id?: string | null
   text?: ResponsesTextConfig | null
   tools?: Array<Tool> | null
   tool_choice?: ToolChoiceOptions | ToolChoiceFunction | ToolChoiceCustom
@@ -303,7 +304,7 @@ export interface CopilotUsage {
 export type Metadata = { [key: string]: string }
 
 export interface IncompleteDetails {
-  reason?: "max_output_tokens" | "content_filter"
+  reason?: "max_output_tokens" | "content_filter" | "interrupted"
 }
 
 export interface ResponseError {
@@ -427,6 +428,7 @@ export interface ResponseUsage {
     reasoning_tokens: number
   }
   cost?: number
+  cost_in_usd_ticks?: number
 }
 
 export type ResponseStreamEvent =
@@ -490,6 +492,7 @@ export interface ResponseErrorEvent {
   type: "error"
   error?: {
     type?: string | null
+    param?: string | null
     code: string | null
     message: string
   }

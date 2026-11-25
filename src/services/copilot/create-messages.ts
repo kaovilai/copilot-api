@@ -1,8 +1,8 @@
 import consola from "consola"
 import { events } from "fetch-event-stream"
 
-import type { CompactType } from "~/lib/compact"
-import type { SubagentMarker } from "~/lib/subagent"
+import type { CompactType } from "~/lib/http/compact"
+import type { SubagentMarker } from "~/lib/http/subagent"
 import type {
   AnthropicMessagesPayload,
   AnthropicResponse,
@@ -15,14 +15,15 @@ import {
   prepareForCompact,
   prepareInteractionHeaders,
   prepareMessageProxyHeaders,
-} from "~/lib/api-config"
+} from "~/lib/providers/api-config"
 import { getUpstreamTransportConfig } from "~/lib/config"
-import { logCopilotRateLimits } from "~/lib/copilot-rate-limit"
-import { HTTPError } from "~/lib/error"
-import { setPluginRequestActualModel } from "~/lib/request-context"
+import { logCopilotRateLimits } from "~/lib/providers/copilot-rate-limit"
+import { HTTPError } from "~/lib/http/error"
+import {
+  requestContext,
+  setPluginRequestActualModel,
+} from "~/lib/http/request-context"
 import { state } from "~/lib/state"
-import { parseUserIdMetadata } from "~/lib/utils"
-
 import { fetchCopilotWithReauth } from "./fetch-with-reauth"
 
 export type MessagesStream = ReturnType<typeof events>
@@ -37,6 +38,7 @@ const allowedAnthropicBetas = new Set([
   ADVANCED_TOOL_USE_BETA,
   EXTENDED_CACHE_TTL_BETA,
   "mid-conversation-output-config-2026-07-01",
+  "mid-conversation-tool-changes-2026-07-01",
   "per-turn-control-2026-07-01",
 ])
 
@@ -118,10 +120,7 @@ export const createMessages = async (
 
   prepareForCompact(headers, options.compactType)
 
-  const { safetyIdentifier, sessionId } = parseUserIdMetadata(
-    payload.metadata?.user_id,
-  )
-  if (safetyIdentifier && sessionId && !isOpencodeOauthApp()) {
+  if (requestContext.getStore()?.isClaudeCode && !isOpencodeOauthApp()) {
     headers["anthropic-version"] =
       options.anthropicVersionHeader ?? "2023-06-01"
     prepareMessageProxyHeaders(headers, state)

@@ -1,7 +1,8 @@
 import { afterEach, beforeEach, describe, expect, mock, test } from 'bun:test'
-import { Window } from 'happy-dom'
+import type { Window } from 'happy-dom'
 import { act, createElement } from 'react'
 import type { Root } from 'react-dom/client'
+import { createTestDom } from './helpers/dom'
 
 import App from '../src/App'
 import { LanguageProvider } from '../src/contexts/LanguageContext'
@@ -10,6 +11,7 @@ import type {
   AppUpdateStatus,
   DesktopAuthMode,
   ProviderManagementConfig,
+  ServerLogRecord,
   ServerStatus,
   TokenUsageEventRecord,
   TokenUsageEventsPage,
@@ -71,33 +73,21 @@ let fetchCopilotUsage: ReturnType<typeof mock<() => Promise<unknown>>>
 let fetchUsageSummary: ReturnType<
   typeof mock<(period: TokenUsagePeriod) => Promise<unknown>>
 >
+let getLogs: ReturnType<typeof mock<() => Promise<Array<ServerLogRecord>>>>
+let onServerLog: ReturnType<
+  typeof mock<(callback: (log: ServerLogRecord) => void) => () => void>
+>
+let serverStatusListener: ((status: ServerStatus) => void) | null
+let logListener: ((log: ServerLogRecord) => void) | null
+let logUnsubscribeCount = 0
 let openAuthConfig: ReturnType<
   typeof mock<(returnTab: 'dashboard' | 'providers') => void>
 >
 let currentAuthMode: DesktopAuthMode = 'provider'
-const previousGlobals = new Map<string, PropertyDescriptor | undefined>()
+let cleanupDom: () => Promise<void>
 
 beforeEach(async () => {
-  win = new Window({ url: 'http://localhost' })
-  const globals: Record<string, unknown> = {
-    window: win,
-    document: win.document,
-    navigator: win.navigator,
-    HTMLElement: win.HTMLElement,
-    HTMLInputElement: win.HTMLInputElement,
-    HTMLTextAreaElement: win.HTMLTextAreaElement,
-    Event: win.Event,
-    MouseEvent: win.MouseEvent,
-    IS_REACT_ACT_ENVIRONMENT: true,
-  }
-  for (const [name, value] of Object.entries(globals)) {
-    previousGlobals.set(name, Object.getOwnPropertyDescriptor(globalThis, name))
-    Object.defineProperty(globalThis, name, {
-      configurable: true,
-      writable: true,
-      value,
-    })
-  }
+  ;({ win, root, container, cleanup: cleanupDom } = await createTestDom())
   getProviderConfig = mock(() =>
     Promise.resolve(structuredClone(providerConfig)),
   )
@@ -105,6 +95,17 @@ beforeEach(async () => {
   fetchUsageSummary = mock((_period: TokenUsagePeriod) =>
     Promise.resolve(structuredClone(summary)),
   )
+  getLogs = mock(() => Promise.resolve([]))
+  logUnsubscribeCount = 0
+  logListener = null
+  onServerLog = mock((callback: (log: ServerLogRecord) => void) => {
+    logListener = callback
+    return () => {
+      logUnsubscribeCount += 1
+      if (logListener === callback) logListener = null
+    }
+  })
+  serverStatusListener = null
   currentAuthMode = 'provider'
   openAuthConfig = mock((_returnTab: 'dashboard' | 'providers') => {})
   Object.defineProperty(win, 'electronAPI', {
@@ -132,9 +133,12 @@ beforeEach(async () => {
         Promise.resolve({ ...structuredClone(summary), days: [] }),
       fetchTokenUsageEvents: () => Promise.resolve(createEventsPage(6)),
       fetchTokenUsageSessions: () => Promise.resolve(emptySessionsPage()),
-      getLogs: () => Promise.resolve([]),
-      onServerStatus: () => () => {},
-      onServerLog: () => () => {},
+      getLogs,
+      onServerStatus: (callback: (status: ServerStatus) => void) => {
+        serverStatusListener = callback
+        return () => {}
+      },
+      onServerLog,
       getAppUpdateStatus: (): Promise<AppUpdateStatus> =>
         Promise.resolve({
           phase: 'disabled',
@@ -147,22 +151,13 @@ beforeEach(async () => {
       onWindowMaximizeChange: () => () => {},
     },
   })
-  container = document.createElement('div')
-  document.body.append(container)
-  const { createRoot } = await import('react-dom/client')
-  root = createRoot(container)
 })
 
 afterEach(async () => {
   await act(async () => {
     root.unmount()
   })
-  await win.happyDOM.close()
-  for (const [name, descriptor] of previousGlobals) {
-    if (descriptor) Object.defineProperty(globalThis, name, descriptor)
-    else Reflect.deleteProperty(globalThis, name)
-  }
-  previousGlobals.clear()
+  await cleanupDom()
 })
 
 function createEventsPage(count: number): TokenUsageEventsPage {
@@ -268,6 +263,52 @@ async function clickButton(label: string) {
 }
 
 describe('dashboard overview', () => {
+  test('streams logs during a restart and refreshes history when startup finishes', async () => {
+    getLogs.mockResolvedValue([{ sequence: 1, text: 'initial log' }])
+    await render('provider')
+
+    expect(onServerLog).not.toHaveBeenCalled()
+    expect(getLogs).not.toHaveBeenCalled()
+
+    await clickButton('Logs')
+    await act(async () => {})
+    expect(onServerLog).toHaveBeenCalledTimes(1)
+    expect(getLogs).toHaveBeenCalledTimes(1)
+    expect(container.textContent).toContain('initial log')
+
+    await clickButton('Dashboard')
+    expect(logUnsubscribeCount).toBe(1)
+
+    getLogs.mockResolvedValue([{ sequence: 2, text: 'latest hidden log' }])
+    await clickButton('Logs')
+    await act(async () => {})
+    expect(getLogs).toHaveBeenCalledTimes(2)
+    expect(container.textContent).toContain('latest hidden log')
+
+    const emitLog = logListener
+    await act(async () => {
+      serverStatusListener?.({ running: false, restarting: true })
+    })
+    expect(container.textContent).toContain('Server logs')
+    expect(container.textContent).toContain('latest hidden log')
+    expect(logUnsubscribeCount).toBe(1)
+
+    await act(async () => {
+      emitLog?.({ sequence: 3, text: 'starting new server' })
+    })
+    expect(container.textContent).toContain('starting new server')
+
+    getLogs.mockResolvedValue([{ sequence: 4, text: 'new server run' }])
+    await act(async () => {
+      serverStatusListener?.({ running: true, port: 4141 })
+    })
+    await act(async () => {})
+    expect(getLogs).toHaveBeenCalledTimes(3)
+    expect(logUnsubscribeCount).toBe(2)
+    expect(container.textContent).toContain('new server run')
+    expect(container.textContent).not.toContain('latest hidden log')
+  })
+
   test('loads subscriptions on first open and preserves them across tab switches', async () => {
     getProviderConfig.mockResolvedValue({
       configPath: 'config.json',
@@ -411,6 +452,67 @@ describe('dashboard overview', () => {
       container.querySelector('[role="tab"][aria-selected="true"]')
         ?.textContent,
     ).toBe('Token usage')
+  })
+
+  test('reserves the left dashboard cards while the first load is in flight', async () => {
+    const usage = Promise.withResolvers<TokenUsageSummary>()
+    const providers = Promise.withResolvers<ProviderManagementConfig>()
+    fetchUsageSummary.mockImplementation(() => usage.promise)
+    getProviderConfig.mockImplementation(() => providers.promise)
+
+    await render()
+
+    const usageCard = cardByTitle('Usage snapshot')
+    expect(usageCard.textContent).not.toContain('No token usage recorded')
+    expect(usageCard.querySelector('.grid')?.childElementCount).toBe(4)
+    expect(usageCard.querySelector('.grid')?.getAttribute('aria-label')).toBe(
+      'Loading…',
+    )
+
+    const providerCard = cardByTitle('Providers')
+    expect(providerCard.textContent).not.toContain('dashscope')
+    expect(
+      [...providerCard.querySelectorAll('div')].some((node) =>
+        node.className.includes('h-[140px]'),
+      ),
+    ).toBe(true)
+    expect(
+      [...(usageCard.parentElement?.children ?? [])].map(
+        (node) => node.querySelector('h3')?.textContent,
+      ),
+    ).toEqual(['Usage snapshot', 'Providers', 'Service address'])
+
+    await act(async () => {
+      usage.resolve(structuredClone(summary))
+      providers.resolve(structuredClone(providerConfig))
+    })
+
+    expect(usageCard.textContent).toContain('Requests')
+    expect(usageCard.querySelector('.grid')?.childElementCount).toBe(4)
+    expect(usageCard.textContent).not.toContain('No token usage recorded')
+    expect(providerCard.textContent).toContain('dashscope')
+  })
+
+  test('shows the empty usage snapshot only after the first load finds nothing', async () => {
+    fetchUsageSummary.mockImplementation(() => Promise.resolve(null))
+
+    await render()
+
+    const usageCard = cardByTitle('Usage snapshot')
+    expect(usageCard.textContent).toContain('No token usage recorded')
+    expect(usageCard.querySelector('.grid')?.childElementCount).toBe(1)
+  })
+
+  test('hides the provider overview when the first config load fails', async () => {
+    getProviderConfig.mockImplementation(() =>
+      Promise.reject(new Error('no config')),
+    )
+
+    await render()
+
+    expect(
+      [...container.querySelectorAll('h3')].map((node) => node.textContent),
+    ).not.toContain('Providers')
   })
 
   test('keeps the provider overview visible with Copilot as the only provider', async () => {
