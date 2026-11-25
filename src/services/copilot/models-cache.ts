@@ -10,6 +10,18 @@ let modelsRefreshTimer: ReturnType<typeof setTimeout> | null = null
 // cannot cancel a response that is already on the wire. The generation lets a
 // stopped loop neither write state.models nor schedule itself again.
 let refreshGeneration = 0
+let modelsRefreshFailedAttempts = 0
+let modelsRefreshOutageStartedAt = 0
+
+// Formats an outage duration for the recovery summary log, e.g. "45s" or
+// "12m 5s".
+const formatDowntime = (ms: number): string => {
+  const totalSeconds = Math.round(ms / 1000)
+  if (totalSeconds < 60) return `${totalSeconds}s`
+  const minutes = Math.floor(totalSeconds / 60)
+  const seconds = totalSeconds % 60
+  return seconds > 0 ? `${minutes}m ${seconds}s` : `${minutes}m`
+}
 
 const cancelModelsRefreshTimer = () => {
   if (modelsRefreshTimer) {
@@ -62,9 +74,25 @@ const scheduleModelsRefresh = (fetcher: ModelsFetcher, intervalMs: number) => {
   modelsRefreshTimer = setTimeout(async () => {
     try {
       await refreshModels(fetcher, generation)
+      if (generation === refreshGeneration && modelsRefreshFailedAttempts > 0) {
+        consola.info(
+          `Models refresh recovered after ${modelsRefreshFailedAttempts} failed attempt${modelsRefreshFailedAttempts === 1 ? "" : "s"}`
+            + ` (${formatDowntime(Date.now() - modelsRefreshOutageStartedAt)} offline)`,
+        )
+        modelsRefreshFailedAttempts = 0
+      }
     } catch (error) {
       if (generation === refreshGeneration) {
-        consola.warn("Failed to refresh models, keeping previous cache.", error)
+        modelsRefreshFailedAttempts++
+        // Only the first failure of a streak is logged -- subsequent identical
+        // failures stay quiet until the recovery summary above.
+        if (modelsRefreshFailedAttempts === 1) {
+          modelsRefreshOutageStartedAt = Date.now()
+          consola.warn(
+            "Failed to refresh models, keeping previous cache.",
+            error,
+          )
+        }
       }
     } finally {
       if (generation === refreshGeneration) {
@@ -84,6 +112,8 @@ export async function cacheModels(
   // and overwrite state.models once it comes back.
   refreshGeneration++
   const generation = refreshGeneration
+  modelsRefreshFailedAttempts = 0
+  modelsRefreshOutageStartedAt = 0
   await refreshModels(fetcher, generation)
   if (generation !== refreshGeneration) return
 

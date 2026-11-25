@@ -80,6 +80,24 @@ export const getResponsesStreamTerminalDisposition = (
     return "continue"
   }
 
+  // Callers that already derive `event` from the same parse used to build
+  // the chunk (createResponsesWebSocketStreamChunk et al.) can skip a
+  // redundant JSON.parse here.
+  if (chunk.event !== undefined) {
+    if (chunk.event === "error" || chunk.event === "response.failed") {
+      return "discard"
+    }
+
+    if (
+      chunk.event === "response.completed"
+      || chunk.event === "response.incomplete"
+    ) {
+      return "reuse"
+    }
+
+    return "continue"
+  }
+
   try {
     // WebSocket decoders already extracted the event type. Parse only for
     // callers that provide a raw chunk without event metadata.

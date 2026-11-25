@@ -15,6 +15,7 @@ Run from the repository root unless noted:
 - `bun run typecheck` / `bun run lint`: gateway TypeScript / ESLint checks.
 - `bun run typecheck:all` / `bun run lint:all`: gateway and desktop checks.
 - `bun test tests/provider-resolver.test.ts`: one test file; use explicit `tests` and/or `desktop/tests` directories for larger suites, and capture their output as described below.
+- Run Bun tests with `--isolate`: several files call `mock.module()` on shared modules (e.g. `~/lib/token`), and without isolation those mocks leak across files.
 - `bun run --cwd desktop test`: desktop tests; `bun run --cwd desktop build`: Electron app build.
 
 ## Code Style

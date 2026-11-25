@@ -20,15 +20,16 @@ import {
 import { generateRequestIdFromPayload, getUUID, isNullish } from "~/lib/utils"
 import { handleProviderChatCompletionsForProvider } from "~/routes/provider/chat-completions/handler"
 import type {
+  ChatCompletionChunk,
   ChatCompletionResponse,
   ChatCompletionsPayload,
 } from "~/lib/types/chat-completions"
-import { createChatCompletions } from "~/services/copilot/create-chat-completions"
+import { createChatCompletions as createCopilotChatCompletions } from "~/services/copilot/create-chat-completions"
 
 const logger = createHandlerLogger("chat-completions-handler")
 
 export const chatCompletionsHandlerDependencies = {
-  createChatCompletions,
+  createChatCompletions: createCopilotChatCompletions,
 }
 
 export async function handleCompletion(c: Context) {
@@ -103,12 +104,13 @@ export async function handleCompletion(c: Context) {
         response.copilot_usage?.total_nano_aiu,
       ),
     })
-    return c.json(response)
+    return c.json(normalizeChatCompletionResponse(response))
   }
 
   logger.debug("Streaming response")
   return streamSSE(c, async (stream) => {
     let usage: UsageTokens = {}
+    const toolCallIndexMap = new Map<string, number>()
 
     try {
       for await (const {
@@ -125,7 +127,9 @@ export async function handleCompletion(c: Context) {
             ),
           }
         }
-        await writeSSEIfConnected(stream, chunk as SSEMessage)
+
+        const remapped = remapToolCallChunkIndices(chunk, toolCallIndexMap)
+        await writeSSEIfConnected(stream, (remapped ?? chunk) as SSEMessage)
       }
     } finally {
       recordUsage(usage)
@@ -134,5 +138,98 @@ export async function handleCompletion(c: Context) {
 }
 
 const isNonStreaming = (
-  response: Awaited<ReturnType<typeof createChatCompletions>>,
+  response: Awaited<ReturnType<typeof createCopilotChatCompletions>>,
 ): response is ChatCompletionResponse => Object.hasOwn(response, "choices")
+
+/**
+ * GitHub Copilot's upstream chat-completions response omits `object` on the
+ * top-level response and `index`/`logprobs` on each choice -- fields this
+ * type already declares as required, and fields the OpenAI spec (and strict
+ * clients like the official `@ai-sdk/openai` package, used by e.g. n8n's
+ * "Connect a model" verification) actually require. Without this, such
+ * clients reject an otherwise-valid response with a generic
+ * "Invalid JSON response" error, since their Zod schema validation fails on
+ * the missing required fields -- confirmed live against n8n 2.37.10.
+ * Fills in only what's missing, so a response that already has these (e.g.
+ * from a future upstream change, or a different provider routed through
+ * this same handler) passes through unchanged.
+ */
+function normalizeChatCompletionResponse(
+  response: ChatCompletionResponse,
+): ChatCompletionResponse {
+  return {
+    ...response,
+    object: response.object ?? "chat.completion",
+    choices: response.choices.map((choice, index) => ({
+      ...choice,
+      index: choice.index ?? index,
+      logprobs: choice.logprobs ?? null,
+    })),
+  }
+}
+
+/**
+ * GitHub Copilot's upstream stream reuses Anthropic content-block indices
+ * for `tool_calls[].index` -- when a text block precedes a tool call, the
+ * text consumes "block 0", so the first tool call streams with `index: 1`
+ * instead of `0`, leaving a hole at index 0. Streaming AI SDK clients (n8n's
+ * bundled @ai-sdk/provider-utils among them, per vercel/ai#18333) track
+ * streamed tool calls in an array positioned BY this index, and their
+ * flush() handler iterates that array with a bare `for...of` (which does
+ * not skip holes), crashing with "Cannot read properties of undefined
+ * (reading 'hasFinished')" on the empty slot. Confirmed live: n8n 2.37.10's
+ * AI Assistant crashed on exactly this pattern (a one-sentence preamble
+ * before a tool call) against this gateway.
+ *
+ * Remaps each tool call's raw index to a sequential, zero-based one (in
+ * order of first appearance in this stream) before forwarding, matching
+ * what OpenAI's own real API always does. `indexMap` is fresh per request/
+ * stream (see caller), keyed by `"<choiceIndex>:<rawToolCallIndex>"` rather
+ * than the raw index alone -- an `n > 1` request can carry multiple
+ * `choices`, each numbering its own tool calls independently starting from
+ * 0, and a raw-index-only key would conflate two different tool calls (one
+ * per choice) that happen to share that raw index. Sequencing is
+ * per-choice too, so each choice's tool calls remap to their own 0, 1, 2...
+ * Returns null (pass the original chunk through unchanged) when there's
+ * nothing to remap or the chunk doesn't parse.
+ */
+function remapToolCallChunkIndices(
+  chunk: unknown,
+  indexMap: Map<string, number>,
+): { data: string } | null {
+  const data = (chunk as { data?: string }).data
+  if (!data || data === "[DONE]" || !data.includes("tool_calls")) {
+    return null
+  }
+
+  let parsed: ChatCompletionChunk
+  try {
+    parsed = JSON.parse(data) as ChatCompletionChunk
+  } catch {
+    return null
+  }
+
+  let changed = false
+  for (const choice of parsed.choices ?? []) {
+    const toolCalls = choice.delta?.tool_calls
+    if (!toolCalls) continue
+    const choiceIndex = choice.index ?? 0
+    for (const toolCall of toolCalls) {
+      if (toolCall.index == null) continue
+      const key = `${choiceIndex}:${toolCall.index}`
+      let mapped = indexMap.get(key)
+      if (mapped == null) {
+        mapped = [...indexMap.keys()].filter((k) =>
+          k.startsWith(`${choiceIndex}:`),
+        ).length
+        indexMap.set(key, mapped)
+      }
+      if (mapped !== toolCall.index) {
+        toolCall.index = mapped
+        changed = true
+      }
+    }
+  }
+
+  return changed ? { ...(chunk as object), data: JSON.stringify(parsed) } : null
+}

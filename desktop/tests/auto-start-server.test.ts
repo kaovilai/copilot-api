@@ -10,9 +10,9 @@ const settings = {
 
 test('auto-starts only after authorization loads', async () => {
   const calls: unknown[] = []
-  const startServer = async (...args: unknown[]) => {
+  const startServer = (...args: unknown[]) => {
     calls.push(args)
-    return { running: true, port: 5151 }
+    return Promise.resolve({ running: true, port: 5151 })
   }
 
   expect(
@@ -41,9 +41,9 @@ test('auto-starts only after authorization loads', async () => {
 
 test('passes the saved host when auto-starting', async () => {
   const calls: unknown[] = []
-  const startServer = async (...args: unknown[]) => {
+  const startServer = (...args: unknown[]) => {
     calls.push(args)
-    return { running: true, port: 5151 }
+    return Promise.resolve({ running: true, port: 5151 })
   }
 
   await autoStartServer(

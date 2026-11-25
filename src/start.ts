@@ -204,6 +204,10 @@ export async function runServer(options: RunServerOptions): Promise<void> {
     gracefulShutdown: false,
     bun: {
       idleTimeout: 0,
+      // SO_REUSEPORT: a replacement gateway can bind alongside this one and the
+      // kernel keeps routing new connections here until this listener closes —
+      // the zero-gap restart path. With no second binder, nothing changes.
+      reusePort: true,
     },
   })
   registerProcessShutdownDrain(async () => {

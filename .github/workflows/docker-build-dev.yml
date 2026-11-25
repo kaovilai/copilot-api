@@ -1,0 +1,79 @@
+name: Build and Push Docker Image (dev)
+
+# Builds and pushes ghcr.io/kaovilai/copilot-api:latest on every push to dev
+# -- separate from release-docker.yml (which only fires on a v*.*.* tag, and
+# no tag has ever been cut, so that workflow has never actually published an
+# image). This one is what a deployment tracking `dev` directly (e.g. a VPS
+# sidecar) should pull from.
+#
+# amd64 only, deliberately not multi-arch: the one real deployment target
+# for this image right now is a single x86_64 VPS. Add arm64 back (with
+# native runners, not QEMU -- see kaovilai/n8n-playwright's docker-build.yml
+# for why QEMU-emulated native-addon builds are unreliable) if that changes.
+on:
+  push:
+    branches: [ dev ]
+    paths-ignore:
+      - 'docs/**'
+      - '**.md'
+  workflow_dispatch:
+
+# Only the newest push to dev should ever end up published as :latest --
+# without this, two overlapping runs (e.g. a quick follow-up push before the
+# first build finishes) could finish out of order and let an OLDER commit's
+# build overwrite :latest after a newer one already did. Cancelling the
+# in-progress older run instead of letting both race to publish means only
+# the latest commit's build ever actually completes and pushes.
+concurrency:
+  group: docker-build-dev-${{ github.ref }}
+  cancel-in-progress: true
+
+# Deny-by-default at the workflow level; the job below grants back only what
+# it actually needs (contents:read to checkout, packages:write to push).
+permissions: {}
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+
+      - name: Log in to the Container registry
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract metadata
+        id: meta
+        uses: docker/metadata-action@c299e40c65443455700f0fdfc63efafe5b349051 # v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=raw,value=latest
+            type=sha,prefix=dev-,suffix=-{{date 'YYYYMMDDHHmmss'}}
+
+      - name: Build and push
+        uses: docker/build-push-action@ca052bb54ab0790a636c9b5f226502c73d547a25 # v5
+        with:
+          context: .
+          platforms: linux/amd64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max

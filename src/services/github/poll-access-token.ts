@@ -1,6 +1,7 @@
 import consola from "consola"
 
 import { getOauthAppConfig, getOauthUrls } from "~/lib/providers/api-config"
+import { parseRetryAfterMs } from "~/lib/http/http-error"
 
 import type { DeviceCodeResponse } from "./get-device-code"
 
@@ -56,7 +57,7 @@ export async function pollAccessToken(
       )
     }
 
-    const json = await requestAccessToken(accessTokenUrl, {
+    const { json, retryAfterMs } = await requestAccessToken(accessTokenUrl, {
       method: "POST",
       headers,
       body: JSON.stringify({
@@ -91,9 +92,11 @@ export async function pollAccessToken(
       }
     }
 
+    // A 429 overrides our interval with the server's requested wait, same
+    // reasoning as the Copilot token refresh loop.
     await sleepUnlessAborted(
       dependencies.sleep,
-      toSleepDuration(intervalSeconds),
+      Math.max(toSleepDuration(intervalSeconds), retryAfterMs ?? 0),
       signal,
     )
   }
@@ -124,7 +127,7 @@ async function sleepUnlessAborted(
 }
 
 /**
- * Resolves to `undefined` when the poll should simply be retried. The device
+ * Resolves without `json` when the poll should simply be retried. The device
  * code stays valid until it expires, so a dropped connection (for example a
  * proxy closing the socket) or a non-2xx response must not abort the login.
  * A request aborted through `init.signal` rejects instead.
@@ -132,16 +135,17 @@ async function sleepUnlessAborted(
 async function requestAccessToken(
   url: string,
   init: RequestInit,
-): Promise<AccessTokenResponse | undefined> {
+): Promise<{ json?: AccessTokenResponse; retryAfterMs?: number }> {
   try {
     const response = await fetch(url, init)
 
     if (!response.ok) {
+      const retryAfterMs = parseRetryAfterMs(response.headers) ?? undefined
       consola.error("Failed to poll access token:", await response.text())
-      return undefined
+      return { retryAfterMs }
     }
 
-    return (await response.json()) as AccessTokenResponse
+    return { json: (await response.json()) as AccessTokenResponse }
   } catch (error) {
     if (init.signal?.aborted) {
       throw error
@@ -150,7 +154,7 @@ async function requestAccessToken(
     consola.warn(
       `Failed to poll access token, will retry: ${describeError(error)}`,
     )
-    return undefined
+    return {}
   }
 }
 

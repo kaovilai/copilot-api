@@ -31,7 +31,7 @@ import { getCopilotUsage } from "~/services/github/get-copilot-usage"
 import { getDeviceCode } from "~/services/github/get-device-code"
 import { pollAccessToken } from "~/services/github/poll-access-token"
 
-import { HTTPError } from "../http/http-error"
+import { HTTPError, parseRetryAfterMs } from "../http/http-error"
 import { state } from "../state"
 import { createOAuthAccountManager } from "./oauth-accounts"
 import type { OAuthAccountSummary } from "../types/oauth"
@@ -328,9 +328,27 @@ export const applyCopilotTokenResponse = (
   }
 }
 
+// Concurrent 401s (or a 401 racing the background refresh loop) would each
+// call this independently, firing duplicate refresh requests at GitHub.
+// Single-flighting means the first caller does the refresh and every
+// concurrent caller just awaits that same result.
+let inFlightSetup: Promise<void> | null = null
+
 export const setupCopilotToken = async (
   dependencies: CopilotTokenDependencies = defaultCopilotTokenDependencies,
-) => {
+): Promise<void> => {
+  if (inFlightSetup) {
+    return inFlightSetup
+  }
+
+  inFlightSetup = doSetupCopilotToken(dependencies).finally(() => {
+    inFlightSetup = null
+  })
+
+  return inFlightSetup
+}
+
+const doSetupCopilotToken = async (dependencies: CopilotTokenDependencies) => {
   assertGitHubCopilotEnabled()
   if (isOpencodeOauthApp()) {
     if (!state.githubToken) throw new Error(`opencode token not found`)
@@ -491,6 +509,17 @@ const MAX_RETRY_REFRESH_DELAY_MS = 600_000
 const RETRY_REFRESH_JITTER_MS = 15_000
 const MIN_REFRESH_DELAY_MS = 1_000
 
+// Formats an outage duration for the recovery summary log, e.g. "45s" or
+// "12m 5s" -- unlike fetch-timeout's per-request formatRetryDuration, an
+// outage here can span many minutes so seconds alone would be unreadable.
+const formatDowntime = (ms: number): string => {
+  const totalSeconds = Math.round(ms / 1000)
+  if (totalSeconds < 60) return `${totalSeconds}s`
+  const minutes = Math.floor(totalSeconds / 60)
+  const seconds = totalSeconds % 60
+  return seconds > 0 ? `${minutes}m ${seconds}s` : `${minutes}m`
+}
+
 export const getRefreshDeadlineMs = (
   refreshIn: number,
   nowMs: number = Date.now(),
@@ -527,6 +556,17 @@ export const scheduleRefreshRetry = (
   }
 }
 
+// A 429's Retry-After overrides our own backoff schedule -- the server told
+// us exactly how long to wait, so guessing shorter would spam it and
+// guessing longer would recover slower than necessary. Returns null when
+// there's no Retry-After, so the caller falls back to its jittered backoff.
+export const getRetryAfterDelayMs = (
+  retryDelayMs: number,
+  retryAfterMs: number | null,
+): number | null =>
+  retryAfterMs === null ? null : (
+    Math.min(Math.max(retryAfterMs, retryDelayMs), MAX_RETRY_REFRESH_DELAY_MS)
+  )
 const runCopilotRefreshLoop = async (
   refreshIn: number,
   signal: AbortSignal,
@@ -534,6 +574,8 @@ const runCopilotRefreshLoop = async (
 ) => {
   let refreshAtMs = getRefreshDeadlineMs(refreshIn)
   let retryDelayMs = RETRY_REFRESH_DELAY_MS
+  let failedAttempts = 0
+  let outageStartedAt = 0
 
   while (!signal.aborted) {
     const nextDelayMs = getRefreshPollDelayMs(refreshAtMs)
@@ -554,15 +596,38 @@ const runCopilotRefreshLoop = async (
       if (state.showToken) {
         consola.info("Refreshed Copilot token:", state.copilotToken)
       }
+
+      if (failedAttempts > 0) {
+        consola.info(
+          `Copilot token refresh recovered after ${failedAttempts} failed attempt${failedAttempts === 1 ? "" : "s"}`
+            + ` (${formatDowntime(Date.now() - outageStartedAt)} offline)`,
+        )
+        failedAttempts = 0
+      }
     } catch (error) {
       if (signal.aborted) return
-      consola.error("Failed to refresh Copilot token:", error)
+      failedAttempts++
+      const retryAfterMs =
+        error instanceof HTTPError ?
+          parseRetryAfterMs(error.response.headers)
+        : null
       const retry = scheduleRefreshRetry(retryDelayMs)
-      refreshAtMs = retry.refreshAtMs
+      const delayMs =
+        getRetryAfterDelayMs(retryDelayMs, retryAfterMs) ?? retry.delayMs
+      refreshAtMs = Date.now() + delayMs
       retryDelayMs = retry.nextRetryDelayMs
-      consola.warn(
-        `Retrying Copilot token refresh in ${Math.round(retry.delayMs / 1000)}s`,
-      )
+
+      // Only the first failure of a streak is logged -- an extended outage
+      // would otherwise print this same error every retry (every 15s-10min).
+      // Subsequent identical failures stay quiet until the recovery summary
+      // above.
+      if (failedAttempts === 1) {
+        outageStartedAt = Date.now()
+        consola.error("Failed to refresh Copilot token:", error)
+        consola.warn(
+          `Retrying Copilot token refresh in ${Math.round(delayMs / 1000)}s`,
+        )
+      }
     }
   }
 }

@@ -12,6 +12,7 @@ import {
 } from "~/lib/config"
 import { getGrokBuildVersion } from "~/lib/providers/grok-build"
 import { XAI_API_BASE_URL } from "~/lib/auth/oauth/xai"
+import { retryPreResponseFailures } from "~/lib/fetch-timeout"
 import {
   requestContext,
   setPluginRequestActualModel,
@@ -20,6 +21,7 @@ import { createTimeoutDispatcher } from "~/lib/http/timeout-dispatcher"
 import type { AnthropicMessagesPayload } from "~/lib/types/anthropic"
 import type { ChatCompletionsPayload } from "~/lib/types/chat-completions"
 import type { ResponsesPayload } from "~/lib/types/responses"
+import { UpstreamHeadersTimeoutError } from "~/lib/http/http-error"
 import type { GoogleModelsResponse } from "~/lib/types/google"
 import { fetchUpstreamWithLifecycle } from "~/services/upstream-http"
 import { recordNativeAlphaSearchUsage } from "~/lib/token-usage/alpha-search"
@@ -216,6 +218,14 @@ export function createProviderProxyResponseHeaders(
   return headers
 }
 
+// Forces Bun to open a fresh TCP connection per request instead of reusing a
+// keep-alive socket -- eliminates the "resurrected zombie socket after wifi
+// reconnect" failure class outright. Verified empirically that Bun's fetch
+// honors this (see PR description / plan notes): default fetch reuses one TCP
+// connection across requests, this header forces a new one every time. Cost
+// is one extra TCP+TLS handshake (~50-150ms), negligible next to LLM latency.
+const CLOSE_CONNECTION_HEADERS = { connection: "close" } as const
+
 export async function forwardProviderMessages(
   providerConfig: ResolvedProviderConfig,
   payload: AnthropicMessagesPayload,
@@ -231,18 +241,23 @@ export async function forwardProviderMessages(
   )
   const transportConfig = getUpstreamTransportConfig()
   setPluginRequestActualModel(payload.model, providerConfig)
-  return await fetchUpstreamWithLifecycle(
-    resolveProviderEndpointUrl(providerConfig, "messages"),
-    {
-      method: "POST",
-      headers,
-      body: JSON.stringify(payload),
-    },
-    {
-      clientSignal: options.clientSignal,
-      headersTimeoutMs: transportConfig.headersTimeoutMs,
-      streamInactivityTimeoutMs: transportConfig.streamInactivityTimeoutMs,
-    },
+  return await retryPreResponseFailures(
+    () =>
+      fetchUpstreamWithLifecycle(
+        resolveProviderEndpointUrl(providerConfig, "messages"),
+        {
+          method: "POST",
+          headers: { ...headers, ...CLOSE_CONNECTION_HEADERS },
+          body: JSON.stringify(payload),
+        },
+        {
+          clientSignal: options.clientSignal,
+          headersTimeoutMs: transportConfig.headersTimeoutMs,
+          streamInactivityTimeoutMs: transportConfig.streamInactivityTimeoutMs,
+        },
+      ),
+    options.clientSignal,
+    (error) => error instanceof UpstreamHeadersTimeoutError,
   )
 }
 
@@ -261,18 +276,23 @@ export async function forwardProviderChatCompletions(
   )
   const transportConfig = getUpstreamTransportConfig()
   setPluginRequestActualModel(payload.model, providerConfig)
-  return await fetchUpstreamWithLifecycle(
-    resolveProviderEndpointUrl(providerConfig, "chat/completions"),
-    {
-      method: "POST",
-      headers,
-      body: JSON.stringify(payload),
-    },
-    {
-      clientSignal: options.clientSignal,
-      headersTimeoutMs: transportConfig.headersTimeoutMs,
-      streamInactivityTimeoutMs: transportConfig.streamInactivityTimeoutMs,
-    },
+  return await retryPreResponseFailures(
+    () =>
+      fetchUpstreamWithLifecycle(
+        resolveProviderEndpointUrl(providerConfig, "chat/completions"),
+        {
+          method: "POST",
+          headers: { ...headers, ...CLOSE_CONNECTION_HEADERS },
+          body: JSON.stringify(payload),
+        },
+        {
+          clientSignal: options.clientSignal,
+          headersTimeoutMs: transportConfig.headersTimeoutMs,
+          streamInactivityTimeoutMs: transportConfig.streamInactivityTimeoutMs,
+        },
+      ),
+    options.clientSignal,
+    (error) => error instanceof UpstreamHeadersTimeoutError,
   )
 }
 
@@ -292,22 +312,29 @@ export async function forwardProviderResponses(
   )
   await applyXaiGrokBuildHeaders(providerConfig, headers, payload)
   setPluginRequestActualModel(payload.model, providerConfig)
-  return await fetchUpstreamWithLifecycle(
-    resolveProviderEndpointUrl(providerConfig, "responses"),
-    {
-      method: "POST",
-      headers,
-      body: JSON.stringify(payload),
-    },
-    {
-      headersTimeoutMs: transportConfig.headersTimeoutMs,
-      clientSignal: options.clientSignal,
-      streamInactivityTimeoutMs: transportConfig.streamInactivityTimeoutMs,
-    },
+  return await retryPreResponseFailures(
+    () =>
+      fetchUpstreamWithLifecycle(
+        resolveProviderEndpointUrl(providerConfig, "responses"),
+        {
+          method: "POST",
+          headers: { ...headers, ...CLOSE_CONNECTION_HEADERS },
+          body: JSON.stringify(payload),
+        },
+        {
+          clientSignal: options.clientSignal,
+          headersTimeoutMs: transportConfig.headersTimeoutMs,
+          streamInactivityTimeoutMs: transportConfig.streamInactivityTimeoutMs,
+        },
+      ),
+    options.clientSignal,
+    (error) => error instanceof UpstreamHeadersTimeoutError,
   )
 }
 
 const PROVIDER_MODELS_TIMEOUT_MS = 15_000
+/** Small, unambiguously non-streaming JSON responses -- a plain total-duration cap is safe. */
+const PROVIDER_JSON_REQUEST_TIMEOUT_MS = 30_000
 
 export async function forwardProviderModels(
   providerConfig: ResolvedProviderConfig,
@@ -413,6 +440,7 @@ export async function forwardProviderAlphaSearch(
       method: "POST",
       headers,
       body,
+      signal: AbortSignal.timeout(PROVIDER_JSON_REQUEST_TIMEOUT_MS),
     },
     {
       clientSignal: options.clientSignal,

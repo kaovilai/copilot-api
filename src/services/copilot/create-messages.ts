@@ -24,7 +24,7 @@ import {
   setPluginRequestActualModel,
 } from "~/lib/http/request-context"
 import { state } from "~/lib/state"
-import { fetchUpstreamWithLifecycle } from "~/services/upstream-http"
+import { fetchCopilotWithReauth } from "./fetch-with-reauth"
 
 export type MessagesStream = ReturnType<typeof events>
 export type CreateMessagesReturn = AnthropicResponse | MessagesStream
@@ -140,7 +140,7 @@ export const createMessages = async (
 
   const transportConfig = getUpstreamTransportConfig()
   setPluginRequestActualModel(payload.model)
-  const response = await fetchUpstreamWithLifecycle(
+  const response = await fetchCopilotWithReauth(
     `${copilotBaseUrl(state)}/v1/messages`,
     {
       method: "POST",

@@ -204,6 +204,25 @@ test("retries non-2xx responses from GitHub", async () => {
   ])
 })
 
+test("waits out Retry-After on a 429 instead of the default interval", async () => {
+  mockFetch((attempt) =>
+    Promise.resolve(
+      attempt === 1 ?
+        new Response("rate limited", {
+          status: 429,
+          headers: { "Retry-After": "30" },
+        })
+      : tokenResponse(),
+    ),
+  )
+  const { dependencies, sleeps } = createFakeClock()
+
+  const token = await pollAccessToken(deviceCode, dependencies)
+
+  expect(token).toBe("gho_test_token")
+  expect(sleeps).toEqual([30_000])
+})
+
 test("keeps polling while authorization is pending", async () => {
   const calls = mockFetch((attempt) =>
     Promise.resolve(

@@ -16,6 +16,8 @@
  */
 
 import type { ResponsesStreamChunk } from "~/lib/http/responses-stream-event"
+import { randomUUID } from "node:crypto"
+
 import type {
   ResponseOutputItem,
   ResponseOutputItemAddedEvent,
@@ -115,11 +117,8 @@ const synchronizeOutputItem = (
 ): ResponseOutputItem => {
   let itemId = tracker.outputItems.get(outputIndex) ?? item.id
   if (!itemId) {
-    let randomSuffix = ""
-    while (randomSuffix.length < 16) {
-      randomSuffix += Math.random().toString(36).slice(2)
-    }
-    itemId = `oi_${outputIndex}_${randomSuffix.slice(0, 16)}`
+    const randomSuffix = randomUUID().replaceAll("-", "").slice(0, 16)
+    itemId = `oi_${outputIndex}_${randomSuffix}`
   }
 
   tracker.outputItems.set(outputIndex, itemId)
@@ -150,4 +149,25 @@ const synchronizeItemId = (
   return itemId && itemId !== parsed.item_id ?
       { ...parsed, item_id: itemId }
     : parsed
+}
+
+/**
+ * Applies the ID fix in place on an already-parsed event and reports whether
+ * the event was actually mutated. Callers should only re-serialize the event
+ * (JSON.stringify) when this returns true, and can forward the original raw
+ * string unchanged otherwise -- avoids a parse+stringify round-trip on every
+ * streamed token when the upstream IDs already happen to match.
+ */
+export const applyStreamIdFix = (
+  parsed: ResponseStreamEvent,
+  event: string | undefined,
+  tracker: StreamIdTracker,
+): boolean => {
+  const normalized = fixStreamIds(parsed, event, tracker)
+  if (normalized === parsed) {
+    return false
+  }
+
+  Object.assign(parsed, normalized)
+  return true
 }

@@ -17,7 +17,8 @@ import {
   getUpstreamTransportConfig,
   isResponsesApiWebSocketEnabled as isConfiguredResponsesApiWebSocketEnabled,
 } from "~/lib/config"
-import { HTTPError } from "~/lib/http/error"
+import { HTTPError, UpstreamHeadersTimeoutError } from "~/lib/http/error"
+import { retryPreResponseFailures } from "~/lib/fetch-timeout"
 import { getResponsesContinuationSession } from "~/lib/responses-continuation"
 import {
   readResponsesStreamEvent,
@@ -331,18 +332,23 @@ export async function forwardCodexResponses(
   })
 
   const transportConfig = getUpstreamTransportConfig()
-  const response = await fetchUpstreamWithLifecycle(
-    resolveCodexResponsesUrl(baseUrl),
-    {
-      method: "POST",
-      headers,
-      body: JSON.stringify(normalizedPayload),
-    },
-    {
-      clientSignal: options.clientSignal,
-      headersTimeoutMs: transportConfig.headersTimeoutMs,
-      streamInactivityTimeoutMs: transportConfig.streamInactivityTimeoutMs,
-    },
+  const response = await retryPreResponseFailures(
+    () =>
+      fetchUpstreamWithLifecycle(
+        resolveCodexResponsesUrl(baseUrl),
+        {
+          method: "POST",
+          headers,
+          body: JSON.stringify(normalizedPayload),
+        },
+        {
+          clientSignal: options.clientSignal,
+          headersTimeoutMs: transportConfig.headersTimeoutMs,
+          streamInactivityTimeoutMs: transportConfig.streamInactivityTimeoutMs,
+        },
+      ),
+    options.clientSignal,
+    (error) => error instanceof UpstreamHeadersTimeoutError,
   )
 
   if (!response.ok) {

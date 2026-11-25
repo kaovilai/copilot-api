@@ -230,9 +230,10 @@ export const translateSystemMessage = (
       : []
   }
 
-  const content = message.content
-    .filter((block) => block.type === "text" && block.text.length > 0)
-    .map((block) => createTextContent(block.text))
+  const content = message.content.flatMap((block) => {
+    const textContent = createTextContent(block.text)
+    return textContent ? [textContent] : []
+  })
   return content.length > 0 ? [createMessage("developer", content)] : []
 }
 
@@ -343,7 +344,8 @@ export const translateUserContentBlock = (
 ): Array<ResponseInputContent> => {
   switch (block.type) {
     case "text": {
-      return [createTextContent(block.text)]
+      const textContent = createTextContent(block.text)
+      return textContent ? [textContent] : []
     }
     case "image": {
       return [createImageContent(block)]
@@ -426,15 +428,23 @@ export const shouldApplyPhase = (_model: string): boolean => {
   return true
 }
 
-export const createTextContent = (text: string): ResponseInputText => ({
-  type: "input_text",
-  text,
-})
+// Claude Code can emit text blocks with a missing or empty text field; the
+// Copilot Responses validator rejects input_text/output_text parts without a
+// usable text value, which kills the whole request. Drop them instead,
+// mirroring isEmptyTextContentPart in the reverse translation.
+const isEmptyText = (
+  text: string | undefined | null,
+): text is null | undefined => typeof text !== "string" || text === ""
 
-export const createOutPutTextContent = (text: string): ResponseInputText => ({
-  type: "output_text",
-  text,
-})
+const createTextContent = (
+  text: string | undefined | null,
+): ResponseInputText | undefined =>
+  isEmptyText(text) ? undefined : { type: "input_text", text }
+
+const createOutPutTextContent = (
+  text: string | undefined | null,
+): ResponseInputText | undefined =>
+  isEmptyText(text) ? undefined : { type: "output_text", text }
 
 export const createImageContent = (
   block: AnthropicImageBlock,
@@ -773,10 +783,11 @@ export const translateSystemPrompt = (
 
   const text = system
     .map((block, index) => {
+      const blockText = isEmptyText(block.text) ? "" : block.text
       if (index === 0) {
-        return block.text + "\n\n" + extraPrompt + "\n\n"
+        return blockText + "\n\n" + extraPrompt + "\n\n"
       }
-      return block.text
+      return blockText
     })
     .join(" ")
   return text.length > 0 ? text : null
@@ -922,7 +933,10 @@ export const convertToolResultContent = (
     for (const block of content) {
       switch (block.type) {
         case "text": {
-          result.push(createTextContent(block.text))
+          const textContent = createTextContent(block.text)
+          if (textContent) {
+            result.push(textContent)
+          }
           break
         }
         case "image": {
@@ -934,7 +948,10 @@ export const convertToolResultContent = (
           break
         }
         case "tool_reference": {
-          result.push(createTextContent(`Tool ${block.tool_name} loaded`))
+          result.push({
+            type: "input_text",
+            text: `Tool ${block.tool_name} loaded`,
+          })
           break
         }
         default: {
@@ -942,7 +959,11 @@ export const convertToolResultContent = (
         }
       }
     }
-    return result
+    // A fully-dropped array must not become an empty content array (the
+    // Responses validator rejects it); fall back to an empty string like the
+    // reverse translation does. Skipping the function_call_output item would
+    // orphan its function_call, so "" is the only valid fallback here.
+    return result.length > 0 ? result : ""
   }
 
   return ""

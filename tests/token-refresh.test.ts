@@ -8,6 +8,7 @@ import type { CodexCredentials } from "~/lib/auth/oauth/codex"
 import {
   getRefreshDeadlineMs,
   getRefreshPollDelayMs,
+  getRetryAfterDelayMs,
   refreshCodexCredentialsOnce,
   scheduleRefreshRetry,
   type CodexRefreshDependencies,
@@ -92,6 +93,22 @@ test("Codex and Copilot refresh failures share exponential backoff with jitter",
   expect(capped.delayMs).toBe(600_000)
   expect(capped.nextRetryDelayMs).toBe(600_000)
   expect(capped.refreshAtMs).toBe(nowMs + 600_000)
+})
+
+test("returns null when there's no Retry-After, falling back to jittered backoff", () => {
+  expect(getRetryAfterDelayMs(15_000, null)).toBeNull()
+})
+
+test("honors a Retry-After longer than the current backoff", () => {
+  expect(getRetryAfterDelayMs(15_000, 300_000)).toBe(300_000)
+})
+
+test("doesn't shrink the delay below the current backoff for a short Retry-After", () => {
+  expect(getRetryAfterDelayMs(15_000, 1_000)).toBe(15_000)
+})
+
+test("clamps an extreme Retry-After to the max refresh retry delay", () => {
+  expect(getRetryAfterDelayMs(15_000, 100 * 60_000)).toBe(600_000)
 })
 
 test("shares one in-flight Codex refresh between concurrent callers", async () => {

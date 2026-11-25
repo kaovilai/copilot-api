@@ -46,7 +46,8 @@ import {
   getResponsesStreamTerminalDisposition,
 } from "~/services/responses-websocket-helpers"
 import { createResponsesHttpEventStream } from "~/services/responses-http"
-import { fetchUpstreamWithLifecycle } from "~/services/upstream-http"
+
+import { fetchCopilotWithReauth } from "./fetch-with-reauth"
 
 // Copilot can return a generic internal_error for messages above 16 MiB.
 export const COPILOT_RESPONSES_WEBSOCKET_MAX_MESSAGE_BYTES = 16 * 1024 * 1024
@@ -208,7 +209,7 @@ const fetchHttpResponses = async (
   clientSignal?: AbortSignal,
 ): Promise<Response> => {
   const transportConfig = getUpstreamTransportConfig()
-  const response = await fetchUpstreamWithLifecycle(
+  const response = await fetchCopilotWithReauth(
     `${baseUrl}/responses`,
     {
       method: "POST",

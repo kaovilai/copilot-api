@@ -1,6 +1,7 @@
 import { describe, expect, mock, test } from "bun:test"
 
 import * as agentContextModule from "../plugin/opencode/agent-context.js"
+import { parseSubagentMarkerFromFirstUser } from "~/routes/messages/subagent-marker"
 
 interface SessionInfo {
   id: string
@@ -129,6 +130,21 @@ describe("OpenCode v1 subagent marker", () => {
     const next = messageOutput()
     await hooks["chat.message"]({ sessionID: "child" }, next)
     expect(next.parts).toHaveLength(1)
+  })
+
+  test("skips text blocks with missing or empty text instead of crashing", () => {
+    expect(
+      parseSubagentMarkerFromFirstUser({
+        model: "test-model",
+        max_tokens: 128,
+        messages: [
+          {
+            role: "user",
+            content: [{ type: "text" }, { type: "text", text: "" }],
+          },
+        ],
+      } as unknown as Parameters<typeof parseSubagentMarkerFromFirstUser>[0]),
+    ).toBeNull()
   })
 
   test("uses the default agent name and prevents concurrent duplicate markers", async () => {

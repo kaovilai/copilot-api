@@ -4,6 +4,7 @@ import { Hono } from "hono"
 import {
   forwardError,
   HTTPError,
+  parseRetryAfterMs,
   UpstreamHeadersTimeoutError,
   UpstreamStreamInactivityTimeoutError,
 } from "~/lib/http/error"
@@ -106,6 +107,73 @@ describe("upstream error forwarding", () => {
     expect(response.headers.get("retry-after")).toBe(retryAfter)
   })
 
+  test("marks 400 invalid_request_body errors as non-retryable", async () => {
+    const response = await forwardHttp(
+      Response.json(
+        {
+          error: {
+            message: "Missing required parameter: 'input[6].content[1].text'.",
+            code: "invalid_request_body",
+          },
+        },
+        { status: 400 },
+      ),
+    )
+
+    expect(response.status).toBe(400)
+    expect(response.headers.get("x-should-retry")).toBe("false")
+  })
+
+  test("marks 400 invalid_request_error errors as non-retryable", async () => {
+    const response = await forwardHttp(
+      Response.json(
+        {
+          error: {
+            type: "invalid_request_error",
+            message: "Unsupported parameter",
+          },
+        },
+        { status: 400 },
+      ),
+    )
+
+    expect(response.headers.get("x-should-retry")).toBe("false")
+  })
+
+  test.each([429, 500, 502])(
+    "keeps transient upstream HTTP %i errors retryable",
+    async (status) => {
+      const response = await forwardHttp(
+        Response.json(
+          {
+            error: {
+              type: "invalid_request_error",
+              code: "invalid_request_body",
+              message: "Transient upstream failure",
+            },
+          },
+          { status },
+        ),
+      )
+
+      expect(response.headers.get("x-should-retry")).toBeNull()
+    },
+  )
+
+  test.each([401, 403, 404])(
+    "leaves the retry hint off for non-invalid-request HTTP %i errors",
+    async (status) => {
+      const response = await forwardHttp(
+        Response.json(
+          { error: { type: "server_error", message: "Upstream error" } },
+          { status },
+        ),
+      )
+
+      expect(response.headers.get("x-should-retry")).toBeNull()
+    },
+  )
+
   test.each([
     "upstream unavailable",
     "null",
@@ -157,4 +225,40 @@ describe("upstream error forwarding", () => {
       error: { message: "Unexpected failure", type: "error" },
     })
   })
+})
+
+test("parses Retry-After as delta-seconds", () => {
+  const headers = new Headers({ "Retry-After": "120" })
+
+  expect(parseRetryAfterMs(headers)).toBe(120_000)
+})
+
+test("parses Retry-After as an HTTP-date", () => {
+  const futureDate = new Date(Date.now() + 60_000)
+  const headers = new Headers({ "Retry-After": futureDate.toUTCString() })
+
+  const result = parseRetryAfterMs(headers)
+
+  expect(result).not.toBeNull()
+  expect(result).toBeGreaterThan(55_000)
+  expect(result).toBeLessThanOrEqual(60_000)
+})
+
+test("clamps a past HTTP-date to zero", () => {
+  const pastDate = new Date(Date.now() - 60_000)
+  const headers = new Headers({ "Retry-After": pastDate.toUTCString() })
+
+  expect(parseRetryAfterMs(headers)).toBe(0)
+})
+
+test("returns null when the header is absent", () => {
+  const headers = new Headers()
+
+  expect(parseRetryAfterMs(headers)).toBeNull()
+})
+
+test("returns null for an unparseable value", () => {
+  const headers = new Headers({ "Retry-After": "not-a-date-or-number" })
+
+  expect(parseRetryAfterMs(headers)).toBeNull()
 })
